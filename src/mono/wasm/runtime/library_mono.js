@@ -598,6 +598,15 @@ var MonoSupportLib = {
 
 			var virtualName = asset.virtual_path || asset.name;
 			var offset = null;
+			var lastSlash = virtualName.lastIndexOf("/");
+			var parentDirectory = (lastSlash > 0)
+				? virtualName.substr(0, lastSlash)
+				: "/";
+			var fileName = (lastSlash > 0)
+				? virtualName.substr(lastSlash + 1)
+				: virtualName;
+			if (fileName.startsWith("/"))
+				fileName = fileName.substr(1);
 
 			switch (asset.behavior) {
 				case "assembly":
@@ -609,26 +618,13 @@ var MonoSupportLib = {
 					break;
 
 				case "vfs":
-					// FIXME
-					var lastSlash = virtualName.lastIndexOf("/");
-					var parentDirectory = (lastSlash > 0)
-						? virtualName.substr(0, lastSlash)
-						: null;
-					var fileName = (lastSlash > 0)
-						? virtualName.substr(lastSlash + 1)
-						: virtualName;
-					if (fileName.startsWith("/"))
-						fileName = fileName.substr(1);
-
-					if (parentDirectory) {
+					if (parentDirectory != "/") {
 						if (ctx.tracing)
 							console.log ("MONO_WASM: Creating directory '" + parentDirectory + "'");
 
 						var pathRet = ctx.createPath(
 							"/", parentDirectory, true, true // fixme: should canWrite be false?
 						);
-					} else {
-						parentDirectory = "/";
 					}
 
 					if (ctx.tracing)
@@ -639,6 +635,9 @@ var MonoSupportLib = {
 						bytes, true /* canRead */, true /* canWrite */, true /* canOwn */
 					);
 
+					break;
+				case "blat":
+					this.mono_wasm_load_data (bytes, parentDirectory);
 					break;
 
 				default:
@@ -1119,10 +1118,7 @@ var MonoSupportLib = {
 			// /usr/share/zoneinfo/Asia
 			// ..
 			var p = prefix.slice(1).split('/');
-			p.forEach((v, i) => {
-				FS.mkdir(v);
-				Module['FS_createPath']("/" + p.slice(0, i).join('/'), v, true, true);
-			})
+			Module['FS_createPath']("/", p, true, true);
 			var folders = new Set()
 			manifest.filter(m => {
 				m = m[0].split('/')
