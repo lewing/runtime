@@ -613,32 +613,30 @@ var MonoSupportLib = {
 					var lastSlash = virtualName.lastIndexOf("/");
 					var parentDirectory = (lastSlash > 0)
 						? virtualName.substr(0, lastSlash)
-						: null;
+						: "/";
 					var fileName = (lastSlash > 0)
 						? virtualName.substr(lastSlash + 1)
 						: virtualName;
 					if (fileName.startsWith("/"))
 						fileName = fileName.substr(1);
-
-					if (parentDirectory) {
+					if (parentDirectory != "/") {
 						if (ctx.tracing)
 							console.log ("MONO_WASM: Creating directory '" + parentDirectory + "'");
 
 						var pathRet = ctx.createPath(
 							"/", parentDirectory, true, true // fixme: should canWrite be false?
 						);
-					} else {
-						parentDirectory = "/";
 					}
 
 					if (ctx.tracing)
 						console.log ("MONO_WASM: Creating file '" + fileName + "' in directory '" + parentDirectory + "'");
 
-					var fileRet = ctx.createDataFile (
-						parentDirectory, fileName,
-						bytes, true /* canRead */, true /* canWrite */, true /* canOwn */
-					);
-
+					if (!this.mono_wasm_load_data_archive (bytes, parentDirectory)) {
+						var fileRet = ctx.createDataFile (
+							parentDirectory, fileName,
+							bytes, true /* canRead */, true /* canWrite */, true /* canOwn */
+						);
+					}
 					break;
 
 				default:
@@ -1101,12 +1099,12 @@ var MonoSupportLib = {
 			return className.replace(/\//g, '.').replace(/`\d+/g, '');
 		},
 
-		mono_wasm_load_data: function (data, prefix) {
+		mono_wasm_load_data_archive: function (data, prefix) {
 			var dataview = new DataView(data.buffer);
 			var magic = dataview.getUint32(0, true);
 			//	get magic number
 			if (magic != 0x626c6174) {
-				throw new Error ("File is of wrong type");
+				return false;
 			}
 			var manifestSize = dataview.getUint32(4, true);
 			var manifestContent = Module.UTF8ArrayToString(data, 8, manifestSize);
@@ -1118,11 +1116,7 @@ var MonoSupportLib = {
 			// /usr/share/zoneinfo/Africa
 			// /usr/share/zoneinfo/Asia
 			// ..
-			var p = prefix.slice(1).split('/');
-			p.forEach((v, i) => {
-				FS.mkdir(v);
-				Module['FS_createPath']("/" + p.slice(0, i).join('/'), v, true, true);
-			})
+			Module['FS_createPath']("/", prefix.slice(1), true, true);
 			var folders = new Set()
 			manifest.filter(m => {
 				m = m[0].split('/')
