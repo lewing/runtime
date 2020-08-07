@@ -20,6 +20,9 @@
     <PackageFile Include="$(ArtifactsDir)bin\BrowserDebugHost\$(TargetArchitecture)\$(Configuration)\BrowserDebugHost.runtimeconfig.json">
       <TargetPath>tools\$(NetCoreAppCurrent)\BrowserDebugHost.runtimeconfig.json</TargetPath>
     </PackageFile>
+     <PackageFile Include="$(ArtifactsDir)bin\VisualStudioDebugHost\$(TargetArchitecture)\$(Configuration)\VisualStudioDebugHost.exe">
+      <TargetPath>tools\$(NetCoreAppCurrent)\VisualStudioDebugHost.exe</TargetPath>
+    </PackageFile>
   </ItemGroup>
 
   <Import Project="$([MSBuild]::GetPathOfFileAbove(Directory.Build.targets))" />
