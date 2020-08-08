@@ -768,7 +768,7 @@ namespace DebuggerTests
 
         public static TheoryData<string, string, int, int, bool> NegativeTestsData(bool use_cfo = false) => new TheoryData<string, string, int, int, bool>
         { { "invoke_static_method ('[debugger-test] DebuggerTests.CallFunctionOnTest:MethodForNegativeTests', null);", "dotnet://debugger-test.dll/debugger-cfo-test.cs", 45, 12, use_cfo },
-            { "negative_cfo_test ();", "/other.js", 41, 1, use_cfo }
+            { "negative_cfo_test ();", "/other.js", 58, 1, use_cfo }
         };
 
         [Theory]

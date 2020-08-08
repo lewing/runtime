@@ -32,6 +32,24 @@ function getters_js_test () {
 	return ptd;
 }
 
+function exception_caught_test () {
+	try {
+		throw new TypeError ('exception caught');
+	} catch (e) {
+		console.log(e);
+	}
+}
+
+function exception_uncaught_test () {
+	console.log('uncaught test');
+	throw new RangeError ('exception uncaught');
+}
+
+function exceptions_test () {
+	exception_caught_test ();
+	exception_uncaught_test ();
+}
+
 function negative_cfo_test (str_value = null) {
 	var ptd = {
 		get Int () { return 5; },

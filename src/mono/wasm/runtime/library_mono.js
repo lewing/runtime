@@ -1758,6 +1758,16 @@ var MonoSupportLib = {
 		// eslint-disable-next-line no-debugger
 		debugger;
 	},
+
+	mono_wasm_fire_exception: function (exception_id, message, class_name, uncaught) {
+		MONO.active_exception = {
+			exception_id: exception_id,
+			message     : Module.UTF8ToString (message),
+			class_name  : Module.UTF8ToString (class_name),
+			uncaught    : uncaught
+		};
+		debugger;
+	},
 };
 
 autoAddDeps(MonoSupportLib, '$MONO')
