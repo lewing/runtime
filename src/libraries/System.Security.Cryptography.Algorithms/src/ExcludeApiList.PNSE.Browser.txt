@@ -1,4 +1,6 @@
 T:System.Security.Cryptography.RandomNumberGenerator
+T:System.Security.Cryptography.HashAlgorithm
+T:System.Security.Cryptography.HashAlgorithmName
 T:System.Security.Cryptography.IncrementalHash
 T:System.Security.Cryptography.SHA1
 T:System.Security.Cryptography.SHA256
