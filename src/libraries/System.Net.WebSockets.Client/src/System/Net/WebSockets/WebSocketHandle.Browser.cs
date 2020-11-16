@@ -61,7 +61,8 @@ namespace System.Net.WebSockets
 
                 Abort();
 
-                if (exc is WebSocketException)
+                if (exc is WebSocketException ||
+                (exc is OperationCanceledException && cancellationToken.IsCancellationRequested))
                 {
                     throw;
                 }
