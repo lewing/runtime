@@ -26,6 +26,10 @@ public class CompileTimeZoneData : Task
     [Required]
     public string[]? TimeZones { get; set; }
 
+    // List of spectic zones to include in the
+    // zone.tab file if they exist
+    public string[]? ZoneTabInclude { get; set; }
+
     private const string ZoneTabFileName = "zone1970.tab";
 
     private void CompileTimeZoneDataSource()
@@ -53,7 +57,7 @@ public class CompileTimeZoneData : Task
         }
     }
 
-    private void FilterZoneTab(string[] filters, string ZoneTabFile)
+    private void FilterZoneTab(string[]? include, string ZoneTabFile)
     {
         var path = Path.Combine(OutputDirectory!, "zone.tab");
         using (StreamReader sr = new StreamReader(ZoneTabFile))
@@ -61,7 +65,11 @@ public class CompileTimeZoneData : Task
         {
             string? line;
             while ((line = sr.ReadLine()) != null) {
-                if (filters.Any(x => Regex.IsMatch(line, $@"\b{x}\b")))
+                if (include is null)
+                {
+                    sw.WriteLine(line);
+                }
+                else if (include.Any(x => Regex.IsMatch(line, $@"\b{x}\b")))
                 {
                     sw.WriteLine(line);
                 }
@@ -84,13 +92,8 @@ public class CompileTimeZoneData : Task
 
         CompileTimeZoneDataSource();
 
-        string[] filtered = new string[] { "America/Los_Angeles", "Australia/Sydney", "Europe/London", "Pacific/Tongatapu",
-                                "America/Sao_Paulo", "Australia/Perth", "Africa/Nairobi", "Europe/Berlin",
-                                "Europe/Moscow", "Africa/Tripoli", "America/Argentina/Catamarca", "Europe/Lisbon",
-                                "America/St_Johns"};
-
         FilterTimeZoneData();
-        FilterZoneTab(filtered, ZoneTabFile);
+        FilterZoneTab(ZoneTabInclude, ZoneTabFile);
 
         return !Log.HasLoggedErrors;
     }
