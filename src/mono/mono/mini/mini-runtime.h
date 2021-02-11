@@ -22,7 +22,6 @@ typedef struct
 	GHashTable *jump_target_got_slot_hash;
 	GHashTable *jump_target_hash;
 	/* Maps methods/klasses to the address of the given type of trampoline */
-	GHashTable *class_init_trampoline_hash;
 	GHashTable *jump_trampoline_hash;
 	GHashTable *jit_trampoline_hash;
 	GHashTable *delegate_trampoline_hash;
@@ -148,6 +147,24 @@ struct MonoJitTlsData {
 #define MONO_LMFEXT_INTERP_EXIT_WITH_CTX 3
 
 /*
+ * The MonoLMF structure is arch specific, it includes at least these fields.
+ * LMF means 'last-managed-frame'. Originally, these were allocated
+ * on the stack to mark the last frame before transitioning to
+ * native code, but currently, they are used to mark all kinds of
+ * other transitions as well, see MonoLMFExt.
+ */
+#if 0
+typedef struct {
+	/*
+	 * If the second lowest bit is set to 1, then this is a MonoLMFExt structure, and
+	 * the other fields are not valid.
+	 */
+	gpointer previous_lmf;
+	gpointer lmf_addr;
+} MonoLMF;
+#endif
+
+/*
  * This structure is an extension of MonoLMF and contains extra information.
  */
 typedef struct {
@@ -256,9 +273,7 @@ typedef struct MonoDebugOptions {
 	 */
 	gboolean top_runtime_invoke_unhandled;
 
-#ifdef ENABLE_NETCORE
 	gboolean enabled;
-#endif
 } MonoDebugOptions;
 
 /*
@@ -418,6 +433,12 @@ static inline MonoMethod*
 jinfo_get_method (MonoJitInfo *ji)
 {
 	return mono_jit_info_get_method (ji);
+}
+
+static inline gpointer
+jinfo_get_ftnptr (MonoJitInfo *ji)
+{
+	return MINI_ADDR_TO_FTNPTR (ji->code_start);
 }
 
 /* main function */
@@ -619,7 +640,7 @@ void mini_register_sigterm_handler (void);
 	mono_codeman_disable_write (); \
 	mono_arch_flush_icache ((buf), (size)); \
 	if ((int)type != -1) \
-		MONO_PROFILER_RAISE (jit_code_buffer, ((buf), (size), (type), (arg))); \
+		MONO_PROFILER_RAISE (jit_code_buffer, ((buf), (size), (MonoProfilerCodeBufferType)(type), (arg))); \
 	} while (0)
 
 #endif /* __MONO_MINI_RUNTIME_H__ */

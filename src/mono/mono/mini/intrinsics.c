@@ -568,9 +568,7 @@ emit_unsafe_intrinsics (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignatu
 		EMIT_NEW_BIALU (cfg, ins, OP_PSUB, dreg, args [1]->dreg, args [0]->dreg);
 		ins->type = STACK_PTR;
 		return ins;
-	}
-#ifdef ENABLE_NETCORE
-	else if (!strcmp (cmethod->name, "InitBlockUnaligned")) {
+	} else if (!strcmp (cmethod->name, "InitBlockUnaligned")) {
 		g_assert (fsig->param_count == 3);
 
 		mini_emit_memory_init_bytes (cfg, args [0], args [1], args [2], MONO_INST_UNALIGNED);
@@ -583,7 +581,6 @@ emit_unsafe_intrinsics (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignatu
 		MONO_ADD_INS (cfg->cbb, ins);
 		return ins;
 	}
-#endif
 
 	return NULL;
 }
@@ -680,12 +677,6 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		int dreg = alloc_preg (cfg);
 		EMIT_NEW_LOAD_MEMBASE (cfg, ins, OP_LOAD_MEMBASE, dreg, args [0]->dreg, 0);
 		return ins;
-	} else if (in_corlib && cmethod->klass == mono_defaults.object_class) {
-		if (!strcmp (cmethod->name, "GetRawData")) {
-			int dreg = alloc_preg (cfg);
-			EMIT_NEW_BIALU_IMM (cfg, ins, OP_PADD_IMM, dreg, args [0]->dreg, MONO_ABI_SIZEOF (MonoObject));
-			return ins;
-		}
 	}
 
 	if (!(cfg->opt & MONO_OPT_INTRINS))
@@ -859,6 +850,10 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 	} else if (cmethod->klass == runtime_helpers_class) {
 		if (strcmp (cmethod->name, "get_OffsetToStringData") == 0 && fsig->param_count == 0) {
 			EMIT_NEW_ICONST (cfg, ins, MONO_STRUCT_OFFSET (MonoString, chars));
+			return ins;
+		} else if (!strcmp (cmethod->name, "GetRawData")) {
+			int dreg = alloc_preg (cfg);
+			EMIT_NEW_BIALU_IMM (cfg, ins, OP_PADD_IMM, dreg, args [0]->dreg, MONO_ABI_SIZEOF (MonoObject));
 			return ins;
 		} else if (strcmp (cmethod->name, "IsReferenceOrContainsReferences") == 0 && fsig->param_count == 0) {
 			MonoGenericContext *ctx = mono_method_get_context (cmethod);
@@ -1928,7 +1923,6 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		}
 	}
 
-#ifdef ENABLE_NETCORE
 	// Return false for IsSupported for all types in System.Runtime.Intrinsics.* 
 	// if it's not handled in mono_emit_simd_intrinsics
 	if (in_corlib && 
@@ -1978,7 +1972,6 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			break;
 		}
 	}
-#endif
 
 	ins = mono_emit_native_types_intrinsics (cfg, cmethod, fsig, args);
 	if (ins)
@@ -2114,23 +2107,6 @@ emit_array_unsafe_mov (MonoCompile *cfg, MonoMethodSignature *fsig, MonoInst **a
 	return NULL;
 }
 
-#ifndef ENABLE_NETCORE
-MonoInst*
-mini_emit_inst_for_sharable_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig, MonoInst **args)
-{
-	if (cmethod->klass == mono_defaults.array_class) {
-		if (strcmp (cmethod->name, "UnsafeStore") == 0)
-			return emit_array_unsafe_access (cfg, fsig, args, TRUE);
-		else if (strcmp (cmethod->name, "UnsafeLoad") == 0)
-			return emit_array_unsafe_access (cfg, fsig, args, FALSE);
-		else if (strcmp (cmethod->name, "UnsafeMov") == 0)
-			return emit_array_unsafe_mov (cfg, fsig, args);
-	}
-
-	return NULL;
-}
-#endif
-
 MonoInst*
 mini_emit_inst_for_field_load (MonoCompile *cfg, MonoClassField *field)
 {
@@ -2146,13 +2122,11 @@ mini_emit_inst_for_field_load (MonoCompile *cfg, MonoClassField *field)
 		is_le = (TARGET_BYTE_ORDER == G_LITTLE_ENDIAN);
 		EMIT_NEW_ICONST (cfg, ins, is_le);
 		return ins;
-	} 
-#ifdef ENABLE_NETCORE
-	else if ((klass == mono_defaults.int_class || klass == mono_defaults.uint_class) && strcmp (field->name, "Zero") == 0) {
+	} else if ((klass == mono_defaults.int_class || klass == mono_defaults.uint_class) && strcmp (field->name, "Zero") == 0) {
 		EMIT_NEW_PCONST (cfg, ins, 0);
 		return ins;
 	}
-#endif
+
 	return NULL;
 }
 #else

@@ -1,7 +1,6 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-#nullable enable
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
@@ -10,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Globalization;
 using System.Net.NetworkInformation;
+using System.Buffers.Binary;
 
 namespace System.Net
 {
@@ -181,11 +181,7 @@ namespace System.Net
             {
                 // IPv4AddressHelper.ParseNonCanonical returns the bytes in the inverse order.
                 // Reverse them and return success.
-                address =
-                    ((0xFF000000 & tmpAddr) >> 24) |
-                    ((0x00FF0000 & tmpAddr) >> 8) |
-                    ((0x0000FF00 & tmpAddr) << 8) |
-                    ((0x000000FF & tmpAddr) << 24);
+                address = BinaryPrimitives.ReverseEndianness((uint)tmpAddr);
                 return true;
             }
             else

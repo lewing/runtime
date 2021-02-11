@@ -14,29 +14,31 @@
 #     This directory is the one that is sent to all the helix machines that performs SPMI collection.
 # 2.  It clones dotnet/jitutils, builds it and then copies the `pmi.dll` to `correlation_payload_directory` folder.
 #     This file is needed to do pmi SPMI runs.
-# 3.  The script takes `libraries_artifacts` and `tests_artifacts` parameters which contains managed .dlls and .exes on
+# 3.  The script takes `input_artifacts` parameter which contains managed .dlls and .exes on
 #     which SPMI needs to be run. This script will partition these folders into equal buckets of approximately `max_size`
 #     bytes and stores them under `payload` directory. Each sub-folder inside `payload` directory is sent to individual
-#     helix machine to do SPMI collection on. E.g. for `libraries_artifacts` the parameter would be path to `CORE_ROOT`
-#     folder and this script will copy `max_size` bytes of those files under `payload/Core_Root/libraries_0/binaries`,
-#     `payload/Core_Root/libraries_1/binaries` and so forth.
+#     helix machine to do SPMI collection on. E.g. for `input_artifacts` to be run on libraries, the parameter would be path to
+#     `CORE_ROOT` folder and this script will copy `max_size` bytes of those files under `payload/libraries/0/binaries`,
+#     `payload/libraries/1/binaries` and so forth.
 # 4.  Lastly, it sets the pipeline variables.
 
 # Below are the helix queues it sets depending on the OS/architecture:
-# | Arch  | Windows_NT       | Linux                                                                                                                                |
-# |-------|------------------|--------------------------------------------------------------------------------------------------------------------------------------|
-# | x86   | Windows.10.Amd64 | -                                                                                                                                    |
-# | x64   | Windows.10.Amd64 | Ubuntu.1804.Amd64                                                                                                                    |
-# | arm   | -                | (Ubuntu.1804.Arm32)Ubuntu.1804.Armarch@mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-helix-arm32v7-bfcd90a-20200121150440 |
-# | arm64 | Windows.10.Arm64 | (Ubuntu.1804.Arm64)Ubuntu.1804.ArmArch@mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-helix-arm64v8-a45aeeb-20190620155855 |
+# | Arch  | windows              | Linux                                                                                                                                |
+# |-------|----------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+# | x86   | Windows.10.Amd64.X86 |                                                                                                                                      |
+# | x64   | Windows.10.Amd64.X86 | Ubuntu.1804.Amd64                                                                                                                    |
+# | arm   | -                    | (Ubuntu.1804.Arm32)Ubuntu.1804.Armarch@mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-helix-arm32v7-bfcd90a-20200121150440 |
+# | arm64 | Windows.10.Arm64     | (Ubuntu.1804.Arm64)Ubuntu.1804.ArmArch@mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-helix-arm64v8-a45aeeb-20190620155855 |
 ################################################################################
 ################################################################################
 
 
-import subprocess
 import argparse
+import shutil
+import subprocess
+import tempfile
 
-from os import listdir, path, walk
+from os import linesep, listdir, path, walk
 from os.path import isfile, join, getsize
 from coreclr_arguments import *
 
@@ -48,23 +50,39 @@ parser.add_argument("-source_directory", help="path to source directory")
 parser.add_argument("-core_root_directory", help="path to core_root directory")
 parser.add_argument("-arch", help="Architecture")
 parser.add_argument("-mch_file_tag", help="Tag to be used to mch files")
-parser.add_argument("-libraries_directory", help="directory containing assemblies for which superpmi collection to "
-                                                  "be done")
-parser.add_argument("-tests_directory", help="path to managed test artifacts directory")
+parser.add_argument("-collection_name", help="Name of the SPMI collection to be done (e.g., libraries, tests)")
+parser.add_argument("-collection_type", help="Type of the SPMI collection to be done (crossgen, crossgen2, pmi)")
+parser.add_argument("-input_directory", help="directory containing assemblies for which superpmi collection to be done")
 parser.add_argument("-max_size", help="Max size of each partition in MB")
 is_windows = platform.system() == "Windows"
+
 native_binaries_to_ignore = [
-    "clrcompression.dll",
     "clretwrc.dll",
     "clrgc.dll",
     "clrjit.dll",
+    "clrjit_unix_arm_arm.dll",
+    "clrjit_unix_arm_arm64.dll",
     "clrjit_unix_arm_x64.dll",
+    "clrjit_unix_arm_x86.dll",
+    "clrjit_unix_arm64_arm64.dll",
     "clrjit_unix_arm64_x64.dll",
+    "clrjit_unix_armel_x86.dll",
+    "clrjit_unix_osx_arm64_arm64.dll",
+    "clrjit_unix_osx_arm64_x64.dll",
+    "clrjit_unix_x64_arm64.dll",
     "clrjit_unix_x64_x64.dll",
+    "clrjit_win_arm_arm.dll",
+    "clrjit_win_arm_arm64.dll",
     "clrjit_win_arm_x64.dll",
+    "clrjit_win_arm_x86.dll",
+    "clrjit_win_arm64_arm64.dll",
     "clrjit_win_arm64_x64.dll",
+    "clrjit_win_x64_arm64.dll",
     "clrjit_win_x64_x64.dll",
+    "clrjit_win_x86_arm.dll",
+    "clrjit_win_x86_arm64.dll",
     "clrjit_win_x86_x64.dll",
+    "clrjit_win_x86_x86.dll",
     "coreclr.dll",
     "CoreConsole.exe",
     "coredistools.dll",
@@ -75,19 +93,28 @@ native_binaries_to_ignore = [
     "dbgshim.dll",
     "ilasm.exe",
     "ildasm.exe",
+    "jitinterface_arm.dll",
+    "jitinterface_arm64.dll",
     "jitinterface_x64.dll",
-    "linuxnonjit.dll",
+    "jitinterface_x86.dll",
+    "KernelTraceControl.dll",
+    "KernelTraceControl.Win61.dll",
     "mcs.exe",
+    "Microsoft.DiaSymReader.Native.amd64.dll",
+    "Microsoft.DiaSymReader.Native.x86.dll",
     "mscordaccore.dll",
     "mscordbi.dll",
     "mscorrc.dll",
-    "protononjit.dll",
+    "msdia140.dll",
     "superpmi.exe",
     "superpmi-shim-collector.dll",
     "superpmi-shim-counter.dll",
     "superpmi-shim-simple.dll",
+    "System.IO.Compression.Native.dll",
+    "ucrtbase.dll",
 ]
 
+MAX_FILES_COUNT = 1500
 
 def setup_args(args):
     """ Setup the args for SuperPMI to use.
@@ -123,14 +150,19 @@ def setup_args(args):
                         "Unable to set mch_file_tag")
 
     coreclr_args.verify(args,
-                        "libraries_directory",
-                        lambda libraries_directory: os.path.isdir(libraries_directory),
-                        "libraries_directory doesn't exist")
+                        "collection_name",
+                        lambda unused: True,
+                        "Unable to set collection_name")
 
     coreclr_args.verify(args,
-                        "tests_directory",
-                        lambda tests_directory: os.path.isdir(tests_directory),
-                        "tests_directory doesn't exist")
+                        "collection_type",
+                        lambda unused: True,
+                        "Unable to set collection_type")
+
+    coreclr_args.verify(args,
+                        "input_directory",
+                        lambda input_directory: os.path.isdir(input_directory),
+                        "input_directory doesn't exist")
 
     coreclr_args.verify(args,
                         "max_size",
@@ -204,7 +236,7 @@ def first_fit(sorted_by_size, max_size):
         if file_size < max_size:
             for p_index in partitions:
                 total_in_curr_par = sum(n for _, n in partitions[p_index])
-                if (total_in_curr_par + file_size) < max_size:
+                if (((total_in_curr_par + file_size) < max_size) and (len(partitions[p_index]) < MAX_FILES_COUNT)):
                     partitions[p_index].append(curr_file)
                     found_bucket = True
                     break
@@ -215,7 +247,7 @@ def first_fit(sorted_by_size, max_size):
     total_size = 0
     for p_index in partitions:
         partition_size = sum(n for _, n in partitions[p_index])
-        print("Partition {0}: {1} bytes.".format(p_index, partition_size))
+        print("Partition {0}: {1} files with {2} bytes.".format(p_index, len(partitions[p_index]), partition_size))
         total_size += partition_size
     print("Total {0} partitions with {1} bytes.".format(str(len(partitions)), total_size))
 
@@ -238,17 +270,17 @@ def run_command(command_to_run, _cwd=None):
             print(stderr.decode("utf-8"))
 
 
-def copy_directory(src_path, dst_path):
+def copy_directory(src_path, dst_path, verbose_output=True, match_func=lambda path: True):
     """Copies directory in 'src_path' to 'dst_path' maintaining the directory
     structure. https://docs.python.org/3.5/library/shutil.html#shutil.copytree can't
     be used in this case because it expects the destination directory should not
     exist, however we do call copy_directory() to copy files to same destination directory.
 
-    It only copied *.dll, *.exe and *.py files.
-
     Args:
         src_path (string): Path of source directory that need to be copied.
         dst_path (string): Path where directory should be copied.
+        verbose_output (bool): True to print every copy or skipped file.
+        match_func (str -> bool) : Criteria function determining if a file is copied.
     """
     if not os.path.exists(dst_path):
         os.makedirs(dst_path)
@@ -256,16 +288,15 @@ def copy_directory(src_path, dst_path):
         src_item = os.path.join(src_path, item)
         dst_item = os.path.join(dst_path, item)
         if os.path.isdir(src_item):
-            copy_directory(src_item, dst_item)
+            copy_directory(src_item, dst_item, verbose_output, match_func)
         else:
-            should_copy_file = dst_item.endswith('.dll') or dst_item.endswith('.py')
-            if is_windows:
-                should_copy_file = should_copy_file or dst_item.endswith('.exe')
+            if match_func(src_item):
+                if verbose_output:
+                    print("> copy {0} => {1}".format(src_item, dst_item))
+                shutil.copy2(src_item, dst_item)
             else:
-                should_copy_file = should_copy_file or dst_item.endswith('.so') or item.find(".") == -1
-            if not should_copy_file:
-                continue
-            shutil.copy2(src_item, dst_item)
+                if verbose_output:
+                    print("> skipping {0}".format(src_item))
 
 
 def copy_files(src_path, dst_path, file_names):
@@ -280,7 +311,7 @@ def copy_files(src_path, dst_path, file_names):
 
     print('### Copying below files to {0}:'.format(dst_path))
     print('')
-    print(file_names)
+    print(os.linesep.join(file_names))
     for f in file_names:
         # Create same structure in dst so we don't clobber same files names present in different directories
         dst_path_of_file = f.replace(src_path, dst_path)
@@ -302,6 +333,7 @@ def partition_files(src_directory, dst_directory, max_size, exclude_directories=
         exclude_files ([string]): List of files names to be excluded.
     """
 
+    print('Partitioning files from {0} to {1}'.format(src_directory, dst_directory))
     sorted_by_size = get_files_sorted_by_size(src_directory, exclude_directories, exclude_files)
     partitions = first_fit(sorted_by_size, max_size)
 
@@ -343,7 +375,7 @@ def main(main_args):
     creator = ""
     ci = True
     if is_windows:
-        helix_queue = "Windows.10.Arm64" if arch == "arm64" else "Windows.10.Amd64"
+        helix_queue = "Windows.10.Arm64" if arch == "arm64" else "Windows.10.Amd64.X86"
     else:
         if arch == "arm":
             helix_queue = "(Ubuntu.1804.Arm32)Ubuntu.1804.Armarch@mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-helix-arm32v7-bfcd90a-20200121150440"
@@ -354,9 +386,16 @@ def main(main_args):
 
     # create superpmi directory
     print('Copying {} -> {}'.format(superpmi_src_directory, superpmi_dst_directory))
-    copy_directory(superpmi_src_directory, superpmi_dst_directory)
+    copy_directory(superpmi_src_directory, superpmi_dst_directory, match_func=lambda path: any(path.endswith(extension) for extension in [".py"]))
+
+    if is_windows:
+        acceptable_copy = lambda path: any(path.endswith(extension) for extension in [".py", ".dll", ".exe", ".json"])
+    else:
+        # Need to accept files without any extension, which is how executable filesnames look.
+        acceptable_copy = lambda path: (os.path.basename(path).find(".") == -1) or any(path.endswith(extension) for extension in [".py", ".dll", ".so", ".json"])
+
     print('Copying {} -> {}'.format(coreclr_args.core_root_directory, superpmi_dst_directory))
-    copy_directory(coreclr_args.core_root_directory, superpmi_dst_directory)
+    copy_directory(coreclr_args.core_root_directory, superpmi_dst_directory, match_func=acceptable_copy)
 
     # Clone and build jitutils
     try:
@@ -377,21 +416,32 @@ def main(main_args):
     workitem_directory = path.join(source_directory, "workitem")
     pmiassemblies_directory = path.join(workitem_directory, "pmiAssembliesDirectory")
 
-    # libraries
-    libraries_artifacts = path.join(pmiassemblies_directory, "Core_Root")
-    partition_files(coreclr_args.libraries_directory, libraries_artifacts, coreclr_args.max_size)
+    # NOTE: we can't use the build machine ".dotnet" to run on all platforms. E.g., the Windows x86 build uses a
+    # Windows x64 .dotnet\dotnet.exe that can't load a 32-bit shim. Thus, we always use corerun from Core_Root to invoke crossgen2.
+    # The following will copy .dotnet to the correlation payload in case we change our mind, and need or want to use it for some scenarios.
 
-    # test
-    tests_artifacts = path.join(pmiassemblies_directory, "Tests")
-    # TODO: Disable SPMI for P1 tests
-    # partition_files(coreclr_args.tests_directory, tests_artifacts, coreclr_args.max_size, ["Core_Root"])
+    # # Copy ".dotnet" to correlation_payload_directory for crossgen2 job; it is needed to invoke crossgen2.dll
+    # if coreclr_args.collection_type == "crossgen2":
+    #     dotnet_src_directory = path.join(source_directory, ".dotnet")
+    #     dotnet_dst_directory = path.join(correlation_payload_directory, ".dotnet")
+    #     print('Copying {} -> {}'.format(dotnet_src_directory, dotnet_dst_directory))
+    #     copy_directory(dotnet_src_directory, dotnet_dst_directory, verbose_output=False)
+
+    # payload
+    input_artifacts = path.join(pmiassemblies_directory, coreclr_args.collection_name)
+    exclude_directory = ['Core_Root'] if coreclr_args.collection_name == "tests" else []
+    exclude_files = native_binaries_to_ignore
+    if coreclr_args.collection_type == "crossgen2":
+        print('Adding exclusions for crossgen2')
+        # Currently, trying to crossgen2 R2RTest\Microsoft.Build.dll causes a pop-up failure, so exclude it.
+        exclude_files += [ "Microsoft.Build.dll" ]
+    partition_files(coreclr_args.input_directory, input_artifacts, coreclr_args.max_size, exclude_directory, exclude_files)
 
     # Set variables
     print('Setting pipeline variables:')
     set_pipeline_variable("CorrelationPayloadDirectory", correlation_payload_directory)
     set_pipeline_variable("WorkItemDirectory", workitem_directory)
-    set_pipeline_variable("LibrariesArtifacts", libraries_artifacts)
-    set_pipeline_variable("TestsArtifacts", tests_artifacts)
+    set_pipeline_variable("InputArtifacts", input_artifacts)
     if is_windows:
         set_pipeline_variable("Python", "py -3")
     else:

@@ -470,13 +470,6 @@ mono_remoting_update_exception (MonoException *exc)
 		return ret;
 	}
 
-	thread = mono_thread_internal_current ();
-	if (mono_object_class (exc) == mono_defaults.threadabortexception_class &&
-			thread->flags & MONO_THREAD_FLAG_APPDOMAIN_ABORT) {
-		mono_thread_internal_reset_abort (thread);
-		return mono_get_exception_appdomain_unloaded ();
-	}
-
 	return exc;
 }
 
@@ -623,15 +616,10 @@ mono_marshal_set_domain_by_id (gint32 id, MonoBoolean push)
 	MonoDomain *current_domain = mono_domain_get ();
 	MonoDomain *domain = mono_domain_get_by_id (id);
 
-	if (!domain || !mono_domain_set_fast (domain, FALSE)) {
-		mono_set_pending_exception (mono_get_exception_appdomain_unloaded ());
+	if (!domain)
 		return 0;
-	}
 
-	if (push)
-		mono_thread_push_appdomain_ref (domain);
-	else
-		mono_thread_pop_appdomain_ref ();
+	mono_domain_set_fast (domain, FALSE);
 
 	return current_domain->domain_id;
 }
@@ -761,9 +749,10 @@ mono_marshal_get_xappdomain_dispatch (MonoMethod *method, int *marshal_types, in
 
 	mono_mb_emit_ldarg (mb, 1);
 	mono_mb_emit_byte (mb, CEE_LDIND_REF);
-	mono_mb_emit_byte (mb, CEE_DUP);
 	pos = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
 	
+	mono_mb_emit_ldarg (mb, 1);
+	mono_mb_emit_byte (mb, CEE_LDIND_REF);
 	mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
 	mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
 	

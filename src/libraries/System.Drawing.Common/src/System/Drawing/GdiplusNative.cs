@@ -10,9 +10,9 @@ namespace System.Drawing
 {
     // Raw function imports for gdiplus
     // Functions are loaded manually in order to accomodate different shared library names on Unix.
-    internal static unsafe partial class SafeNativeMethods
+    internal static partial class SafeNativeMethods
     {
-        internal static partial class Gdip
+        internal static unsafe partial class Gdip
         {
             // Shared function imports (all platforms)
             [DllImport(LibraryName, ExactSpelling = true)]
@@ -800,7 +800,7 @@ namespace System.Drawing
             internal static extern int GdipVectorTransformMatrixPointsI(HandleRef matrix, Point* pts, int count);
 
             [DllImport(LibraryName, ExactSpelling = true)]
-            internal static extern int GdipGetMatrixElements(HandleRef matrix, IntPtr m);
+            internal static extern unsafe int GdipGetMatrixElements(HandleRef matrix, float* m);
 
             [DllImport(LibraryName, ExactSpelling = true)]
             internal static extern int GdipIsMatrixInvertible(HandleRef matrix, out int boolean);
