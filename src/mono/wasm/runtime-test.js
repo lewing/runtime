@@ -8,28 +8,56 @@ var is_browser = typeof window != "undefined";
 var consoleWebSocket;
 var print;
 var printErr;
-var make_print_fn;
 
-if (is_browser) {
-	make_print_fn = function(level) {
-		return function(_msg) {
-			window.real_print(JSON.stringify({
+if (typeof console === "undefined") {
+	var Console = function () {
+		this.log = function(msg){ print(msg) };
+		this.clear = function() { };
+	};
+	console = new Console();
+}
+
+if (!console.debug)
+	console.log = console.log;
+if (!console.trace)
+	console.trace = console.log;
+if (!console.warn)
+	console.warn = console.log;
+if (!console.error)
+	console.error = console.log;
+
+let redirectJson = function() {
+	let	make_print_fn = function(level) {
+		return function() {
+			globalThis.testLog(JSON.stringify({
 				method: `console.${level}`,
-				payload: _msg
+				payload: arguments[0],
+				arguments: [...arguments]
 			}));
 		};
 	};
-	window.real_print = console.log;
+	console.log = make_print_fn('log');
+	console.debug = make_print_fn('debug');
+	console.info = make_print_fn('info');
+	console.error = make_print_fn('error');
+	console.warn = make_print_fn('warning');
+	console.trace = make_print_fn('trace');
+}
 
+globalThis.testLog = console.log;
+globalThis.testConsole = console;
+
+if (is_browser) {
 	const consoleUrl = `${window.location.origin}/console`.replace('http://', 'ws://');
 
 	consoleWebSocket = new WebSocket(consoleUrl);
 	consoleWebSocket.onopen = function(event) {
-		window.real_print = function(msg) {
+
+		globalThis.testLog = function(msg) {
 			consoleWebSocket.send(msg);
 		};
-
-		print("browser: Console websocket connected.");
+		redirectJson();
+		globalThis.testConsole.log("browser: Console websocket connected.");
 	};
 	consoleWebSocket.onerror = function(event) {
 		console.log(`websocket error: ${event}`);
@@ -45,46 +73,13 @@ if (is_browser) {
 		}
 	}
 } else {
-    let real_console_log = console.log;
-    make_print_fn = function(level) {
-		return function(_msg) {
-			real_console_log(JSON.stringify({
-				method: `console.${level}`,
-				payload: _msg
-			}));
-		};
-	};
+	//redirectJson();
 }
 
-console.log = make_print_fn('log');
-console.debug = make_print_fn('debug');
-console.info = make_print_fn('info');
-console.error = make_print_fn('error');
-console.warn = make_print_fn('warning');
-console.trace = make_print_fn('trace');
-
-print = console.log;
-printErr = console.error;
+print = globalThis.testConsole.log;
+printErr = globalThis.testConsole.error;
 
 // JavaScript core does not have a console defined
-if (typeof console === "undefined") {
-	var Console = function () {
-		this.log = function(msg){ print(msg) };
-		this.clear = function() { };
-	};
-	console = new Console();
-}
-
-if (typeof console !== "undefined") {
-	if (!console.debug)
-		console.debug = console.log;
-	if (!console.trace)
-		console.trace = console.log;
-	if (!console.warn)
-		console.warn = console.log;
-	if (!console.error)
-		console.error = console.log;
-}
 
 if (typeof crypto === 'undefined') {
 	// **NOTE** this is a simple insecure polyfill for testing purposes only
