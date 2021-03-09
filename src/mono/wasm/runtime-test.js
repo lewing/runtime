@@ -16,17 +16,17 @@ if (typeof (console) === "undefined") {
 
 globalThis.testConsole = console;
 
-function proxyMethod (prefix, func, asJson) {
+function proxyMethod (prefix, proxyFunc, asJson) {
 	return function() {
 		var args = [...arguments];
 		if (asJson) {
-			func (JSON.stringify({
+			proxyFunc (JSON.stringify({
 				method: prefix,
 				payload: args[0],
 				arguments: args
 			}));
 		} else {
-			func([prefix + args[0], ...args.slice(1)]);
+			proxyFunc([prefix + args[0], ...args.slice(1)]);
 		}
 	};
 };
@@ -34,13 +34,13 @@ function proxyMethod (prefix, func, asJson) {
 var methods = ["debug", "trace", "warn", "info", "error"];
 for (var m of methods) {
 	if (typeof(console[m]) != "function") {
-		console[m] = proxyMethod(`console.${m}: `, console.log, false);
+		globalThis.console[m] = proxyMethod(`console.${m}: `, console.log, false);
 	}
 }
 
-function proxyJson (func) {
+function proxyJson (consoleFunc) {
 	for (var m of ["log", ...methods])
-		console[m] = proxyMethod(`console.${m}`,func, true);
+		globalThis.console[m] = proxyMethod(`console.${m}`, consolefunc, true);
 }
 
 if (is_browser) {
@@ -103,6 +103,8 @@ try {
 	if (typeof arguments == "undefined") {
 		if (typeof scriptArgs !== "undefined")
 			arguments = scriptArgs;
+		if (typeof process !== "undefined")
+			arguments = process.argv;
 	}
 } catch (e) {
 }
@@ -119,7 +121,7 @@ function test_exit (exit_code) {
 	if (is_browser) {
 		// Notify the selenium script
 		Module.exit_code = exit_code;
-		Module.print ("WASM EXIT " + exit_code);
+		console.log ("WASM EXIT " + exit_code);
 		var tests_done_elem = document.createElement ("label");
 		tests_done_elem.id = "tests_done";
 		tests_done_elem.innerHTML = exit_code.toString ();
@@ -130,7 +132,7 @@ function test_exit (exit_code) {
 }
 
 function fail_exec (reason) {
-	Module.print (reason);
+	console.log (reason);
 	test_exit (1);
 }
 
@@ -144,8 +146,8 @@ function inspect_object (o) {
 }
 
 // Preprocess arguments
-var args = testArguments;
-console.info("Arguments: " + testArguments);
+var args = [...testArguments];
+//console.info("Arguments: " + testArguments);
 profilers = [];
 setenv = {};
 runtime_args = [];
@@ -153,28 +155,29 @@ enable_gc = true;
 enable_zoneinfo = false;
 working_dir='/';
 while (args !== undefined && args.length > 0) {
-	if (args [0].startsWith ("--profile=")) {
-		var arg = args [0].substring ("--profile=".length);
+	let currentArg = args[0].toString();
+		if (currentArg.startsWith ("--profile=")) {
+		var arg = currentArg.substring ("--profile=".length);
 
 		profilers.push (arg);
 
 		args = args.slice (1);
-	} else if (args [0].startsWith ("--setenv=")) {
-		var arg = args [0].substring ("--setenv=".length);
+	} else if (currentArg.startsWith ("--setenv=")) {
+		var arg = currentArg.substring ("--setenv=".length);
 		var parts = arg.split ('=');
 		if (parts.length != 2)
-			fail_exec ("Error: malformed argument: '" + args [0]);
+			fail_exec ("Error: malformed argument: '" + currentArg);
 		setenv [parts [0]] = parts [1];
 		args = args.slice (1);
-	} else if (args [0].startsWith ("--runtime-arg=")) {
-		var arg = args [0].substring ("--runtime-arg=".length);
+	} else if (currentArg.startsWith ("--runtime-arg=")) {
+		var arg = currentArg.substring ("--runtime-arg=".length);
 		runtime_args.push (arg);
 		args = args.slice (1);
-	} else if (args [0] == "--disable-on-demand-gc") {
+	} else if (currentArg == "--disable-on-demand-gc") {
 		enable_gc = false;
 		args = args.slice (1);
-	} else if (args [0].startsWith ("--working-dir=")) {
-		var arg = args [0].substring ("--working-dir=".length);
+	} else if (currentArg.startsWith ("--working-dir=")) {
+		var arg = currentArg.substring ("--working-dir=".length);
 		working_dir = arg;
 		args = args.slice (1);
 	} else {
@@ -200,30 +203,37 @@ function loadScript (url)
 		script.src = url;
 		document.head.appendChild (script);
 	} else {
-		load (url);
+		//load (url);
+		return require ('./' + url);
 	}
 }
 
-loadScript ("mono-config.js");
-
-var Module = {
+var config = loadScript ("mono-config.js").config;
+var module = loadScript ("dotnet.js");
+let mP = module ({
 	mainScriptUrlOrBlob: "dotnet.js",
-
+	config,
+	setenv,
 	print,
 	printErr,
-
 	onAbort: function(x) {
-		print ("ABORT: " + x);
+		console.log ("ABORT: " + x);
 		var err = new Error();
-		print ("Stacktrace: \n");
-		print (err.stack);
+		console.log ("Stacktrace: \n");
+		console.log (err.stack);
 		test_exit (1);
 	},
 
 	onRuntimeInitialized: function () {
+		try {
+		Module = this;
+		//var config = this.config;
+		console.log ("happy");
+		console.log (setenv);
+		console.log (config);
 		// Have to set env vars here to enable setting MONO_LOG_LEVEL etc.
 		for (var variable in setenv) {
-			MONO.mono_wasm_setenv (variable, setenv [variable]);
+			Module._mono_wasm_setenv (variable, setenv [variable]);
 		}
 
 		if (!enable_gc) {
@@ -231,6 +241,7 @@ var Module = {
 		}
 
 		config.loaded_cb = function () {
+			console.log ("loaded");
 			let wds = FS.stat (working_dir);
 			if (wds === undefined || !FS.isDir (wds.mode)) {
 				fail_exec (`Could not find working directory ${working_dir}`);
@@ -241,6 +252,7 @@ var Module = {
 			App.init ();
 		};
 		config.fetch_file_cb = function (asset) {
+			console.log ("fetch");
 			// console.log("fetch_file_cb('" + asset + "')");
 			// for testing purposes add BCL assets to VFS until we special case File.Open
 			// to identify when an assembly from the BCL is being open and resolve it correctly.
@@ -261,7 +273,11 @@ var Module = {
 				return new Promise ((resolve, reject) => {
 					var bytes = null, error = null;
 					try {
-						bytes = read (asset, 'binary');
+						console.log ("reading "+asset);
+						var fs2 = require ('fs');
+						bytes = fs2.readFileSync('./managed/'+asset);
+						console.log (bytes);
+						//bytes = read (asset, 'binary');
 					} catch (exc) {
 						error = exc;
 					}
@@ -280,11 +296,12 @@ var Module = {
 			}
 		};
 
-		MONO.mono_load_runtime_and_bcl_args (config);
+		Module.mono_load_runtime_and_bcl_args (config);
+	} catch (e) {
+		console.log (e);
+	}
 	},
-};
-
-loadScript ("dotnet.js");
+}).then ((va) => console.log (va));
 
 const IGNORE_PARAM_COUNT = -1;
 
@@ -314,10 +331,10 @@ var App = {
 			var res = 0;
 				try {
 					res = exec_regression (10, args[1]);
-					Module.print ("REGRESSION RESULT: " + res);
+					console.log ("REGRESSION RESULT: " + res);
 				} catch (e) {
-					Module.print ("ABORT: " + e);
-					print (e.stack);
+					console.log ("ABORT: " + e);
+					console.log (e.stack);
 					res = 1;
 				}
 
@@ -368,7 +385,7 @@ var App = {
 			}
 
 		} else {
-			fail_exec ("Unhandled argument: " + args [0]);
+			fail_exec ("Unhandled argument: " + args[0]);
 		}
 	},
 	call_test_method: function (method_name, args, signature) {
