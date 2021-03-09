@@ -873,7 +873,7 @@ var BindingSupportLib = {
 			}
 
 			var constructor = this._create_rebindable_named_function (name, argumentNames, body, closureArgumentNames);
-			result = constructor.apply (this, closureArgumentList);
+			result = constructor.apply (null, closureArgumentList);
 
 			return result;
 		},
@@ -1016,7 +1016,7 @@ var BindingSupportLib = {
 			// ensure the indirect values are 8-byte aligned so that aligned loads and stores will work
 			var indirectBaseOffset = ((((args_marshal.length * 4) + 7) / 8) | 0) * 8;
 
-			var closure = {};
+			var closure = { Module };
 			var indirectLocalOffset = 0;
 
 			body.push (
@@ -1349,6 +1349,7 @@ var BindingSupportLib = {
 				library_mono: MONO,
 				binding_support: this,
 				method: method,
+				Module: Module,
 				this_arg: this_arg
 			};
 

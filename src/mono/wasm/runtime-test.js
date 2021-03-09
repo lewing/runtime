@@ -298,7 +298,7 @@ var Module = {
 
 eval (loadScript ("dotnet.js"));
 //var module = require ('./dotnet.js')(Module).then ((va) => console.log (va));
-globalThis.Module = Module;
+//globalThis.Module = Module;
 
 const IGNORE_PARAM_COUNT = -1;
 
