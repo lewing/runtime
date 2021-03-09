@@ -873,7 +873,7 @@ var BindingSupportLib = {
 			}
 
 			var constructor = this._create_rebindable_named_function (name, argumentNames, body, closureArgumentNames);
-			result = constructor.apply (null, closureArgumentList);
+			result = constructor.apply (this, closureArgumentList);
 
 			return result;
 		},

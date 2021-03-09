@@ -4,15 +4,17 @@
 //
 
 //glue code to deal with the differences between chrome, ch, d8, jsc and sm.
-var is_browser = typeof window != "undefined";
+const is_browser = typeof window != "undefined";
+const is_node = !is_browser && typeof process != 'undefined' && process['title'] == 'node'
 
 // if the engine doesn't provide a console
 if (typeof (console) === "undefined") {
-	var console = {
+	console = {
 		log: globalThis.print,
 		clear: function () { }
 	};
 }
+
 
 globalThis.testConsole = console;
 
@@ -34,13 +36,13 @@ function proxyMethod (prefix, proxyFunc, asJson) {
 var methods = ["debug", "trace", "warn", "info", "error"];
 for (var m of methods) {
 	if (typeof(console[m]) != "function") {
-		globalThis.console[m] = proxyMethod(`console.${m}: `, console.log, false);
+		console[m] = proxyMethod(`console.${m}: `, console.log, false);
 	}
 }
 
 function proxyJson (consoleFunc) {
 	for (var m of ["log", ...methods])
-		globalThis.console[m] = proxyMethod(`console.${m}`, consolefunc, true);
+		console[m] = proxyMethod(`console.${m}`, consolefunc, true);
 }
 
 if (is_browser) {
@@ -49,7 +51,7 @@ if (is_browser) {
 	let consoleWebSocket = new WebSocket(consoleUrl);
 	consoleWebSocket.onopen = function(event) {
 		proxyJson(function (msg) { consoleWebSocket.send (msg); });
-		globalThis.testConsole.log("browser: Console websocket connected.");
+		testConsole.log("browser: Console websocket connected.");
 	};
 	consoleWebSocket.onerror = function(event) {
 		console.log(`websocket error: ${event}`);
@@ -63,6 +65,18 @@ if (is_browser) {
 			arguments.push (v [1]);
 		}
 	}
+}
+
+if (is_node) {
+	arguments = process.argv.slice (2);
+	var fs = require ('fs');
+	function load (file) {
+		eval (fs.readFileSync(file).toString());
+	};
+	function read (path) {
+		return fs.readFileSync(path);
+	};
+	const { performance, PerformanceObserver } = require("perf_hooks")
 }
 //proxyJson(console.log);
 
@@ -92,22 +106,18 @@ if (typeof performance == 'undefined') {
 }
 
 try {
-	if (typeof arguments == "undefined")
-		arguments = WScript.Arguments;
-	load = WScript.LoadScriptFile;
-	read = WScript.LoadBinaryFile;
-} catch (e) {
-}
-
-try {
 	if (typeof arguments == "undefined") {
-		if (typeof scriptArgs !== "undefined")
+	 	if (typof (WScript) != "undfined") {
+			arguments = WScript.Arguments;
+			load = WScript.LoadScriptFile;	
+			read = WScript.LoadBinaryFile;
+		} else if (typeof (scriptArgs) != "undefined") {
 			arguments = scriptArgs;
-		if (typeof process !== "undefined")
-			arguments = process.argv;
+		}
 	}
 } catch (e) {
 }
+
 
 if (arguments === undefined)
 	arguments = [];
@@ -189,33 +199,32 @@ testArguments = args;
 // cheap way to let the testing infrastructure know we're running in a browser context (or not)
 setenv["IsBrowserDomSupported"] = is_browser.toString().toLowerCase();
 
-function writeContentToFile(content, path)
-{
+function writeContentToFile(content, path) {
 	var stream = FS.open(path, 'w+');
 	FS.write(stream, content, 0, content.length, 0);
 	FS.close(stream);
 }
 
-function loadScript (url)
-{
+function loadScript (url){
 	if (is_browser) {
 		var script = document.createElement ("script");
 		script.src = url;
 		document.head.appendChild (script);
+	} else if (is_node) {
+		return read (url).toString();
 	} else {
-		//load (url);
-		return require ('./' + url);
+		load (url);
 	}
+	return "";
 }
 
-var config = loadScript ("mono-config.js").config;
-var module = loadScript ("dotnet.js");
-let mP = module ({
+eval (loadScript ("mono-config.js"));
+var Module = {
 	mainScriptUrlOrBlob: "dotnet.js",
 	config,
 	setenv,
-	print,
-	printErr,
+	read,
+	arguments,
 	onAbort: function(x) {
 		console.log ("ABORT: " + x);
 		var err = new Error();
@@ -228,9 +237,9 @@ let mP = module ({
 		try {
 		Module = this;
 		//var config = this.config;
-		console.log ("happy");
-		console.log (setenv);
-		console.log (config);
+		//console.log ("happy");
+		//console.log (setenv);
+		//console.log (config);
 		// Have to set env vars here to enable setting MONO_LOG_LEVEL etc.
 		for (var variable in setenv) {
 			Module._mono_wasm_setenv (variable, setenv [variable]);
@@ -252,8 +261,7 @@ let mP = module ({
 			App.init ();
 		};
 		config.fetch_file_cb = function (asset) {
-			console.log ("fetch");
-			// console.log("fetch_file_cb('" + asset + "')");
+			//console.log("fetch_file_cb('" + asset + "')");
 			// for testing purposes add BCL assets to VFS until we special case File.Open
 			// to identify when an assembly from the BCL is being open and resolve it correctly.
 			/*
@@ -273,26 +281,16 @@ let mP = module ({
 				return new Promise ((resolve, reject) => {
 					var bytes = null, error = null;
 					try {
-						console.log ("reading "+asset);
-						var fs2 = require ('fs');
-						bytes = fs2.readFileSync('./managed/'+asset);
-						console.log (bytes);
-						//bytes = read (asset, 'binary');
+						bytes = Module.read (asset, 'binary');
 					} catch (exc) {
-						error = exc;
+						reject (exc);
 					}
-					var response = { ok: (bytes && !error), url: asset,
-						arrayBuffer: function () {
-							return new Promise ((resolve2, reject2) => {
-								if (error)
-									reject2 (error);
-								else
-									resolve2 (new Uint8Array (bytes));
-						}
-					)}
-					}
-					resolve (response);
-				})
+					resolve ({
+						ok: (bytes && !error),
+						url: asset,
+						arrayBuffer: () => Promise.resolve (new Uint8Array (bytes))
+					});
+				});
 			}
 		};
 
@@ -301,7 +299,11 @@ let mP = module ({
 		console.log (e);
 	}
 	},
-}).then ((va) => console.log (va));
+};
+
+eval (loadScript ("dotnet.js"));
+//var module = require ('./dotnet.js')(Module).then ((va) => console.log (va));
+globalThis.Module = Module;
 
 const IGNORE_PARAM_COUNT = -1;
 
@@ -369,9 +371,7 @@ var App = {
 			wasm_set_main_args (main_argc, main_argv);
 
 			// Automatic signature isn't working correctly
-			let result = Module.mono_call_assembly_entry_point (main_assembly_name, [app_args], "m");
-			let onError = function (error)
-			{
+			let onError = function (error) {
 				console.error (error);
 				if (error.stack)
 					console.error (error.stack);
@@ -379,7 +379,9 @@ var App = {
 				test_exit (1);
 			}
 			try {
-				result.then (test_exit).catch (onError);
+				Module.mono_call_assembly_entry_point (main_assembly_name, [app_args], "m")
+					.then (test_exit)
+					.catch (onError);
 			} catch (error) {
 				onError(error);
 			}

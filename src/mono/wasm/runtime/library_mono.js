@@ -2422,7 +2422,7 @@ var MonoSupportLib = {
 		if (typeof globalThis.setTimeout === 'function') {
 			globalThis.setTimeout (function () {
 				this.mono_set_timeout_exec (id);
-			}, timeout);
+			}.bind(this), timeout);
 		} else {
 			++MONO.pump_count;
 			MONO.timeout_queue.push(function() {
