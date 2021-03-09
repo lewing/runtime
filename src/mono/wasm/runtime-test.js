@@ -5,7 +5,7 @@
 
 //glue code to deal with the differences between chrome, ch, d8, jsc and sm.
 const is_browser = typeof window != "undefined";
-const is_node = !is_browser && typeof process != 'undefined' && process['title'] == 'node'
+const is_node = !is_browser && typeof process != 'undefined';
 
 // if the engine doesn't provide a console
 if (typeof (console) === "undefined") {
@@ -109,7 +109,7 @@ try {
 	if (typeof arguments == "undefined") {
 	 	if (typof (WScript) != "undfined") {
 			arguments = WScript.Arguments;
-			load = WScript.LoadScriptFile;	
+			load = WScript.LoadScriptFile;
 			read = WScript.LoadBinaryFile;
 		} else if (typeof (scriptArgs) != "undefined") {
 			arguments = scriptArgs;
@@ -235,11 +235,7 @@ var Module = {
 
 	onRuntimeInitialized: function () {
 		try {
-		Module = this;
-		//var config = this.config;
-		//console.log ("happy");
-		//console.log (setenv);
-		//console.log (config);
+
 		// Have to set env vars here to enable setting MONO_LOG_LEVEL etc.
 		for (var variable in setenv) {
 			Module._mono_wasm_setenv (variable, setenv [variable]);
@@ -250,7 +246,6 @@ var Module = {
 		}
 
 		config.loaded_cb = function () {
-			console.log ("loaded");
 			let wds = FS.stat (working_dir);
 			if (wds === undefined || !FS.isDir (wds.mode)) {
 				fail_exec (`Could not find working directory ${working_dir}`);
