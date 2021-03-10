@@ -107,7 +107,7 @@ if (typeof performance == 'undefined') {
 
 try {
 	if (typeof arguments == "undefined") {
-	 	if (typof (WScript) != "undfined") {
+		if (typeof (WScript) != "undefined") {
 			arguments = WScript.Arguments;
 			load = WScript.LoadScriptFile;
 			read = WScript.LoadBinaryFile;
@@ -165,8 +165,8 @@ enable_gc = true;
 enable_zoneinfo = false;
 working_dir='/';
 while (args !== undefined && args.length > 0) {
-	let currentArg = args[0].toString();
-		if (currentArg.startsWith ("--profile=")) {
+	let currentArg = args [0].toString();
+	if (currentArg.startsWith ("--profile=")) {
 		var arg = currentArg.substring ("--profile=".length);
 
 		profilers.push (arg);

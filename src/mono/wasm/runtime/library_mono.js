@@ -2412,6 +2412,8 @@ var MonoSupportLib = {
 		++MONO.pump_count;
 		if (typeof globalThis.setTimeout === 'function') {
 			globalThis.setTimeout (MONO.pump_message, 0);
+		} else {
+			Promise.resolve().then (MONO.pump_message);
 		}
 	},
 
@@ -2419,15 +2421,12 @@ var MonoSupportLib = {
 		if (!this.mono_set_timeout_exec)
 			this.mono_set_timeout_exec = Module.cwrap ("mono_set_timeout_exec", null, [ 'number' ]);
 
+		var timer = function () { this.mono_set_timeout_exec (id) }.bind (this);
 		if (typeof globalThis.setTimeout === 'function') {
-			globalThis.setTimeout (function () {
-				this.mono_set_timeout_exec (id);
-			}.bind(this), timeout);
+			globalThis.setTimeout (timer, timeout);
 		} else {
 			++MONO.pump_count;
-			MONO.timeout_queue.push(function() {
-				this.mono_set_timeout_exec (id);
-			})
+			MONO.timeout_queue.push(timer);
 		}
 	},
 
