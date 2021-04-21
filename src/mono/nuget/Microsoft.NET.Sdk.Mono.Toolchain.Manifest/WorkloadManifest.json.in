@@ -1,16 +1,16 @@
 {
   "version": 1,
   "workloads": {
-    "microsoft-net-runtime-mono-browser-build": {
-      "description": "Browser Mono Runtime Build Workload",
+    "microsoft-net-runtime-browser": {
+      "description": "Browser runtime performance tools",
       "packs": [
-        "Microsoft.NETCore.App.Runtime.Mono.browser-wasm",
-        "Microsoft.NET.Runtime.MonoAOTCompiler.Task",
-        "Microsoft.NET.Runtime.WebAssembly.Sdk",
-        "Microsoft.NETCore.App.Runtime.AOT.Cross.browser-wasm",
         "Microsoft.NET.Runtime.Emscripten.Node",
         "Microsoft.NET.Runtime.Emscripten.Python",
-        "Microsoft.NET.Runtime.Emscripten.Sdk"
+        "Microsoft.NET.Runtime.Emscripten.Sdk",
+        "Microsoft.NET.Runtime.WebAssembly.Sdk",
+        "Microsoft.NET.Runtime.MonoAOTCompiler.Task",
+        "Microsoft.NETCore.App.Runtime.Mono.browser-wasm",
+        "Microsoft.NETCore.App.Runtime.AOT.Cross.browser-wasm"
       ]
     },
     "microsoft-net-runtime-android": {
@@ -133,8 +133,8 @@
       "kind": "framework",
       "version": "${PackageVersion}",
       "alias-to": {
-        "osx-arm64": "Microsoft.NETCore.App.Runtime.Mono.iossimulator-arm64",
-        "osx-x64": "Microsoft.NETCore.App.Runtime.Mono.iossimulator-x64"
+        "osx-x64": "Microsoft.NETCore.App.Runtime.Mono.iossimulator-x64",
+        "osx-arm64": "Microsoft.NETCore.App.Runtime.Mono.iossimulator-arm64"
       }
     },
     "Microsoft.NETCore.App.Runtime.AOT.Cross.tvos-arm64": {
@@ -153,8 +153,8 @@
       "kind": "framework",
       "version": "${PackageVersion}",
       "alias-to": {
-        "osx-arm64": "Microsoft.NETCore.App.Runtime.Mono.tvossimulator-arm64",
-        "osx-x64": "Microsoft.NETCore.App.Runtime.Mono.tvossimulator-x64"
+        "osx-x64": "Microsoft.NETCore.App.Runtime.Mono.tvossimulator-x64",
+        "osx-arm64": "Microsoft.NETCore.App.Runtime.Mono.tvossimulator-arm64"
       }
     },
     "Microsoft.NETCore.App.Runtime.AOT.Cross.tvossimulator": {
