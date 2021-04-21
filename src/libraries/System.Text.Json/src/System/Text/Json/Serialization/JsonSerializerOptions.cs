@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Encodings.Web;
 using System.Text.Json.Node;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace System.Text.Json
 {
@@ -20,11 +21,15 @@ namespace System.Text.Json
 
         internal static readonly JsonSerializerOptions s_defaultOptions = new JsonSerializerOptions();
 
-        private readonly ConcurrentDictionary<Type, JsonClassInfo> _classes = new ConcurrentDictionary<Type, JsonClassInfo>();
+        private readonly ConcurrentDictionary<Type, JsonTypeInfo> _classes = new ConcurrentDictionary<Type, JsonTypeInfo>();
 
         // Simple LRU cache for the public (de)serialize entry points that avoid some lookups in _classes.
         // Although this may be written by multiple threads, 'volatile' was not added since any local affinity is fine.
-        private JsonClassInfo? _lastClass { get; set; }
+        private JsonTypeInfo? _lastClass { get; set; }
+
+        internal JsonSerializerContext? _context;
+
+        private Func<Type, JsonSerializerOptions, JsonTypeInfo>? _typeInfoCreationFunc;
 
         // For any new option added, adding it to the options copied in the copy constructor below must be considered.
 
@@ -96,7 +101,7 @@ namespace System.Text.Json
             EffectiveMaxDepth = options.EffectiveMaxDepth;
             ReferenceHandlingStrategy = options.ReferenceHandlingStrategy;
 
-            // _classes is not copied as sharing the JsonClassInfo and JsonPropertyInfo caches can result in
+            // _classes is not copied as sharing the JsonTypeInfo and JsonPropertyInfo caches can result in
             // unnecessary references to type metadata, potentially hindering garbage collection on the source options.
 
             // _haveTypesBeenCreated is not copied; it's okay to make changes to this options instance as (de)serialization has not occurred.
@@ -133,6 +138,25 @@ namespace System.Text.Json
             {
                 throw new ArgumentOutOfRangeException(nameof(defaults));
             }
+        }
+
+        /// <summary>
+        /// Binds current <see cref="JsonSerializerOptions"/> instance with a new instance of the specified <see cref="JsonSerializerContext"/> type.
+        /// </summary>
+        /// <typeparam name="TContext">The generic definition of the specified context type.</typeparam>
+        /// <remarks>When serializing and deserializing types using the options
+        /// instance, metadata for the types will be fetched from the context instance.
+        /// </remarks>
+        public void AddContext<TContext>() where TContext : JsonSerializerContext, new()
+        {
+            if (_context != null)
+            {
+                ThrowHelper.ThrowInvalidOperationException_JsonSerializerOptionsAlreadyBoundToContext();
+            }
+
+            TContext context = new();
+            _context = context;
+            context._options = this;
         }
 
         /// <summary>
@@ -545,34 +569,51 @@ namespace System.Text.Json
             }
         }
 
-        internal JsonClassInfo GetOrAddClass(Type type)
+        internal JsonTypeInfo GetOrAddClass(Type type)
         {
             _haveTypesBeenCreated = true;
 
-            // todo: for performance and reduced instances, consider using the converters and JsonClassInfo from s_defaultOptions by cloning (or reference directly if no changes).
+            // todo: for performance and reduced instances, consider using the converters and JsonTypeInfo from s_defaultOptions by cloning (or reference directly if no changes).
             // https://github.com/dotnet/runtime/issues/32357
-            if (!_classes.TryGetValue(type, out JsonClassInfo? result))
+            if (!_classes.TryGetValue(type, out JsonTypeInfo? result))
             {
-                result = _classes.GetOrAdd(type, new JsonClassInfo(type, this));
+                result = _classes.GetOrAdd(type, GetClassFromContextOrCreate(type));
             }
 
             return result;
         }
 
-        /// <summary>
-        /// Return the ClassInfo for root API calls.
-        /// This has a LRU cache that is intended only for public API calls that specify the root type.
-        /// </summary>
-        internal JsonClassInfo GetOrAddClassForRootType(Type type)
+        internal JsonTypeInfo GetClassFromContextOrCreate(Type type)
         {
-            JsonClassInfo? jsonClassInfo = _lastClass;
-            if (jsonClassInfo?.Type != type)
+            JsonTypeInfo? info = _context?.GetTypeInfo(type);
+            if (info != null)
             {
-                jsonClassInfo = GetOrAddClass(type);
-                _lastClass = jsonClassInfo;
+                return info;
             }
 
-            return jsonClassInfo;
+            if (_typeInfoCreationFunc == null)
+            {
+                ThrowHelper.ThrowNotSupportedException_NoMetadataForType(type);
+                return null!;
+            }
+
+            return _typeInfoCreationFunc(type, this);
+        }
+
+        /// <summary>
+        /// Return the TypeInfo for root API calls.
+        /// This has a LRU cache that is intended only for public API calls that specify the root type.
+        /// </summary>
+        internal JsonTypeInfo GetOrAddClassForRootType(Type type)
+        {
+            JsonTypeInfo? jsonTypeInfo = _lastClass;
+            if (jsonTypeInfo?.Type != type)
+            {
+                jsonTypeInfo = GetOrAddClass(type);
+                _lastClass = jsonTypeInfo;
+            }
+
+            return jsonTypeInfo;
         }
 
         internal bool TypeIsCached(Type type)
@@ -621,9 +662,9 @@ namespace System.Text.Json
             // The default options are hidden and thus should be immutable.
             Debug.Assert(this != s_defaultOptions);
 
-            if (_haveTypesBeenCreated)
+            if (_haveTypesBeenCreated || _context != null)
             {
-                ThrowHelper.ThrowInvalidOperationException_SerializerOptionsImmutable();
+                ThrowHelper.ThrowInvalidOperationException_SerializerOptionsImmutable(_context);
             }
         }
     }
