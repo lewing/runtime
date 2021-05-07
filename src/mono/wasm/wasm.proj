@@ -83,7 +83,7 @@
       <IcuDataFiles Include="$(NativeBinDir)*.dat" />
       <WasmSrcFiles Include="$(NativeBinDir)src\*.c;
                              $(NativeBinDir)src\*.js;
-                             $(NativeBinDir)src\emcc-flags.txt;
+                             $(NativeBinDir)src\emcc-flags.rsp;
                              $(NativeBinDir)src\emcc-version.txt" />
       <WasmHeaderFiles Include="$(NativeBinDir)include\wasm\*.h" />
     </ItemGroup>
@@ -199,7 +199,7 @@
           DestinationFolder="$(NativeBinDir)"
           SkipUnchangedFiles="true" />
 
-    <WriteLinesToFile File="$(NativeBinDir)src\emcc-flags.txt"
+    <WriteLinesToFile File="$(NativeBinDir)src\emcc-flags.rsp"
                       Lines="$(EmccFlags)"
                       WriteOnlyWhenDifferent="true" />
 
@@ -213,7 +213,7 @@
       <WasmHeaderFiles Include="$(NativeBinDir)include\wasm\*.h" />
       <WasmSrcFiles Include="$(NativeBinDir)src\*.c;
                              $(NativeBinDir)src\*.js;
-                             $(NativeBinDir)src\emcc-flags.txt;
+                             $(NativeBinDir)src\emcc-flags.rsp;
                              $(NativeBinDir)src\emcc-version.txt" />
       <IcuDataFiles Include="$(NativeBinDir)*.dat" />
     </ItemGroup>
