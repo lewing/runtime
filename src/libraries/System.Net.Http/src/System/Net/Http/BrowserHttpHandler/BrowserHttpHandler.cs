@@ -323,9 +323,15 @@ namespace System.Net.Http
                 return httpResponse;
 
             }
-            catch (JSException jsExc)
-            {
-                throw new System.Net.Http.HttpRequestException(jsExc.Message);
+            catch (OperationCanceledException oce) {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw CreateOperationCanceledException(oce, cancellationToken);
+                }
+                throw;
+            }
+            catch (JSException jse) {
+                throw new System.Net.Http.HttpRequestException(jse.Message);
             }
         }
 
