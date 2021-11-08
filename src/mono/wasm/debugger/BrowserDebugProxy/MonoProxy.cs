@@ -737,12 +737,12 @@ namespace Microsoft.WebAssembly.Diagnostics
         {
             var callFrames = new List<object>();
             var frames = new List<Frame>();
-            var commandParams = new MemoryStream();
-            var commandParamsWriter = new MonoBinaryWriter(commandParams);
+
+            using var commandParamsWriter = new MonoBinaryWriter();
             commandParamsWriter.Write(thread_id);
             commandParamsWriter.Write(0);
             commandParamsWriter.Write(-1);
-            var retDebuggerCmdReader = await SdbHelper.SendDebuggerAgentCommand<CmdThread>(sessionId, CmdThread.GetFrameInfo, commandParams, token);
+            using var retDebuggerCmdReader = await SdbHelper.SendDebuggerAgentCommand<CmdThread>(sessionId, CmdThread.GetFrameInfo, commandParamsWriter.GetMemoryStream(), token);
             var frame_count = retDebuggerCmdReader.ReadInt32();
             //Console.WriteLine("frame_count - " + frame_count);
             for (int j = 0; j < frame_count; j++) {
