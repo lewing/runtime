@@ -385,18 +385,33 @@ namespace Microsoft.WebAssembly.Diagnostics
             HasError = hasError;
         }
 
-        internal static unsafe void PutBytesBE (byte *dest, byte *src, int count)
+        public static MonoBinaryReader From(Result result)
         {
-            int i = 0;
-
-            if (BitConverter.IsLittleEndian){
-                dest += count;
-                for (; i < count; i++)
-                    *(--dest) = *src++;
-            } else {
-                for (; i < count; i++)
-                    *dest++ = *src++;
+            byte[] newBytes = Array.Empty<byte>();
+            if (!result.IsErr) {
+                newBytes = Convert.FromBase64String(result.Value?["result"]?["value"]?["value"]?.Value<string>());
             }
+            return new MonoBinaryReader(new MemoryStream(newBytes), result.IsErr);
+        }
+
+        internal static void PutBytesBE (Span<byte> dest, Span<byte> src)
+        {
+            if (BitConverter.IsLittleEndian)
+            {
+                for (int i = 0; i < src.Length; i++)
+                    dest [src.Length - i - 1] = src [i];
+            }
+            else
+            {
+                src.CopyTo(dest);
+            }
+        }
+
+        public void SkipString()
+        {
+            var valueLen = ReadInt32();
+            for (int i = 0; i < valueLen; i++)
+                ReadByte(); // skip string
         }
 
         public override string ReadString()
@@ -413,45 +428,40 @@ namespace Microsoft.WebAssembly.Diagnostics
             Read(data);
 
             long ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 8);
-            }
-
+            Span<byte> retData = new Span<byte>(&ret, 8);
+            PutBytesBE (retData, data);
             return ret;
         }
         public override unsafe sbyte ReadSByte()
         {
             Span<byte> data = stackalloc byte[4];
+            int ret;
             Read(data);
 
-            int ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 4);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 4);
+            PutBytesBE (retData, data);
             return (sbyte)ret;
         }
 
         public unsafe byte ReadUByte()
         {
             Span<byte> data = stackalloc byte[4];
+            int ret;
             Read(data);
 
-            int ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 4);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 4);
+            PutBytesBE (retData, data);
             return (byte)ret;
         }
 
         public override unsafe int ReadInt32()
         {
             Span<byte> data = stackalloc byte[4];
+            int ret;
             Read(data);
 
-            int ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 4);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 4);
+            PutBytesBE (retData, data);
             return ret;
         }
 
@@ -461,32 +471,29 @@ namespace Microsoft.WebAssembly.Diagnostics
             Read(data);
 
             double ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 8);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 8);
+            PutBytesBE (retData, data);
             return ret;
         }
 
         public override unsafe uint ReadUInt32()
         {
             Span<byte> data = stackalloc byte[4];
+            uint ret;
             Read(data);
 
-            uint ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 4);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 4);
+            PutBytesBE (retData, data);
             return ret;
         }
         public unsafe ushort ReadUShort()
         {
             Span<byte> data = stackalloc byte[4];
+            uint ret;
             Read(data);
 
-            uint ret;
-            fixed (byte *src = &data[0]){
-                PutBytesBE ((byte *) &ret, src, 4);
-            }
+            Span<byte> retData = new Span<byte>(&ret, 4);
+            PutBytesBE (retData, data);
             return (ushort)ret;
         }
     }
