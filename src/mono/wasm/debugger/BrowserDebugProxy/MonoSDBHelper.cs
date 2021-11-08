@@ -409,8 +409,8 @@ namespace Microsoft.WebAssembly.Diagnostics
         }
         public unsafe long ReadLong()
         {
-            byte[] data = new byte[8];
-            Read(data, 0, 8);
+            Span<byte> data = stackalloc byte[8];
+            Read(data);
 
             long ret;
             fixed (byte *src = &data[0]){
@@ -421,8 +421,8 @@ namespace Microsoft.WebAssembly.Diagnostics
         }
         public override unsafe sbyte ReadSByte()
         {
-            byte[] data = new byte[4];
-            Read(data, 0, 4);
+            Span<byte> data = stackalloc byte[4];
+            Read(data);
 
             int ret;
             fixed (byte *src = &data[0]){
@@ -433,8 +433,8 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public unsafe byte ReadUByte()
         {
-            byte[] data = new byte[4];
-            Read(data, 0, 4);
+            Span<byte> data = stackalloc byte[4];
+            Read(data);
 
             int ret;
             fixed (byte *src = &data[0]){
@@ -445,8 +445,9 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public override unsafe int ReadInt32()
         {
-            byte[] data = new byte[4];
-            Read(data, 0, 4);
+            Span<byte> data = stackalloc byte[4];
+            Read(data);
+
             int ret;
             fixed (byte *src = &data[0]){
                 PutBytesBE ((byte *) &ret, src, 4);
@@ -456,8 +457,8 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public override unsafe double ReadDouble()
         {
-            byte[] data = new byte[8];
-            Read(data, 0, 8);
+            Span<byte> data = stackalloc byte[8];
+            Read(data);
 
             double ret;
             fixed (byte *src = &data[0]){
@@ -468,8 +469,8 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public override unsafe uint ReadUInt32()
         {
-            byte[] data = new byte[4];
-            Read(data, 0, 4);
+            Span<byte> data = stackalloc byte[4];
+            Read(data);
 
             uint ret;
             fixed (byte *src = &data[0]){
@@ -479,8 +480,8 @@ namespace Microsoft.WebAssembly.Diagnostics
         }
         public unsafe ushort ReadUShort()
         {
-            byte[] data = new byte[4];
-            Read(data, 0, 4);
+            Span<byte> data = stackalloc byte[4];
+            Read(data);
 
             uint ret;
             fixed (byte *src = &data[0]){
@@ -823,7 +824,10 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         internal async Task<MonoBinaryReader> SendDebuggerAgentCommandInternal(SessionId sessionId, int command_set, int command, MemoryStream parms, CancellationToken token)
         {
-            Result res = await proxy.SendMonoCommand(sessionId, MonoCommands.SendDebuggerAgentCommand(GetId(), command_set, command, Convert.ToBase64String(parms.ToArray())), token);
+            var paramsSegment = ArraySegment<byte>.Empty;
+            parms.TryGetBuffer(out paramsSegment);
+
+            Result res = await proxy.SendMonoCommand(sessionId, MonoCommands.SendDebuggerAgentCommand(GetId(), command_set, command, Convert.ToBase64String(paramsSegment)), token);
             byte[] newBytes = Array.Empty<byte>();
             if (!res.IsErr) {
                 newBytes = Convert.FromBase64String(res.Value?["result"]?["value"]?["value"]?.Value<string>());
@@ -861,7 +865,10 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         internal async Task<MonoBinaryReader> SendDebuggerAgentCommandWithParmsInternal(SessionId sessionId, int command_set, int command, MemoryStream parms, int type, string extraParm, CancellationToken token)
         {
-            Result res = await proxy.SendMonoCommand(sessionId, MonoCommands.SendDebuggerAgentCommandWithParms(GetId(), command_set, command, Convert.ToBase64String(parms.ToArray()), parms.ToArray().Length, type, extraParm), token);
+            var paramsSegment = ArraySegment<byte>.Empty;
+            parms.TryGetBuffer(out paramsSegment);
+
+            Result res = await proxy.SendMonoCommand(sessionId, MonoCommands.SendDebuggerAgentCommandWithParms(GetId(), command_set, command, Convert.ToBase64String(paramsSegment), paramsSegment.Count, type, extraParm), token);
             byte[] newBytes = Array.Empty<byte>();
             if (!res.IsErr) {
                 newBytes = Convert.FromBase64String(res.Value?["result"]?["value"]?["value"]?.Value<string>());
@@ -1555,7 +1562,10 @@ namespace Microsoft.WebAssembly.Diagnostics
 
             return $"{returnType} {methodName} {parameters}";
         }
-        public async Task<JObject> InvokeMethod(SessionId sessionId, byte[] valueTypeBuffer, int methodId, string varName, CancellationToken token)
+
+        public Task<JObject> InvokeMethod(SessionId sessionId, byte[] valueTypeBuffer, int methodId, string varName, CancellationToken token)
+        => InvokeMethod(sessionId, new ArraySegment<byte>(valueTypeBuffer), methodId, varName, token);
+        public async Task<JObject> InvokeMethod(SessionId sessionId, ArraySegment<byte> valueTypeBuffer, int methodId, string varName, CancellationToken token)
         {
             MemoryStream parms = new MemoryStream();
             var commandParamsWriter = new MonoBinaryWriter(parms);
@@ -1589,7 +1599,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             return -1;
         }
 
-        public async Task<JArray> CreateJArrayForProperties(SessionId sessionId, int typeId, byte[] object_buffer, JArray attributes, bool isAutoExpandable, string objectId, bool isOwn, CancellationToken token)
+        public async Task<JArray> CreateJArrayForProperties(SessionId sessionId, int typeId, ArraySegment<byte> object_buffer, JArray attributes, bool isAutoExpandable, string objectId, bool isOwn, CancellationToken token)
         {
             JArray ret = new JArray();
             var retDebuggerCmdReader =  await GetTypePropertiesReader(sessionId, typeId, token);
@@ -2191,12 +2201,14 @@ namespace Microsoft.WebAssembly.Diagnostics
                 command_params_writer_to_proxy.Write(getMethodId);
                 command_params_writer_to_proxy.Write(valueTypes[valueTypeId].valueTypeBuffer);
                 command_params_writer_to_proxy.Write(0);
+                var paramsSegment = ArraySegment<byte>.Empty;
+                command_params_to_proxy.TryGetBuffer(out paramsSegment);
                 valueTypes[valueTypeId].valueTypeProxy.Add(JObject.FromObject(new {
                             get = JObject.FromObject(new {
                                 commandSet = CommandSet.Vm,
                                 command = CmdVM.InvokeMethod,
-                                buffer = Convert.ToBase64String(command_params_to_proxy.ToArray()),
-                                length = command_params_to_proxy.ToArray().Length
+                                buffer = Convert.ToBase64String(paramsSegment),
+                                length = paramsSegment.Count
                                 }),
                             name = propertyNameStr
                         }));
@@ -2318,7 +2330,10 @@ namespace Microsoft.WebAssembly.Diagnostics
                     invokeParamsWriter.Write((byte)ElementType.Object);
                     invokeParamsWriter.Write(objectId);
 
-                    var retMethod = await InvokeMethod(sessionId, invokeParams.ToArray(), methodId, "methodRet", token);
+                    var paramsSegment = ArraySegment<byte>.Empty;
+                    invokeParams.TryGetBuffer(out paramsSegment);
+
+                    var retMethod = await InvokeMethod(sessionId, paramsSegment, methodId, "methodRet", token);
                     DotnetObjectId.TryParse(retMethod?["value"]?["objectId"]?.Value<string>(), out DotnetObjectId dotnetObjectId);
                     var displayAttrs = await GetObjectValues(sessionId, int.Parse(dotnetObjectId.Value), GetObjectCommandOptions.WithProperties | GetObjectCommandOptions.ForDebuggerProxyAttribute, token);
                     return displayAttrs;
@@ -2396,12 +2411,15 @@ namespace Microsoft.WebAssembly.Diagnostics
                             command_params_writer_to_set.Write(1);
                             command_params_writer_to_set.Write(field.Id);
 
+                            var paramsSegment = ArraySegment<byte>.Empty;
+                            command_params_to_set.TryGetBuffer(out paramsSegment);
+
                             fieldValue.Add("set", JObject.FromObject(new {
                                         commandSet = CommandSet.ObjectRef,
                                         command = CmdObject.RefSetValues,
-                                        buffer = Convert.ToBase64String(command_params_to_set.ToArray()),
+                                        buffer = Convert.ToBase64String(paramsSegment.Array),
                                         valtype,
-                                        length = command_params_to_set.ToArray().Length
+                                        length = paramsSegment.Count
                                 }));
                         }
                         objectFields.Add(fieldValue);
@@ -2413,7 +2431,11 @@ namespace Microsoft.WebAssembly.Diagnostics
                 var command_params_obj = new MemoryStream();
                 var commandParamsObjWriter = new MonoBinaryWriter(command_params_obj);
                 commandParamsObjWriter.WriteObj(new DotnetObjectId("object", $"{objectId}"), this);
-                var props = await CreateJArrayForProperties(sessionId, typeId[i], command_params_obj.ToArray(), ret, getCommandType.HasFlag(GetObjectCommandOptions.ForDebuggerProxyAttribute), $"dotnet:object:{objectId}", i == 0, token);
+
+                var command_params_obj_segment = ArraySegment<byte>.Empty;
+                command_params_obj.TryGetBuffer(out command_params_obj_segment);
+
+                var props = await CreateJArrayForProperties(sessionId, typeId[i], command_params_obj_segment, ret, getCommandType.HasFlag(GetObjectCommandOptions.ForDebuggerProxyAttribute), $"dotnet:object:{objectId}", i == 0, token);
                 ret = new JArray(ret.Union(props));
 
                 // ownProperties
@@ -2488,14 +2510,18 @@ namespace Microsoft.WebAssembly.Diagnostics
                         command_params_writer_to_set.Write((byte)ElementType.Class);
                         command_params_writer_to_set.Write(objectId);
                         command_params_writer_to_set.Write(1);
+
+                        var paramsSegment = ArraySegment<byte>.Empty;
+                        command_params_to_set.TryGetBuffer(out paramsSegment);
+
                         if (attr["set"] != null)
                         {
                             attr["set"] = JObject.FromObject(new {
                                         commandSet = CommandSet.Vm,
                                         command = CmdVM.InvokeMethod,
-                                        buffer = Convert.ToBase64String(command_params_to_set.ToArray()),
+                                        buffer = Convert.ToBase64String(paramsSegment),
                                         valtype = attr["set"]["valtype"],
-                                        length = command_params_to_set.ToArray().Length
+                                        length = paramsSegment.Count
                                 });
                         }
                         continue;
@@ -2509,12 +2535,15 @@ namespace Microsoft.WebAssembly.Diagnostics
                         command_params_writer_to_get.Write(objectId);
                         command_params_writer_to_get.Write(0);
 
+                        var paramsSegment = ArraySegment<byte>.Empty;
+                        command_params_to_get.TryGetBuffer(out paramsSegment);
+
                         ret.Add(JObject.FromObject(new {
                                 get = JObject.FromObject(new {
                                     commandSet = CommandSet.Vm,
                                     command = CmdVM.InvokeMethod,
-                                    buffer = Convert.ToBase64String(command_params_to_get.ToArray()),
-                                    length = command_params_to_get.ToArray().Length
+                                    buffer = Convert.ToBase64String(paramsSegment),
+                                    length = paramsSegment.Count
                                     }),
                                 name = propertyNameStr
                             }));
