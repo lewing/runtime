@@ -391,7 +391,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             return new MonoBinaryReader(new MemoryStream(newBytes), result.IsErr);
         }
 
-        internal static void PutBytesBE (Span<byte> dest, Span<byte> src)
+        internal static void PutBytesBE(Span<byte> dest, Span<byte> src)
         {
             if (BitConverter.IsLittleEndian)
             {
@@ -420,79 +420,49 @@ namespace Microsoft.WebAssembly.Diagnostics
 
             return new string(Encoding.UTF8.GetChars(value, 0, valueLen));
         }
-        public unsafe long ReadLong()
-        {
-            Span<byte> data = stackalloc byte[8];
-            Read(data);
 
-            long ret;
-            Span<byte> retData = new Span<byte>(&ret, 8);
-            PutBytesBE (retData, data);
-            return ret;
-        }
-        public override unsafe sbyte ReadSByte()
-        {
-            Span<byte> data = stackalloc byte[4];
-            int ret;
-            Read(data);
-
-            Span<byte> retData = new Span<byte>(&ret, 4);
-            PutBytesBE (retData, data);
-            return (sbyte)ret;
-        }
-
-        public unsafe byte ReadUByte()
-        {
-            Span<byte> data = stackalloc byte[4];
-            int ret;
-            Read(data);
-
-            Span<byte> retData = new Span<byte>(&ret, 4);
-            PutBytesBE (retData, data);
-            return (byte)ret;
-        }
+        public override unsafe sbyte ReadSByte() => (sbyte)ReadInt32();
+        public unsafe byte ReadUByte() => (byte)ReadUInt32();
+        public unsafe ushort ReadUShort() => (ushort)ReadUInt32();
 
         public override unsafe int ReadInt32()
         {
-            Span<byte> data = stackalloc byte[4];
+            Span<byte> data = stackalloc byte[sizeof(int)];
+            Read(data);
+
             int ret;
-            Read(data);
-
-            Span<byte> retData = new Span<byte>(&ret, 4);
-            PutBytesBE (retData, data);
-            return ret;
-        }
-
-        public override unsafe double ReadDouble()
-        {
-            Span<byte> data = stackalloc byte[8];
-            Read(data);
-
-            double ret;
-            Span<byte> retData = new Span<byte>(&ret, 8);
-            PutBytesBE (retData, data);
+            PutBytesBE(new Span<byte>(&ret, sizeof(int)), data);
             return ret;
         }
 
         public override unsafe uint ReadUInt32()
         {
-            Span<byte> data = stackalloc byte[4];
-            uint ret;
+            Span<byte> data = stackalloc byte[sizeof(uint)];
             Read(data);
 
-            Span<byte> retData = new Span<byte>(&ret, 4);
-            PutBytesBE (retData, data);
+            uint ret;
+            PutBytesBE(new Span<byte>(&ret, sizeof(uint)), data);
             return ret;
         }
-        public unsafe ushort ReadUShort()
+
+        public unsafe long ReadLong()
         {
-            Span<byte> data = stackalloc byte[4];
-            uint ret;
+            Span<byte> data = stackalloc byte[sizeof(long)];
             Read(data);
 
-            Span<byte> retData = new Span<byte>(&ret, 4);
-            PutBytesBE (retData, data);
-            return (ushort)ret;
+            long ret;
+            PutBytesBE(new Span<byte>(&ret, sizeof(long)), data);
+            return ret;
+        }
+
+        public override unsafe double ReadDouble()
+        {
+            Span<byte> data = stackalloc byte[sizeof(double)];
+            Read(data);
+
+            double ret;
+            PutBytesBE(new Span<byte>(&ret, sizeof(double)), data);
+            return ret;
         }
     }
 
@@ -629,7 +599,7 @@ namespace Microsoft.WebAssembly.Diagnostics
 
         public (string data, int length) Base64Encode() {
             var segment = GetParameterBuffer();
-            return (Convert.ToBase64String(segment.Array, 0, segment.Count), segment.Count);
+            return (Convert.ToBase64String(segment), segment.Count);
         }
     }
     internal class FieldTypeClass
