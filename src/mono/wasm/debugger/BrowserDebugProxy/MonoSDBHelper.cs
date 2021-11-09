@@ -1037,7 +1037,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdMethod.Assembly);
             command.Writer.Write(methodId);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             return retDebuggerCmdReader.ReadInt32(); //assembly_id
         }
 
@@ -1142,7 +1142,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdMethod.GetParamInfo);
             command.Writer.Write(methodId);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             retDebuggerCmdReader.ReadInt32();
             var paramCount = retDebuggerCmdReader.ReadInt32();
             retDebuggerCmdReader.ReadInt32();
@@ -1169,7 +1169,8 @@ namespace Microsoft.WebAssembly.Diagnostics
             command.Writer.Write((byte)ModifierKind.LocationOnly);
             command.Writer.Write(methodId);
             command.Writer.Write(il_offset);
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             return retDebuggerCmdReader.ReadInt32();
         }
 
@@ -1198,7 +1199,8 @@ namespace Microsoft.WebAssembly.Diagnostics
             command.Writer.Write((int)StepSize.Line);
             command.Writer.Write((int)kind);
             command.Writer.Write((int)(StepFilter.StaticCtor | StepFilter.DebuggerHidden)); //filter
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             if (retDebuggerCmdReader == null)
                 return false;
             var isBPOnManagedCode = retDebuggerCmdReader.ReadInt32();
@@ -1213,11 +1215,9 @@ namespace Microsoft.WebAssembly.Diagnostics
             command.Writer.Write((byte)EventKind.Step);
             command.Writer.Write((int) req_id);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
 
-            if (!retDebuggerCmdReader.HasError)
-                return true;
-            return false;
+            return retDebuggerCmdReader.HasError ? false : true;
         }
 
         public async Task<JObject> GetFieldValue(SessionId sessionId, int typeId, int fieldId, CancellationToken token)
@@ -1238,7 +1238,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdType.IsInitialized);
             command.Writer.Write(typeId);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             return retDebuggerCmdReader.ReadInt32();
         }
 
@@ -1398,15 +1398,8 @@ namespace Microsoft.WebAssembly.Diagnostics
                 if (dispAttrStr.Length == 0)
                     return null;
 
-                if (dispAttrStr.Contains(", nq"))
-                {
-                    dispAttrStr = dispAttrStr.Replace(", nq", "");
-                }
-                if (dispAttrStr.Contains(",nq"))
-                {
-                    dispAttrStr = dispAttrStr.Replace(",nq", "");
-                }
-                expr = "$\"" + dispAttrStr + "\"";
+                expr = $"$\"{dispAttrStr.Replace(", nq", "").Replace(",nq", "")}\"";
+
                 JObject retValue = await resolver.Resolve(expr, token);
                 if (retValue == null)
                     retValue = await EvaluateExpression.CompileAndRunTheExpression(expr, resolver, token);
@@ -1437,10 +1430,10 @@ namespace Microsoft.WebAssembly.Diagnostics
         public async Task<string> GetTypeNameOriginal(SessionId sessionId, int typeId, CancellationToken token)
         {
             using var command = DebuggerCommand.From(CmdType.GetInfo);
-
             command.Writer.Write(typeId);
             command.Writer.Write((int) MonoTypeNameFormat.FormatReflection);
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             retDebuggerCmdReader.SkipString(); //namespace
             retDebuggerCmdReader.SkipString(); //class name
             return retDebuggerCmdReader.ReadString(); //class name formatted
@@ -1451,7 +1444,8 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdType.GetInfo);
             command.Writer.Write(typeId);
             command.Writer.Write((int) MonoTypeNameFormat.FormatReflection);
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             retDebuggerCmdReader.SkipString(); //namespace
             retDebuggerCmdReader.SkipString(); //class name
             retDebuggerCmdReader.SkipString(); //class name formatted
@@ -1467,18 +1461,20 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdString.GetValue);
             command.Writer.Write(string_id);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             var isUtf16 = retDebuggerCmdReader.ReadByte();
             if (isUtf16 == 0) {
                 return retDebuggerCmdReader.ReadString();
             }
             return null;
         }
+
         public async Task<int> GetArrayLength(SessionId sessionId, int object_id, CancellationToken token)
         {
             using var command = DebuggerCommand.From(CmdArray.GetLength);
             command.Writer.Write(object_id);
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             var length = retDebuggerCmdReader.ReadInt32();
             length = retDebuggerCmdReader.ReadInt32();
             return length;
@@ -1489,7 +1485,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             using var command = DebuggerCommand.From(CmdObject.RefGetType);
             command.Writer.Write(object_id);
 
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             var type_id = retDebuggerCmdReader.ReadInt32();
             ret.Add(type_id);
             if (withParents)
@@ -1530,7 +1526,8 @@ namespace Microsoft.WebAssembly.Diagnostics
             command.Writer.Write(method_name);
             command.Writer.Write((int)(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static));
             command.Writer.Write((int)1); //case sensitive
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             var nMethods = retDebuggerCmdReader.ReadInt32();
             return retDebuggerCmdReader.ReadInt32();
         }
@@ -1540,7 +1537,8 @@ namespace Microsoft.WebAssembly.Diagnostics
             var ret = new List<string>();
             using var command = DebuggerCommand.From(CmdObject.RefIsDelegate);
             command.Writer.Write(objectId);
-            var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
+
+            using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             return retDebuggerCmdReader.ReadByte() == 1;
         }
 
@@ -1549,6 +1547,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             var ret = new List<string>();
             using var command = DebuggerCommand.From(CmdObject.RefDelegateGetMethod);
             command.Writer.Write(objectId);
+
             using var retDebuggerCmdReader = await SendCommand(sessionId, command, token);
             return retDebuggerCmdReader.ReadInt32();
         }
@@ -1571,8 +1570,6 @@ namespace Microsoft.WebAssembly.Diagnostics
             return $"{returnType} {methodName} {parameters}";
         }
 
-        public Task<JObject> InvokeMethod(SessionId sessionId, byte[] valueTypeBuffer, int methodId, string varName, CancellationToken token) =>
-            InvokeMethod(sessionId, new ArraySegment<byte>(valueTypeBuffer), methodId, varName, token);
         public async Task<JObject> InvokeMethod(SessionId sessionId, ArraySegment<byte> valueTypeBuffer, int methodId, string varName, CancellationToken token)
         {
             using var command = DebuggerCommand.From(CmdVM.InvokeMethod);
