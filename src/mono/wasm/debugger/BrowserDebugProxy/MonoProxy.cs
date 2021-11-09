@@ -743,7 +743,7 @@ namespace Microsoft.WebAssembly.Diagnostics
             command.AddParameter(0);
             command.AddParameter(-1);
 
-            using var retDebuggerCmdReader = await SdbHelper.SendCommand(sessionId, command, token);
+            using var retDebuggerCmdReader = await command.Send(sessionId, token);
             var frame_count = retDebuggerCmdReader.ReadInt32();
             //Console.WriteLine("frame_count - " + frame_count);
             for (int j = 0; j < frame_count; j++) {
@@ -1219,7 +1219,7 @@ namespace Microsoft.WebAssembly.Diagnostics
                 return await context.ready.Task;
 
             var commandParams = new MemoryStream();
-            await SdbHelper.SendCommand(sessionId, SdbHelper.CreateCommand(CmdEventRequest.ClearAllBreakpoints), token);
+            await SdbHelper.CreateCommand(CmdEventRequest.ClearAllBreakpoints).Send(sessionId, token);
 
             if (context.PauseOnExceptions != PauseOnExceptionsKind.None && context.PauseOnExceptions != PauseOnExceptionsKind.Unset)
                 await SdbHelper.EnableExceptions(sessionId, context.PauseOnExceptions, token);
