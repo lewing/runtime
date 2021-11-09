@@ -738,11 +738,12 @@ namespace Microsoft.WebAssembly.Diagnostics
             var callFrames = new List<object>();
             var frames = new List<Frame>();
 
-            using var commandParamsWriter = new MonoBinaryWriter();
-            commandParamsWriter.Write(thread_id);
-            commandParamsWriter.Write(0);
-            commandParamsWriter.Write(-1);
-            using var retDebuggerCmdReader = await SdbHelper.SendDebuggerAgentCommand<CmdThread>(sessionId, CmdThread.GetFrameInfo, commandParamsWriter.GetMemoryStream(), token);
+            using var command = SdbHelper.CreateCommand(CmdThread.GetFrameInfo);
+            command.AddParameter(thread_id);
+            command.AddParameter(0);
+            command.AddParameter(-1);
+
+            using var retDebuggerCmdReader = await SdbHelper.SendCommand(sessionId, command, token);
             var frame_count = retDebuggerCmdReader.ReadInt32();
             //Console.WriteLine("frame_count - " + frame_count);
             for (int j = 0; j < frame_count; j++) {
@@ -1218,7 +1219,7 @@ namespace Microsoft.WebAssembly.Diagnostics
                 return await context.ready.Task;
 
             var commandParams = new MemoryStream();
-            await SdbHelper.SendDebuggerAgentCommand<CmdEventRequest>(sessionId, CmdEventRequest.ClearAllBreakpoints, commandParams, token);
+            await SdbHelper.SendCommand(sessionId, SdbHelper.CreateCommand(CmdEventRequest.ClearAllBreakpoints), token);
 
             if (context.PauseOnExceptions != PauseOnExceptionsKind.None && context.PauseOnExceptions != PauseOnExceptionsKind.Unset)
                 await SdbHelper.EnableExceptions(sessionId, context.PauseOnExceptions, token);
