@@ -1,5 +1,6 @@
 <Project>
   <PropertyGroup>
-    <WasmNativeWorkload>true</WasmNativeWorkload>
+    <WasmNativeWorkload Condition="$([MSBuild]::VersionEquals('$(TargetFrameworkVersion)', '7.0'))" >true</WasmNativeWorkload>
+    <WasmNativeWorkload7>true</WasmNativeWorkload7>
   </PropertyGroup>
 </Project>

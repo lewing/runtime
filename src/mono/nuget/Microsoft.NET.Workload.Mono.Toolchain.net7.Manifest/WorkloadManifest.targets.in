@@ -1,12 +1,12 @@
 <Project>
     <PropertyGroup>
+        <TargetsNet7 Condition="'$(TargetFrameworkIdentifier)' == '.NETCoreApp' and $([MSBuild]::VersionEquals('$(TargetFrameworkVersion)', '7.0'))">true</TargetsNet7>
         <_RuntimePackInWorkloadVersion7>${PackageVersion}</_RuntimePackInWorkloadVersion7>
         <_BrowserWorkloadDisabled7>$(BrowserWorkloadDisabled)</_BrowserWorkloadDisabled7>
         <_BrowserWorkloadDisabled7 Condition="'$(_BrowserWorkloadDisabled7)' == '' and
                                             '$(RuntimeIdentifier)' == 'browser-wasm' and
                                             '$(TargetFrameworkIdentifier)' == '.NETCoreApp' and
                                             !$([MSBuild]::VersionGreaterThanOrEquals('$(TargetFrameworkVersion)', '6.0'))">true</_BrowserWorkloadDisabled7>
-        <TargetsNet7 Condition="'$(TargetFrameworkIdentifier)' == '.NETCoreApp' and $([MSBuild]::VersionEquals('$(TargetFrameworkVersion)', '7.0'))">true</TargetsNet7>
     </PropertyGroup>
 
     <!--
@@ -20,11 +20,13 @@
     <PropertyGroup Condition="'$(TargetsNet7)' == 'true' and '$(RuntimeIdentifier)' == 'browser-wasm' AND '$(UsingBrowserRuntimeWorkload)' == ''">
         <!-- $(WasmBuildNative)==true is needed to enable workloads, when using native references, without AOT -->
         <UsingBrowserRuntimeWorkload Condition="'$(RunAOTCompilation)' == 'true' or '$(WasmBuildNative)' == 'true' or '$(WasmGenerateAppBundle)' == 'true' or '$(UsingMicrosoftNETSdkBlazorWebAssembly)' != 'true'" >true</UsingBrowserRuntimeWorkload>
+        <WasmNativeWorkload7 Condition="'WasmNativeWorkload' != 'true'>false<WasmNativeWorkload7>
         <UsingBrowserRuntimeWorkload Condition="'$(UsingBrowserRuntimeWorkload)' == ''" >$(WasmNativeWorkload7)</UsingBrowserRuntimeWorkload>
     </PropertyGroup>
 
     <PropertyGroup Condition="'$(TargetsNet7)' == 'true' and '$(_BrowserWorkloadDisabled7)' == 'true'">
         <UsingBrowserRuntimeWorkload>false</UsingBrowserRuntimeWorkload>
+        <WasmNativeWorkload>false<WasmNativeWorkload>
         <WasmNativeWorkload7>false</WasmNativeWorkload7>
     </PropertyGroup>
 
@@ -91,7 +93,7 @@
     </ImportGroup>
 
     <!-- HACK: -->
-    <ImportGroup Condition="'$(RuntimeIdentifier)' == 'browser-wasm' and '$(UsingBrowserRuntimeWorkload)' == 'true' and '$(TargetFrameworkIdentifier)' == '.NETCoreApp' and $([MSBuild]::VersionEquals('$(TargetFrameworkVersion)', '7.0'))">
+    <ImportGroup Condition="'$(TargetsNet7)' == 'true' and '$(RuntimeIdentifier)' == 'browser-wasm' and '$(UsingBrowserRuntimeWorkload)' == 'true'">
       <Import Project="Sdk.props" Sdk="Microsoft.NET.Runtime.Emscripten.Python.net7" Condition="!$([MSBuild]::IsOsPlatform('Linux'))" />
       <Import Project="Sdk.props" Sdk="Microsoft.NET.Runtime.Emscripten.Node.net7" />
       <Import Project="Sdk.props" Sdk="Microsoft.NET.Runtime.Emscripten.Sdk.net7" />
