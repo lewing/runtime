@@ -287,7 +287,12 @@ namespace Microsoft.WebAssembly.Diagnostics
 
     internal sealed class MonoCommands
     {
-        public string expression { get; set; }
+        public string expression {
+            get => $"""
+                       {value}
+                       //# sourceURL=mono{value.GetHashCode()}.cdp
+                    """;
+            init; }
         public string objectGroup { get; set; } = "mono-debugger";
         public bool includeCommandLineAPI { get; set; }
         public bool silent { get; set; }
