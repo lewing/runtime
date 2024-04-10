@@ -229,6 +229,8 @@ static void *sysglobal_native_handle;
 static void*
 wasm_dl_load (const char *name, int flags, char **err, void *user_data)
 {
+	if (!name)
+		return NULL;
 	void* handle = wasm_dl_lookup_pinvoke_table (name);
 	if (handle)
 		return handle;
