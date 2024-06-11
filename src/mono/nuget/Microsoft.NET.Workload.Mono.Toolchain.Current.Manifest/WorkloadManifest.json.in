@@ -147,9 +147,9 @@
       "abstract": true,
       "description": "Windows Runtime Packs",
       "packs": [
-        "Microsoft.NETCore.App.Runtime.${NetVersion}.win-x64",
-        "Microsoft.NETCore.App.Runtime.${NetVersion}.win-x86",
-        "Microsoft.NETCore.App.Runtime.${NetVersion}.win-arm64"
+        "Microsoft.NETCore.App.Runtime.win-x64",
+        "Microsoft.NETCore.App.Runtime.win-x86",
+        "Microsoft.NETCore.App.Runtime.win-arm64"
       ]
     },
     "microsoft-net-runtime-mono-tooling": {
