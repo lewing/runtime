@@ -299,13 +299,20 @@ wasm_dl_symbol (void *handle, const char *name, char **err, void *user_data)
 #else
     PinvokeTable* index = (PinvokeTable*)handle;
 
+<<<<<<< HEAD
     for (int i = 0; i < index->count; ++i) {
+=======
+    for (int i = 0; i < index->count; ++i)
+>>>>>>> 9f323c5eca8 (huh)
 		assert (index->imports [i].name);
 
         if (!strcmp(index->imports[i].name, name))
             return index->imports[i].func;
 
+<<<<<<< HEAD
 	}
+=======
+>>>>>>> 9f323c5eca8 (huh)
     return NULL;
 #endif
 }
