@@ -46,7 +46,6 @@ internal sealed class InterpToNativeGenerator
         var signatures = cookies.OrderBy(c => c).Distinct().ToArray();
         Array.Sort(signatures, StringComparer.Ordinal);
 
-
         static IEnumerable<char> Args (string signature)
         {
             for (int i = 1; i < signature.Length; ++i)

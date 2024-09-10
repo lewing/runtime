@@ -9,6 +9,8 @@
     <PackageReference Include="Microsoft.Build.Tasks.Core" Version="$(MicrosoftBuildTasksCoreVersion)" />
 
     <Compile Include="..\Common\LogAsErrorException.cs" />
+    <Compile Include="..\Common\JoinedString.cs" />
+    <Compile Include="..\Common\IsExternalInit.cs" Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'" />
   </ItemGroup>
 
   <Target Name="PublishBuilder"

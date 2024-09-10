@@ -462,7 +462,7 @@ namespace Wasm.Build.Tests
                         public class Conflict {
                             [UnmanagedCallersOnly(EntryPoint = "A_Conflict_C")]
                             public static void C() {
-                                Console.WriteLine("A.Conflict.C");
+                                Console.WriteLine("A.Conflict_C");
                             }
 
                             [UnmanagedCallersOnly(EntryPoint = "A_Conflict_C\u733f")]
@@ -476,7 +476,7 @@ namespace Wasm.Build.Tests
                         public class Conflict {
                             [UnmanagedCallersOnly(EntryPoint = "B_Conflict_C")]
                             public static void C() {
-                                Console.WriteLine("B.Conflict.C");
+                                Console.WriteLine("B.Conflict_C");
                             }
 
                             [UnmanagedCallersOnly(EntryPoint = "B_Conflict_C\u733f")]
@@ -496,8 +496,8 @@ namespace Wasm.Build.Tests
             Assert.DoesNotMatch(".*(warning|error).*>[A-Z0-9]+__Foo", output);
 
             output = RunAndTestWasmApp(buildArgs, buildDir: _projectDir, expectedExitCode: 42, host: host, id: id);
-            Assert.Contains("A.Conflict.C", output);
-            Assert.Contains("B.Conflict.C", output);
+            Assert.Contains("A.Conflict_C", output);
+            Assert.Contains("B.Conflict_C", output);
             if (OperatingSystem.IsWindows()) {
                 // Windows console unicode support is not great
                 Assert.Contains("A.Conflict.C_", output);

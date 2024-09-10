@@ -5,9 +5,12 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
+
+using JoinedString;
 
 namespace Microsoft.WebAssembly.Build.Tasks
 {
@@ -15,9 +18,9 @@ namespace Microsoft.WebAssembly.Build.Tasks
     {
         [NotNull]
         [Required]
-        public ITaskItem[]? Properties { get; set; }
+        public ITaskItem2[]? Properties { get; set; }
 
-        public ITaskItem[] Items { get; set; } = Array.Empty<ITaskItem>();
+        public ITaskItem2[] Items { get; set; } = Array.Empty<ITaskItem2>();
 
         [NotNull]
         [Required]
@@ -52,58 +55,46 @@ namespace Microsoft.WebAssembly.Build.Tasks
             if (!string.IsNullOrEmpty(outDir) && !Directory.Exists(outDir))
                 Directory.CreateDirectory(outDir);
 
-            StringBuilder sb = new();
+            string GetCondition(ITaskItem item)
+                => item.GetMetadata(s_conditionToUseMetadata) switch {
+                    string condition when !string.IsNullOrEmpty(condition) => $" Condition=\"{condition}\"",
+                    _ => ""
+                };
 
-            sb.AppendLine("<Project>");
-            sb.AppendLine("\t<PropertyGroup>");
-
-            foreach (ITaskItem2 prop in Properties)
+            string GetOriginalName(ITaskItem item)
             {
-                string value = prop.EvaluatedIncludeEscaped;
-                string? name = prop.GetMetadata("Name");
-                string? condition = prop.GetMetadataValueEscaped(s_conditionToUseMetadata);
-
-                if (!string.IsNullOrEmpty(condition))
-                    sb.AppendLine($"\t\t<{name} Condition=\"{condition}\">{value}</{name}>");
-                else
-                    sb.AppendLine($"\t\t<{name}>{value}</{name}>");
-            }
-
-            sb.AppendLine("\t</PropertyGroup>");
-
-            sb.AppendLine("\t<ItemGroup>");
-            foreach (ITaskItem2 item in Items)
-            {
-                string value = item.EvaluatedIncludeEscaped;
                 string name = item.GetMetadata(s_originalItemNameMetadata);
-
                 if (string.IsNullOrEmpty(name))
                 {
-                    Log.LogError($"Item {value} is missing {s_originalItemNameMetadata} metadata, for the item name");
-                    return false;
+                    Log.LogError($"Item {item} is missing {s_originalItemNameMetadata} metadata, for the item name");
                 }
-
-                sb.AppendLine($"\t\t<{name} Include=\"{value}\"");
-
-                string? condition = item.GetMetadataValueEscaped(s_conditionToUseMetadata);
-                if (!string.IsNullOrEmpty(condition))
-                    sb.AppendLine($"\t\t\tCondition=\"{condition}\"");
-
-                foreach (string mdName in item.MetadataNames)
-                {
-                    if (!s_metadataNamesToSkip.Contains(mdName))
-                        sb.AppendLine($"\t\t\t{mdName}=\"{item.GetMetadataValueEscaped(mdName)}\"");
-                }
-
-                sb.AppendLine($"\t\t/>");
+                return name;
             }
 
-            sb.AppendLine("\t</ItemGroup>");
-            sb.AppendLine("</Project>");
+            bool Skip(string mdName) => s_metadataNamesToSkip.Contains(mdName);
 
-            File.WriteAllText(OutputFile, sb.ToString());
+            var writer = new JoinedStringStreamWriter(OutputFile, false);
+            writer.Write(
+                $$""""
+                <Project>
+                    <PropertyGroup>
+                {{Properties.Join("", prop =>
+                $"        <{prop.GetMetadata("Name")}{GetCondition(prop)}>{prop.EvaluatedIncludeEscaped}</{prop.GetMetadata("Name")}>{writer.NewLine}"
+                )}}
+                    </PropertyGroup>
+                    <ItemGroup>
+                {{Items.Join("", item =>
+                $$$"""
+                        <{{{GetOriginalName(item)}}} Include="{{{item.EvaluatedIncludeEscaped}}}"{{{GetCondition(item)}}}{{{writer.NewLine}}}{{{
+                            item.MetadataNames.OfType<string>().Where(m => !Skip(m)).Join(writer.NewLine, metadataName =>
+                $"            {metadataName}=\"{item.GetMetadataValueEscaped(metadataName)}\"")}}} />
+                """
+                )}}
+                    </ItemGroup>
+                </Project>
+                """");
+
             return !Log.HasLoggedErrors;
         }
-
     }
 }
