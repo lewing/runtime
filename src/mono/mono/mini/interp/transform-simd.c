@@ -1102,6 +1102,10 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 
 	bool is_packedsimd = strcmp (m_class_get_name (cmethod->klass), "PackedSimd") == 0;
 	if (is_packedsimd) {
+		if (csignature->ret->type == MONO_TYPE_VOID && csignature->param_count > 1 && mono_type_is_pointer (csignature->params [0])) {
+			// The Store* methods have a more complicated signature
+			vector_klass = mono_class_from_mono_type_internal (csignature->params [1]);
+		}
 		vector_klass = mono_class_from_mono_type_internal (csignature->ret);
 	} else {
 		if (csignature->ret->type == MONO_TYPE_GENERICINST) {
