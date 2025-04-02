@@ -57,8 +57,6 @@ lookup_intrins (guint16 *intrinsics, int size, const char *cmethod_name)
 // These items need to be in ASCII order, which means alphabetical order where lowercase is after uppercase
 // i.e. all 'get_' and 'op_' need to come after regular title-case names
 static guint16 sri_vector128_methods [] = {
-	SN_Abs,
-	SN_Add,
 	SN_AndNot,
 	SN_As,
 	SN_AsByte,
@@ -78,38 +76,23 @@ static guint16 sri_vector128_methods [] = {
 	SN_AsVector,
 	SN_AsVector4,
 	SN_AsVector128,
-	SN_BitwiseAnd,
-	SN_BitwiseOr,
-	SN_Ceiling,
 	SN_ConditionalSelect,
 	SN_Create,
 	SN_CreateScalar,
 	SN_CreateScalarUnsafe,
-	SN_Divide,
-	SN_Dot,
 	SN_Equals,
 	SN_EqualsAny,
 	SN_ExtractMostSignificantBits,
-	SN_Floor,
 	SN_GreaterThan,
-	SN_GreaterThanOrEqual,
 	SN_LessThan,
 	SN_LessThanOrEqual,
 	SN_Narrow,
-	SN_Negate,
-	SN_Max,
-	SN_Min,
-	SN_Multiply,
-	SN_OnesComplement,
 	SN_ShiftLeft,
 	SN_ShiftRightArithmetic,
 	SN_ShiftRightLogical,
 	SN_Shuffle,
-	SN_Subtract,
-	SN_Truncate,
 	SN_WidenLower,
 	SN_WidenUpper,
-	SN_Xor,
 	SN_get_IsHardwareAccelerated,
 };
 
@@ -160,6 +143,56 @@ static guint16 sn_vector_t_methods [] = {
 static guint16 sri_packedsimd_methods [] = {
 	SN_get_IsHardwareAccelerated,
 	SN_get_IsSupported,
+};
+
+static guint16 packed_simd_alias_methods [] = {
+	SN_Abs,
+	SN_Add,
+	SN_AndNot,
+	SN_BitwiseAnd,
+	SN_Ceiling,
+	SN_Divide,
+	// SN_Dot,
+	SN_Equals,
+	SN_Floor,
+	SN_GreaterThan,
+	SN_GreaterThanOrEqual,
+	SN_LessThan,
+	SN_LessThanOrEqual,
+	SN_Max,
+	SN_Min,
+	SN_Multiply,
+	SN_Negate,
+	SN_OnesComplement,
+	SN_ShiftLeft,
+	SN_ShiftRightArithmetic,
+	SN_ShiftRightLogical,
+	SN_Subtract,
+	SN_Truncate,
+	SN_WidenLower,
+	SN_WidenUpper,
+	SN_Xor,
+	// SN_ctor,
+	// SN_get_AllBitsSet,
+	// SN_get_Count,
+	// SN_get_IsHardwareAccelerated,
+	// SN_get_IsSupported,
+	// SN_get_One,
+	// SN_get_Zero,
+	SN_op_Addition,
+	SN_op_BitwiseAnd,
+	SN_op_BitwiseOr,
+	SN_op_Division,
+	SN_op_Equality,
+	SN_op_ExclusiveOr,
+	SN_op_Inequality,
+	SN_op_LeftShift,
+	SN_op_Multiply,
+	SN_op_OnesComplement,
+	SN_op_RightShift,
+	SN_op_Subtraction,
+	SN_op_UnaryNegation,
+	SN_op_UnsignedRightShift,
 };
 
 static MonoTypeEnum 
@@ -699,6 +732,11 @@ emit_sri_vector128_t (TransformData *td, MonoMethod *cmethod, MonoMethodSignatur
 		}
 	}
 
+#ifdef HOST_BROWSER
+	if (emit_sri_packedsimd (td, cmethod, csignature))
+		return TRUE;
+#endif
+
 	int id = lookup_intrins (sri_vector128_t_methods, sizeof (sri_vector128_t_methods), cmethod->name);
 	if (id == -1) {
 		if (explicitly_implemented) {
@@ -747,6 +785,12 @@ emit_sn_vector_t (TransformData *td, MonoMethod *cmethod, MonoMethodSignature *c
 		cmethod_name += 67;
 		explicitly_implemented = true;
 	}
+
+
+#ifdef HOST_BROWSER
+	if (emit_sri_packedsimd (td, cmethod, csignature))
+		return TRUE;
+#endif
 
 	int id = lookup_intrins (sn_vector_t_methods, sizeof (sn_vector_t_methods), cmethod_name);
 	if (id == -1) {
@@ -1093,8 +1137,10 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 	if (!is_packedsimd) {
 		// transform the method name from the Vector(128|) name to the packed simd name
 		// FIXME: This is a hack, but it works for now.
-		id = lookup_intrins (sri_vector128_methods, sizeof (sri_vector128_methods), cmethod_name);
+		id = lookup_intrins (packed_simd_alias_methods, sizeof (packed_simd_alias_methods), cmethod_name);
 		gboolean is_unsigned = (atype == MONO_TYPE_U1 || atype == MONO_TYPE_U2 || atype == MONO_TYPE_U4 || atype == MONO_TYPE_U8 || atype == MONO_TYPE_U);
+		
+		// cmethod_name = must be a packed simd intrinsic, so we can just use the name directly
 		switch (id) {
 			case SN_LessThan:
 				cmethod_name = "CompareLessThan";
@@ -1125,6 +1171,60 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 				break;
 			case SN_WidenUpper:
 				cmethod_name = is_unsigned ? "ZeroExtendWideningUpper" : "SignExtendWideningUpper";
+				break;
+			case SN_op_Addition:
+				cmethod_name = "Add";
+				break;
+			case SN_op_BitwiseAnd:
+				cmethod_name = "And";
+				break;
+			case SN_op_BitwiseOr:
+				cmethod_name = "Or";
+				break;
+			case SN_op_Division:
+				cmethod_name = "Divide";
+				break;
+			case SN_op_GreaterThan:
+				cmethod_name = "CompareGreaterThan";
+				break;
+			case SN_op_GreaterThanOrEqual:
+				cmethod_name = "CompareGreaterThanOrEqual";
+				break;
+			case SN_op_LessThan:
+				cmethod_name = "CompareLessThan";
+				break;
+			case SN_op_LessThanOrEqual:
+				cmethod_name = "CompareLessThanOrEqual";
+				break;
+			case SN_op_Equality:
+				cmethod_name = "CompareEqual";
+				break;
+			case SN_op_ExclusiveOr:
+				cmethod_name = "Xor";
+				break;
+			case SN_op_Inequality:
+				cmethod_name = "CompareNotEqual";
+				break;
+			case SN_op_LeftShift:
+				cmethod_name = "ShiftLeft";
+				break;
+			case SN_op_Multiply:
+				cmethod_name = "Multiply";
+				break;
+			case SN_op_OnesComplement:
+				cmethod_name = "Not";
+				break;
+			case SN_op_RightShift:
+				cmethod_name = "ShiftRightLogical";
+				break;
+			case SN_op_Subtraction:
+				cmethod_name = "Subtract";
+				break;
+			case SN_op_UnaryNegation:
+				cmethod_name = "Negate";
+				break;
+			case SN_op_UnsignedRightShift:
+				cmethod_name = "ShiftRightLogical";
 				break;
 			case SN_Add:
 			case SN_AndNot:
