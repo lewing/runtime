@@ -1150,27 +1150,34 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 		// cmethod_name = must be a packed simd intrinsic, so we can just use the name directly
 		switch (id) {
 			case SN_LessThan:
+			case SN_op_LessThan:
 				cmethod_name = "CompareLessThan";
 				break;
 			case SN_LessThanOrEqual:
+			case SN_op_LessThanOrEqual:
 				cmethod_name = "CompareLessThanOrEqual";
 				break;
 			case SN_GreaterThan:
+			case SN_op_GreaterThan:
 				cmethod_name = "CompareGreaterThan";
 				break;
 			case SN_GreaterThanOrEqual:
+			case SN_op_GreaterThanOrEqual:
 				cmethod_name = "CompareGreaterThanOrEqual";
 				break;
 			case SN_Equals:
 				cmethod_name = "CompareEqual";
 				break;
 			case SN_BitwiseAnd:
+			case SN_op_BitwiseAnd:
 				cmethod_name = "And";
 				break;
 			case SN_BitwiseOr:
+			case SN_op_BitwiseOr:
 				cmethod_name = "Or";
 				break;
 			case SN_OnesComplement:
+			case SN_op_OnesComplement:
 				cmethod_name = "Not";
 				break;
 			case SN_WidenLower:
@@ -1179,29 +1186,15 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 			case SN_WidenUpper:
 				cmethod_name = is_unsigned ? "ZeroExtendWideningUpper" : "SignExtendWideningUpper";
 				break;
+			case SN_Load:
+			case SN_LoadUnsafe:
+				cmethod_name = "LoadVector128";
+				break;
 			case SN_op_Addition:
 				cmethod_name = "Add";
 				break;
-			case SN_op_BitwiseAnd:
-				cmethod_name = "And";
-				break;
-			case SN_op_BitwiseOr:
-				cmethod_name = "Or";
-				break;
 			case SN_op_Division:
 				cmethod_name = "Divide";
-				break;
-			case SN_op_GreaterThan:
-				cmethod_name = "CompareGreaterThan";
-				break;
-			case SN_op_GreaterThanOrEqual:
-				cmethod_name = "CompareGreaterThanOrEqual";
-				break;
-			case SN_op_LessThan:
-				cmethod_name = "CompareLessThan";
-				break;
-			case SN_op_LessThanOrEqual:
-				cmethod_name = "CompareLessThanOrEqual";
 				break;
 			case SN_op_Equality:
 				cmethod_name = "CompareEqual";
@@ -1218,11 +1211,8 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 			case SN_op_Multiply:
 				cmethod_name = "Multiply";
 				break;
-			case SN_op_OnesComplement:
-				cmethod_name = "Not";
-				break;
 			case SN_op_RightShift:
-				cmethod_name = "ShiftRightLogical";
+				cmethod_name = is_unsigned ? "ShiftRightLogical" : "ShiftRightArithmetic";
 				break;
 			case SN_op_Subtraction:
 				cmethod_name = "Subtract";
@@ -1232,9 +1222,6 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 				break;
 			case SN_op_UnsignedRightShift:
 				cmethod_name = "ShiftRightLogical";
-			case SN_Load:
-			case SN_LoadUnsafe:
-				cmethod_name = "LoadVector128";
 				break;
 			case SN_Add:
 			case SN_AndNot:
