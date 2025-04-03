@@ -150,9 +150,9 @@ static guint16 packed_simd_alias_methods [] = {
 	SN_Add,
 	SN_AndNot,
 	SN_BitwiseAnd,
+	SN_BitwiseOr,
 	SN_Ceiling,
 	SN_Divide,
-	// SN_Dot,
 	SN_Equals,
 	SN_Floor,
 	SN_GreaterThan,
@@ -1230,6 +1230,9 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 				break;
 			case SN_op_UnsignedRightShift:
 				cmethod_name = "ShiftRightLogical";
+			case SN_Load:
+			case SN_LoadUnsafe:
+				cmethod_name = "LoadVector128";
 				break;
 			case SN_Add:
 			case SN_AndNot:
@@ -1249,9 +1252,6 @@ emit_sri_packedsimd (TransformData *td, MonoMethod *cmethod, MonoMethodSignature
 			case SN_Truncate:
 				cmethod_name = cmethod->name;
 				break;
-			case SN_get_IsHardwareAccelerated:
-			case SN_get_IsSupported:
-			case SN_Dot: // wasm simd opcode is different from the C# intrinsic
 			default:
 				// Only transform the name if we expect it to work
 				return FALSE;
