@@ -2152,7 +2152,7 @@ interp_handle_intrinsics (TransformData *td, MonoMethod *target_method, MonoClas
 			*op = MINT_ADD_I8;
 #endif
 
-		else if (!strcmp (tm, "As") || !strcmp (tm, "AsRef"))
+		else if (!strcmp (tm, "As") || !strcmp (tm, "AsRef") || !strcmp (tm, "ReadUnaligned"))
 			*op = MINT_MOV_P;
 		else if (!strcmp (tm, "AsPointer")) {
 			/* NOP */
