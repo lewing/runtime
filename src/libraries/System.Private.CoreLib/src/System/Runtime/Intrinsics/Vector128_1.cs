@@ -194,6 +194,10 @@ namespace System.Runtime.Intrinsics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector128<T> operator /(Vector128<T> left, T right)
         {
+            if (Vector128.IsHardwareAccelerated)
+            {
+                return Vector128.Divide(left, Vector128.Create(right));
+            }
             return Vector128.Create(
                 left._lower / right,
                 left._upper / right
@@ -274,6 +278,10 @@ namespace System.Runtime.Intrinsics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector128<T> operator *(Vector128<T> left, T right)
         {
+            if (Vector128.IsHardwareAccelerated)
+            {
+                return Vector128.Multiply(left, Vector128.Create(right));
+            }
             return Vector128.Create(
                 left._lower * right,
                 left._upper * right
