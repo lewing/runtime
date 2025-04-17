@@ -283,7 +283,7 @@ namespace System.IO.Compression.Tests
         [MemberData(nameof(Get_Booleans_Data))]
         public static async Task ZipArchiveEntry_CorruptedStream_EnsureNoExtraBytesReadOrOverWritten(bool async)
         {
-            MemoryStream stream = PopulateStream().Result;
+            MemoryStream stream = await PopulateStream().Result;
 
             int nameOffset = PatchDataRelativeToFileName(Encoding.ASCII.GetBytes(s_tamperedFileName), stream, 8);  // patch uncompressed size in file header
             PatchDataRelativeToFileName(Encoding.ASCII.GetBytes(s_tamperedFileName), stream, 22, nameOffset + s_tamperedFileName.Length); // patch in central directory too
