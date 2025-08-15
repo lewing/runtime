@@ -81,20 +81,3 @@ interp_intrins_math_divrem (guint32 a, guint32 b, guint32 *result)
 	*result = a - (div * b);
 	return div;
 }
-
-mono_u
-interp_intrins_widen_ascii_to_utf16 (guint8 *pAsciiBuffer, mono_unichar2 *pUtf16Buffer, mono_u elementCount)
-{
-	// ASCIIUtility.WidenAsciiToUtf16
-	mono_u currentOffset = 0;
-
-	while (currentOffset < elementCount) {
-		guint16 asciiData = pAsciiBuffer [currentOffset];
-		if ((asciiData & 0x80) != 0)
-			return currentOffset;
-
-		pUtf16Buffer [currentOffset] = (mono_unichar2)asciiData;
-		currentOffset++;
-	}
-	return currentOffset;
-}

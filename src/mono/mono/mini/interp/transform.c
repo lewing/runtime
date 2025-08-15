@@ -2029,9 +2029,6 @@ interp_handle_intrinsics (TransformData *td, MonoMethod *target_method, MonoClas
 			*op = MINT_INTRINS_ORDINAL_IGNORE_CASE_ASCII;
 		else if (!strcmp (tm, "UInt64OrdinalIgnoreCaseAscii"))
 			*op = MINT_INTRINS_64ORDINAL_IGNORE_CASE_ASCII;
-	} else if (in_corlib && !strcmp (klass_name_space, "System.Text") && !strcmp (klass_name, "ASCIIUtility")) {
-		if (!strcmp (tm, "WidenAsciiToUtf16"))
-			*op = MINT_INTRINS_WIDEN_ASCII_TO_UTF16;
 	} else if (in_corlib && !strcmp (klass_name_space, "System") &&
 			(!strcmp (klass_name, "Math") || !strcmp (klass_name, "MathF"))) {
 		gboolean is_float = strcmp (klass_name, "MathF") == 0;
