@@ -26,7 +26,7 @@ namespace Wasm.Build.Tests
 {
     public abstract class BuildTestBase : IClassFixture<SharedBuildPerTestClassFixture>, IDisposable
     {
-        private const int TargetMajorVersion = 11; /* net11 */
+        private const int TargetMajorVersion = 12; /* net12 */
         public static readonly string DefaultTargetFramework = $"net{TargetMajorVersion}.0";
         public static readonly string PreviousTargetFramework = $"net{TargetMajorVersion - 1}.0";
         public static readonly string Previous2TargetFramework = $"net{TargetMajorVersion - 2}.0";

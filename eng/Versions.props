@@ -4,12 +4,13 @@
 
   <PropertyGroup>
     <!-- The .NET product branding version -->
-    <ProductVersion>11.0.0</ProductVersion>
+    <ProductVersion>12.0.0</ProductVersion>
     <!-- File version numbers -->
-    <MajorVersion>11</MajorVersion>
+    <MajorVersion>12</MajorVersion>
     <MinorVersion>0</MinorVersion>
     <PatchVersion>0</PatchVersion>
-    <PackageVersionNet10>10.0.0</PackageVersionNet10>
+    <PackageVersionNet11>11.0.0</PackageVersionNet11>
+    <PackageVersionNet10>10.0.$([MSBuild]::Add($([System.Version]::Parse('$(PackageVersionNet11)').Build),12))</PackageVersionNet10>
     <PackageVersionNet9>9.0.$([MSBuild]::Add($([System.Version]::Parse('$(PackageVersionNet10)').Build),12))</PackageVersionNet9>
     <PackageVersionNet8>8.0.$([MSBuild]::Add($([System.Version]::Parse('$(PackageVersionNet9)').Build),11))</PackageVersionNet8>
     <PackageVersionNet7>7.0.20</PackageVersionNet7>
@@ -27,7 +28,7 @@
     <!-- NETCoreSdkVersion is normally set by the SDK, but for non-SDK projects we need extract from global.json -->
     <_GlobalJsonContent>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)../global.json'))</_GlobalJsonContent>
     <_GlobalJsonSdkVersion Condition="'$(_GlobalJsonContent)' != ''">$([System.Text.RegularExpressions.Regex]::Match($(_GlobalJsonContent), '"sdk"\s*:\s*\{[^\}]*"version"\s*:\s*"([^"]+)"', System.Text.RegularExpressions.RegexOptions.Singleline).Groups[1].Value)</_GlobalJsonSdkVersion>
-    <_DotnetSdkVersion>$(MicrosoftNETWorkloadEmscriptenCurrentManifest110100TransportVersion)</_DotnetSdkVersion>
+    <_DotnetSdkVersion>$(MicrosoftNETWorkloadEmscriptenCurrentManifest120100TransportVersion)</_DotnetSdkVersion>
     <SdkVersionForWorkloadTesting Condition="$([System.String]::Compare('$(_GlobalJsonSdkVersion)', '$(_DotnetSdkVersion)')) &lt;= 0">$(_DotnetSdkVersion)</SdkVersionForWorkloadTesting>
     <SdkVersionForWorkloadTesting Condition="'$(SdkVersionForWorkloadTesting)' == ''">$(_GlobalJsonSdkVersion)</SdkVersionForWorkloadTesting>
     <SdkMajorVersion>$([System.String]::Copy('$(SdkVersionForWorkloadTesting)').Split('.')[0])</SdkMajorVersion>

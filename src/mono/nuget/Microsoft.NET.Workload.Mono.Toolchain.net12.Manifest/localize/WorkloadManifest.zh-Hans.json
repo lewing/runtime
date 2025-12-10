@@ -1,0 +1,4 @@
+{
+  "workloads/wasm-tools-net12/description": ".NET WebAssembly 生成工具",
+  "workloads/wasm-experimental-net12/description": ".NET WebAssembly 实验性工具"
+}
