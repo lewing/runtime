@@ -1,4 +1,0 @@
-{
-  "workloads/wasm-tools-net12/description": "Nástroje pro sestavení .NET WebAssembly",
-  "workloads/wasm-experimental-net12/description": "Experimentální nástroje .NET WebAssembly"
-}

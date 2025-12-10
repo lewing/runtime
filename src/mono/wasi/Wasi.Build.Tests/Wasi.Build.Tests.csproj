@@ -102,11 +102,9 @@
       <_RuntimePackCurrentVersion Condition="'$(DotNetFinalVersionKind)' == ''">$(PackageVersion)</_RuntimePackCurrentVersion>
     </PropertyGroup>
     <ItemGroup>
-      <!-- net12 Add new entry when adding major version -->
-      <_RuntimePackVersions Include="$(_RuntimePackCurrentVersion)" EnvVarName="RUNTIME_PACK_VER12" />
+      <!-- net11 Add new entry when adding major version -->
+      <_RuntimePackVersions Include="$(_RuntimePackCurrentVersion)" EnvVarName="RUNTIME_PACK_VER11" />
 
-      <_RuntimePackVersions Include="$(PackageVersionNet11)" EnvVarName="RUNTIME_PACK_VER11" Condition="'$(PackageVersionNet11)' != ''" />
-      <_RuntimePackVersions Include="$(_RuntimePackCurrentVersion)" EnvVarName="RUNTIME_PACK_VER11" Condition="'$(PackageVersionNet11)' == ''" />
       <_RuntimePackVersions Include="$(PackageVersionNet10)" EnvVarName="RUNTIME_PACK_VER10" Condition="'$(PackageVersionNet10)' != ''" />
       <_RuntimePackVersions Include="$(_RuntimePackCurrentVersion)" EnvVarName="RUNTIME_PACK_VER10" Condition="'$(PackageVersionNet10)' == ''" />
 

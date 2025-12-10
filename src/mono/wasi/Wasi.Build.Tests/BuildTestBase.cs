@@ -26,7 +26,7 @@ namespace Wasm.Build.Tests
 {
     public abstract class BuildTestBase : IClassFixture<SharedBuildPerTestClassFixture>, IDisposable
     {
-        private const int TargetMajorVersion = 12;
+        private const int TargetMajorVersion = 11;
         public static readonly string DefaultTargetFramework = $"net{TargetMajorVersion}.0";
         protected static readonly bool s_skipProjectCleanup;
         protected static readonly string s_xharnessRunnerCommand;

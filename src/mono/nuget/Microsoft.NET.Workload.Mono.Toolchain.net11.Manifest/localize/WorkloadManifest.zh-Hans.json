@@ -1,0 +1,4 @@
+{
+  "workloads/wasm-tools-net11/description": "适用于 .NET 11.0 的 .NET WebAssembly 生成工具",
+  "workloads/wasm-experimental-net11/description": "适用于 .NET 11.0 的 .NET WebAssembly 实验性工具"
+}
