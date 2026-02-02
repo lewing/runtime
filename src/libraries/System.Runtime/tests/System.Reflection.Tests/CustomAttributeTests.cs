@@ -316,7 +316,7 @@ namespace System.Reflection.Tests
             Assert.Equal(typeof(GenericClassForEnum<delegate*<void>[]>.E), arg.ArgumentType);
             
             // Verify the value is the default enum value (0)
-            Assert.Equal((GenericClassForEnum<delegate*<void>[]>.E)0, arg.Value);
+            Assert.Equal(0, Convert.ToInt32(arg.Value));
         }
     }
 }
