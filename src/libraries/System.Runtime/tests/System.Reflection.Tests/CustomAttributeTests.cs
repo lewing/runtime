@@ -301,7 +301,7 @@ namespace System.Reflection.Tests
 
         [Fact]
         [ActiveIssue("https://github.com/dotnet/runtime/issues/123878", typeof(PlatformDetection), nameof(PlatformDetection.IsNativeAot))]
-        public void CustomAttributeCtor_WithGenericEnumArgument_DecodesCorrectly()
+        public unsafe void CustomAttributeCtor_WithGenericEnumArgument_DecodesCorrectly()
         {
             // This test ensures correct reflection behavior when loading a custom attribute
             // whose constructor argument is a generic enum instance involving a function pointer array.
