@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"D:\\\\dotnet\\\\runtime\" log --all --oneline --grep=\"browser.*coreclr\\\\|coreclr.*browser\" -i)",
+      "Bash(git -C \"D:\\\\dotnet\\\\runtime\" log f47247a21f9 --format=fuller)",
+      "Bash(D:dotnetruntimebuild.cmd -os browser -arch wasm -subset clr+libs)",
+      "Bash(cmd /c \"D:\\\\dotnet\\\\runtime\\\\build.cmd -os browser -arch wasm -subset clr+libs\")",
+      "Bash(cmd /c \"cd /d D:\\\\dotnet\\\\runtime && build.cmd -os browser -arch wasm -subset clr+libs 2>&1\")",
+      "Bash(timeout:*)",
+      "Bash(powershell -Command \"Set-Location D:\\\\dotnet\\\\runtime; .\\\\build.cmd -os browser -arch wasm -subset clr+libs\")",
+      "Bash(powershell -Command:*)"
+    ]
+  }
+}
