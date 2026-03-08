@@ -353,6 +353,7 @@ Copyright (c) .NET Foundation. All rights reserved.
     <PropertyGroup>
       <_WasmBuildWebcilPath>$([MSBuild]::NormalizeDirectory($(IntermediateOutputPath), 'webcil'))</_WasmBuildWebcilPath>
       <_WasmBuildTmpWebcilPath>$([MSBuild]::NormalizeDirectory($(IntermediateOutputPath), 'tmp-webcil'))</_WasmBuildTmpWebcilPath>
+      <_WasmBuildPassThroughPath>$([MSBuild]::NormalizeDirectory($(IntermediateOutputPath)))</_WasmBuildPassThroughPath>
     </PropertyGroup>
 
     <ConvertDllsToWebcil Candidates="@(_BuildAssetsCandidates)" IntermediateOutputPath="$(_WasmBuildTmpWebcilPath)" OutputPath="$(_WasmBuildWebcilPath)" IsEnabled="$(_WasmEnableWebcil)">
@@ -360,7 +361,39 @@ Copyright (c) .NET Foundation. All rights reserved.
       <Output TaskParameter="FileWrites" ItemName="FileWrites" />
     </ConvertDllsToWebcil>
 
+    <!-- Copy pass-through files (JS, maps, ICU, native wasm, and when WebCil is disabled, DLLs)
+         from shared locations (e.g. NuGet cache) to a per-project directory so each project gets
+         a unique Identity when multiple WASM client projects reference the same runtime pack.
+         Webcil-converted files already live in per-project $(IntermediateOutputPath)webcil/ and
+         don't need copying. Satellite assemblies are placed in culture subdirectories to match
+         ConvertDllsToWebcil behavior. -->
     <ItemGroup>
+      <_WasmPassThroughCandidates Include="@(_WebcilAssetsCandidates)"
+        Condition="!$([System.String]::new('%(Identity)').StartsWith($(_WasmBuildWebcilPath)))" />
+      <_WebcilAssetsCandidates Remove="@(_WasmPassThroughCandidates)" />
+    </ItemGroup>
+
+    <!-- Separate satellite (culture) pass-throughs from regular ones so we can place them in subdirs -->
+    <ItemGroup>
+      <_WasmCulturePassThroughs Include="@(_WasmPassThroughCandidates)"
+        Condition="'%(_WasmPassThroughCandidates.AssetTraitName)' == 'Culture'" />
+      <_WasmPassThroughCandidates Remove="@(_WasmCulturePassThroughs)" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_WasmPassThroughCandidates)"
+      DestinationFolder="$(_WasmBuildPassThroughPath)"
+      SkipUnchangedFiles="true" />
+
+    <Copy SourceFiles="@(_WasmCulturePassThroughs)"
+      DestinationFiles="@(_WasmCulturePassThroughs->'$(_WasmBuildPassThroughPath)%(AssetTraitValue)/%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true"
+      Condition="'@(_WasmCulturePassThroughs)' != ''" />
+
+    <ItemGroup>
+      <FileWrites Include="@(_WasmPassThroughCandidates->'$(_WasmBuildPassThroughPath)%(Filename)%(Extension)')" />
+      <FileWrites Include="@(_WasmCulturePassThroughs->'$(_WasmBuildPassThroughPath)%(AssetTraitValue)/%(Filename)%(Extension)')" />
+      <_WebcilAssetsCandidates Include="@(_WasmPassThroughCandidates->'$(_WasmBuildPassThroughPath)%(Filename)%(Extension)')" />
+      <_WebcilAssetsCandidates Include="@(_WasmCulturePassThroughs->'$(_WasmBuildPassThroughPath)%(AssetTraitValue)/%(Filename)%(Extension)')" />
       <!-- Set per-item ContentRoot so each asset's Identity matches its actual file on disk -->
       <_WebcilAssetsCandidates Update="@(_WebcilAssetsCandidates)" ContentRoot="%(RootDir)%(Directory)" />
       <_WasmFingerprintPatterns Include="WasmFiles" Pattern="*.wasm" Expression="#[.{fingerprint}]!" />
