@@ -62,7 +62,35 @@ set(NATIVEGLOBALIZATION_SOURCES
     pal_idna.c
     pal_common.c
 )
-if (NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS)
+
+# ICU4X mode: use ICU4X shim files instead of ICU4C for WASM targets
+option(USE_ICU4X "Use ICU4X instead of ICU4C for globalization" OFF)
+
+if (USE_ICU4X)
+    # ICU4X shim sources replace the ICU4C versions
+    set(NATIVEGLOBALIZATION_SOURCES
+        pal_calendarData_icu4x.c
+        pal_casing_icu4x.c
+        pal_collation_icu4x.c
+        pal_locale_icu4x.c
+        pal_localeNumberData_icu4x.c
+        pal_localeStringData_icu4x.c
+        pal_normalization_icu4x.c
+        pal_idna_icu4x.c
+        pal_timeZoneInfo_icu4x.c
+        pal_icushim_icu4x.c
+        pal_common.c
+    )
+    add_definitions(-DSTATIC_ICU)
+    add_definitions(-DUSE_ICU4X)
+
+    # ICU4X headers and library
+    if (DEFINED CMAKE_ICU4X_DIR)
+        include_directories(${CMAKE_ICU4X_DIR}/include)
+        link_libraries(${CMAKE_ICU4X_DIR}/lib/libicu_capi.a)
+    endif()
+
+elseif (NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS)
     set(NATIVEGLOBALIZATION_SOURCES
         ${NATIVEGLOBALIZATION_SOURCES}
         pal_calendarData.c
@@ -83,7 +111,7 @@ if (CLR_CMAKE_TARGET_MACCATALYST OR CLR_CMAKE_TARGET_IOS OR CLR_CMAKE_TARGET_TVO
     )
 endif()
 
-if (NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS AND DEFINED CMAKE_ICU_DIR)
+if (NOT USE_ICU4X AND NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS AND DEFINED CMAKE_ICU_DIR)
     include_directories(${CMAKE_ICU_DIR}/include)
     link_libraries(${CMAKE_ICU_DIR}/lib/libicuuc.a ${CMAKE_ICU_DIR}/lib/libicui18n.a ${CMAKE_ICU_DIR}/lib/libicudata.a)
     link_libraries(stdc++)
@@ -108,6 +136,8 @@ if (LOCAL_BUILD)
     # For minipal files
     include_directories(../../)
     include_directories(${CMAKE_CURRENT_BINARY_DIR})
+elseif (USE_ICU4X)
+    # ICU4X init is already in the source list; nothing extra needed
 elseif (CLR_CMAKE_TARGET_MACCATALYST OR CLR_CMAKE_TARGET_IOS OR CLR_CMAKE_TARGET_TVOS OR CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
     add_definitions(-DSTATIC_ICU)
     set(NATIVEGLOBALIZATION_SOURCES ${NATIVEGLOBALIZATION_SOURCES} pal_icushim_static.c)
@@ -128,7 +158,7 @@ if (CLR_CMAKE_TARGET_APPLE)
 endif()
 
 # time zone names are filtered out of icu data for the browser and associated functionality is disabled
-if (NOT CLR_CMAKE_TARGET_BROWSER AND NOT CLR_CMAKE_TARGET_WASI AND NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS)
+if (NOT USE_ICU4X AND NOT CLR_CMAKE_TARGET_BROWSER AND NOT CLR_CMAKE_TARGET_WASI AND NOT CLR_CMAKE_TARGET_MACCATALYST AND NOT CLR_CMAKE_TARGET_IOS AND NOT CLR_CMAKE_TARGET_TVOS)
     set(NATIVEGLOBALIZATION_SOURCES ${NATIVEGLOBALIZATION_SOURCES} pal_timeZoneInfo.c)
 endif()
 
@@ -225,7 +255,13 @@ if(CLR_CMAKE_TARGET_WIN32)
     endif()
 endif()
 
-if((CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI) AND DEFINED CMAKE_ICU_DIR)
+if (USE_ICU4X AND (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI) AND DEFINED CMAKE_ICU4X_DIR)
+    # Install ICU4X static library (no .dat files needed — data is compiled in)
+    install(FILES "${CMAKE_ICU4X_DIR}/lib/libicu_capi.a" DESTINATION ${STATIC_LIB_DESTINATION} COMPONENT libs)
+    if (NOT CORERUN_LIBS_ONLY)
+        install(FILES "${CMAKE_ICU4X_DIR}/lib/libicu_capi.a" DESTINATION sharedFramework COMPONENT runtime)
+    endif()
+elseif((CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI) AND DEFINED CMAKE_ICU_DIR)
     file(TO_CMAKE_PATH "${CMAKE_ICU_DIR}" CMAKE_ICU_DIR)
     file(GLOB ICU_DATA_AND_LIB_FILES "${CMAKE_ICU_DIR}/lib/*.dat")
     list(APPEND ICU_DATA_AND_LIB_FILES

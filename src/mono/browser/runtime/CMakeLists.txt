@@ -5,6 +5,8 @@ project(mono-wasm-runtime C)
 option(DISABLE_THREADS "defined if the build does NOT support multithreading" ON)
 option(ENABLE_JS_INTEROP_BY_VALUE "defined when JS interop without pointers to managed objects" OFF)
 
+option(USE_ICU4X "Use ICU4X instead of ICU4C for globalization" OFF)
+
 set(CMAKE_EXECUTABLE_SUFFIX ".js")
 add_executable(dotnet.native runtime.c corebindings.c driver.c pinvoke.c)
 
@@ -12,6 +14,16 @@ target_include_directories(dotnet.native PUBLIC ${MONO_INCLUDES} ${MONO_OBJ_INCL
 target_compile_options(dotnet.native PUBLIC @${NATIVE_BIN_DIR}/src/emcc-default.rsp @${NATIVE_BIN_DIR}/src/emcc-compile.rsp -DGEN_PINVOKE=1 ${CONFIGURATION_COMPILE_OPTIONS})
 
 set_target_properties(dotnet.native PROPERTIES COMPILE_FLAGS ${CONFIGURATION_EMCC_FLAGS})
+
+# ICU library selection
+if(USE_ICU4X)
+    set(ICU_LIBS ${NATIVE_BIN_DIR}/libicu_capi.a)
+else()
+    set(ICU_LIBS
+        ${NATIVE_BIN_DIR}/libicudata.a
+        ${NATIVE_BIN_DIR}/libicuuc.a
+        ${NATIVE_BIN_DIR}/libicui18n.a)
+endif()
 
 target_link_libraries(dotnet.native
     PRIVATE
@@ -28,9 +40,7 @@ target_link_libraries(dotnet.native
     ${NATIVE_BIN_DIR}/libSystem.Native.TimeZoneData.a
     ${NATIVE_BIN_DIR}/libSystem.Globalization.Native.a
     ${NATIVE_BIN_DIR}/libSystem.IO.Compression.Native.a
-    ${NATIVE_BIN_DIR}/libicudata.a
-    ${NATIVE_BIN_DIR}/libicuuc.a
-    ${NATIVE_BIN_DIR}/libicui18n.a
+    ${ICU_LIBS}
     ${NATIVE_BIN_DIR}/libz.a)
 
 set_target_properties(dotnet.native PROPERTIES
