@@ -19,7 +19,8 @@
 
 // --- Bump allocator for anonymous mappings ---
 // 256MB arena — sufficient for GC heap + runtime structures.
-// On WASM this is virtual (backed by memory.grow on demand).
+// Note: malloc immediately grows wasm linear memory (no lazy pages).
+// TODO: Consider growing the arena in chunks to reduce memory usage for small apps.
 #define ANON_ARENA_SIZE (256 * 1024 * 1024)
 
 static char *s_arena_base;
