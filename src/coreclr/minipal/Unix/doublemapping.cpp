@@ -28,8 +28,16 @@
 #include "minipal/cpufeatures.h"
 
 #ifndef TARGET_APPLE
+#if !defined(TARGET_WASI)
 #include <link.h>
+#endif
 #include <dlfcn.h>
+#if defined(TARGET_WASI)
+// pal_wasi_missing.h provides Dl_info for the struct InitializeTemplateThunkLocals
+// declaration below; the actual dladdr() call is FEATURE_MAP_THUNKS_FROM_IMAGE-only
+// (Apple) so the stub is never invoked on WASI.
+#include "../../pal/src/include/pal/wasi/pal_wasi_missing.h"
+#endif
 #endif // TARGET_APPLE
 
 #ifdef TARGET_APPLE
@@ -102,6 +110,7 @@ bool VMToOSInterface::CreateDoubleMemoryMapper(void** pHandle, size_t *pMaxExecu
     // Clip the maximum double mapped memory size to 1/4 of the virtual address space limit.
     // When such a limit is set, GC reserves 1/2 of it, so we need to leave something
     // for the rest of the process.
+#if !defined(TARGET_WASI)
     struct rlimit virtualAddressSpaceLimit;
     if ((getrlimit(RLIMIT_AS, &virtualAddressSpaceLimit) == 0) && (virtualAddressSpaceLimit.rlim_cur != RLIM_INFINITY))
     {
@@ -121,6 +130,7 @@ bool VMToOSInterface::CreateDoubleMemoryMapper(void** pHandle, size_t *pMaxExecu
             maxDoubleMappedMemorySize = fileSizeLimit.rlim_cur;
         }
     }
+#endif // !TARGET_WASI
 
     if (ftruncate(fd, maxDoubleMappedMemorySize) == -1)
     {
