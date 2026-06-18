@@ -1,0 +1,206 @@
+# CoreCLR-WASI known-failures list, consumed by run.cs --known-failures=.
+#
+# Format: one test-wrapper path per line, relative to the test-bin root
+#   (e.g. JIT/jit64/regress/ddb/113574/113574/113574.sh).
+# Blank lines and `# comments` are ignored.
+#
+# Tests listed here are excluded from the "unexpected failures" count.
+# An expected-failure that starts passing surfaces as an "unexpected pass"
+# in the summary so you can remove it from this list.
+
+# ----- pure interpreter speed (no WASI bug, just slow) ------------------------
+#
+# 2^31 iteration loop in pure interpreter — runs forever within the 60s
+# default test timeout. Will become viable once R2R-WASM is on for tests.
+JIT/jit64/regress/ddb/113574/113574/113574.sh
+# Same general issue: a large stress loop that exceeds the default timeout
+# under the interpreter. Promote to passing once R2R-WASM is on, or run
+# with a much larger --timeout.
+JIT/Regression/Regression_PdbOnly_r_2/Regression_PdbOnly_r_2.sh
+
+# ----- vararg calling convention not implemented in the WASM interpreter ------
+#
+# Each of these throws "System.InvalidProgramException: Vararg calling
+# convention not supported." from the interpreter on entry. Vararg
+# IL is a real but narrow gap in the WASM interpreter codegen; the
+# tests are checking very old x86 JIT regressions that happen to use
+# __arglist. Unblock requires interpreter vararg support.
+JIT/Regression/CLR-x86-EJIT/V1-M12-Beta2/b26323/b26323/b26323.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b26324/b26324a/b26324a.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b26324/b26324b/b26324b.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b28901/b28901/b28901.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b30838/b30838/b30838.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b30864/b30864/b30864.sh
+JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b32374/b32374/b32374.sh
+JIT/Regression/CLR-x86-JIT/V1-M11-Beta1/b35784/b35784/b35784.sh
+JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b65423/b65423/b65423.sh
+JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b409748/b409748/b409748.sh
+JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b426654/b426654/b426654.sh
+
+# ----- dlopen / shared-library loading not implemented in wasi-libc -----------
+#
+# Each of these has a `[DllImport]` against a per-test native helper
+# (.dylib/.so/.dll). wasi-libc has no dlopen, so the runtime throws
+# DllNotFoundException("dlopen not implemented"). Unblock requires
+# either static-linking pinvoke targets into corerun.wasm, or an
+# in-runtime PInvoke-override scheme like the browser host uses.
+JIT/Regression/JitBlue/Runtime_101046/Runtime_101046/Runtime_101046.sh
+JIT/Regression/VS-ia64-JIT/V1.2-M02/b108129/b108129/b108129.sh
+
+# ----- System.Diagnostics.Process not supported on WASI -----------------------
+#
+# These two tests spawn a sub-process to exercise a 32-bit vs 64-bit
+# JIT codegen difference. System.Diagnostics.Process is excluded from
+# the wasi-wasm runtime pack (the System.Diagnostics.Process
+# .notsupported.cs shim throws PlatformNotSupportedException). The
+# subprocess approach is fundamentally incompatible with a sandboxed
+# WASI module that has no `proc_create` equivalent.
+JIT/Regression/JitBlue/GitHub_23199/GitHub_23199_Target_32Bit/GitHub_23199_Target_32Bit.sh
+JIT/Regression/JitBlue/GitHub_23199/GitHub_23199_Target_64Bit/GitHub_23199_Target_64Bit.sh
+
+# ----- collectible AssemblyLoadContext unloading -----------------------------
+#
+# Test verifies that a readonly static field referenced from a method
+# in a collectible ALC is collected when the ALC is unloaded. The WASI
+# CoreCLR bring-up does not yet implement ALC unloading.
+JIT/Regression/JitBlue/Runtime_100437/Runtime_100437/Runtime_100437.sh
+
+# ----- EH edge case: double-ctor exception not thrown ------------------------
+#
+# Both variants of Dev11_468598 expect a specific EH-driven failure
+# when a constructor is invoked twice via reflection from inside a
+# catch handler. The expected exception does not surface on WASI
+# corerun, suggesting an interaction between the WASM EH path and the
+# constructor-completion bookkeeping. Worth investigating; tracked
+# here for now so it doesn't gate the run.
+JIT/Regression/Dev11/Dev11_468598/Test_HndIndex_10_Plain/Test_HndIndex_10_Plain.sh
+JIT/Regression/Dev11/Dev11_468598/Test_HndIndex_10_Reordered/Test_HndIndex_10_Reordered.sh
+
+
+# =============================================================================
+# baseservices
+# =============================================================================
+
+# ----- multithreading not supported in single-threaded WASI ------------------
+#
+# Tests that call Thread.Start, Timer.., Parallel.* hit
+# `System.PlatformNotSupportedException` from
+# `RuntimeFeature.ThrowIfMultithreadingIsNotSupported()`. Single-threaded
+# WASI is by design — these tests cannot run as-is.
+baseservices/threading/regressions/13662/13662-a/13662-a.sh
+baseservices/threading/regressions/13662/13662-b/13662-b.sh
+baseservices/threading/regressions/13662/13662-simple/13662-simple.sh
+baseservices/threading/regressions/30032/30032/30032.sh
+baseservices/threading/regressions/576463/576463/576463.sh
+baseservices/threading/regressions/beta2/437017/437017.sh
+baseservices/threading/regressions/beta2/437044/437044.sh
+
+# ----- AppDomain.UnhandledException + worker threads --------------------------
+#
+# All of these set up an unhandled-exception handler and then either
+# launch a worker thread to fault or invoke a P/Invoke that faults.
+# Same single-threaded-WASI block as above (Thread.Start throws PNSE).
+baseservices/exceptions/UnhandledExceptionHandler/Foreign/ForeignUnhandled/ForeignUnhandled.sh
+baseservices/exceptions/UnhandledExceptionHandler/HandlerRefuses/HandlerRefuses.sh
+baseservices/exceptions/UnhandledExceptionHandler/HandlerThrows/HandlerThrows.sh
+baseservices/exceptions/UnhandledExceptionHandler/NoEffectInMainThread/NoEffectInMainThread.sh
+baseservices/exceptions/UnhandledExceptionHandler/PInvoke/PInvokeUnhandled/PInvokeUnhandled.sh
+baseservices/exceptions/UnhandledExceptionHandler/UnhandledTrivial/UnhandledTrivial.sh
+
+# ----- tests that shell out to corerun via System.Diagnostics.Process --------
+#
+# Same root cause as the JIT/Regression GitHub_23199_* entries above:
+# System.Diagnostics.Process is excluded from the wasi-wasm runtime
+# pack; the .notsupported.cs shim throws PlatformNotSupportedException.
+# The "tester" tests in baseservices spawn corerun as a subprocess to
+# observe its exit / stderr behaviour, which can't work in a sandboxed
+# WASI module.
+baseservices/RuntimeConfiguration/TestConfigTester/TestConfigTester.sh
+baseservices/callconvs/TestCallingConventions/TestCallingConventions.sh
+baseservices/exceptions/simple/ParallelCrashTester/ParallelCrashTester.sh
+baseservices/exceptions/stackoverflow/stackoverflowtester/stackoverflowtester.sh
+baseservices/exceptions/unhandled/unhandledTester/unhandledTester.sh
+
+# ----- custom test runner that bypasses the wasmtime wrapper ------------------
+#
+# BasicTestWithMcj uses its own RunBasicTestWithMcj.sh which execs
+# `$CORE_ROOT/corerun` directly. On WASI corerun is a `.wasm` file
+# (component) — not natively executable; the script fails with
+# "Permission denied". Same script also expects a host crossgen2 to
+# AOT the test first. The test would need its own WASI-aware runner.
+baseservices/TieredCompilation/BasicTestWithMcj/BasicTestWithMcj.sh
+
+# ----- threading tests masquerading as EH tests (V1/SEH/VJ family) ----------
+#
+# These four tests *look* like nested-throw / handler tests but the
+# actual scenario is single-thread WASI cannot Thread.Start the
+# worker that would do the throwing. Each Main() does
+#   try { mv_Thread.Start(); } catch { retVal = 0; ... }
+# 10 times, printing "Exception was caught in main" per iteration,
+# then returns 0 instead of the expected 100. The nested-throw
+# runtest() that gives these tests their names is never reached.
+# Same threading block as the rest — fix on browser, will require
+# multithreaded WASI to ever pass here.
+baseservices/exceptions/regressions/V1/SEH/VJ/HandlerException/HandlerException.sh
+baseservices/exceptions/regressions/V1/SEH/VJ/MultipleException/MultipleException.sh
+baseservices/exceptions/regressions/V1/SEH/VJ/NestedException/NestedException.sh
+baseservices/exceptions/regressions/V1/SEH/VJ/RecursiveException/RecursiveException.sh
+
+# ----- finalization-dependent: ConditionalWeakTable / dependent handles ------
+#
+# Dev10_535767 is a GC stress test for ConditionalWeakTable/dependent
+# handles that relies on finalizers running on demand from a worker
+# thread. WASI dispatches finalization through WasiEventLoop; without
+# the host loop ticking the test never observes its expected drops.
+# Same blocker as the Finalization smoke test in known-broken/.
+baseservices/compilerservices/dynamicobjectproperties/Dev10_535767/Dev10_535767.sh
+
+# ----- DynamicMethod liveness via worker thread + GC -------------------------
+#
+# Test creates a DynamicMethod, GCs from a worker thread, asserts the
+# DynamicMethod stays alive. Same threading block (Thread.Start
+# throws PNSE on single-threaded WASI).
+baseservices/exceptions/regressions/Dev11/154243/dynamicmethodliveness/dynamicmethodliveness.sh
+
+# ----- NoPIA type-equivalence IL test ----------------------------------------
+#
+# Exercises COM type equivalence (`[TypeIdentifier]`) at the IL level.
+# WASI corerun's `FEATURE_TYPEEQUIVALENCE` path is not yet wired up
+# (no `FEATURE_COMINTEROP` on the WASI build). Real gap, low priority.
+baseservices/typeequivalence/signatures/nopiatestil/nopiatestil.sh
+
+# =============================================================================
+# JIT/Methodical
+# =============================================================================
+
+# ----- finalizer-dependent GC tests (no host-loop tick) ----------------------
+#
+# Same blocker as the Finalization smoke test and Dev10_535767:
+# GC.WaitForPendingFinalizers does not drain finalizers on WASI
+# without a host event-loop turn. These tests deliberately stress the
+# finalizer queue.
+JIT/Methodical/Arrays/misc/arrres_d/arrres_d.sh
+JIT/Methodical/Arrays/misc/arrres_do/arrres_do.sh
+JIT/Methodical/Arrays/misc/arrres_r/arrres_r.sh
+JIT/Methodical/Arrays/misc/arrres_ro/arrres_ro.sh
+
+# ----- threading (single-threaded WASI by design) -----------------------------
+#
+# All call Thread.Start / new Thread(...) and hit
+# PlatformNotSupportedException from
+# RuntimeFeature.ThrowIfMultithreadingIsNotSupported().
+JIT/Methodical/Boxing/misc/concurgc_d/concurgc_d.sh
+JIT/Methodical/Boxing/misc/concurgc_r/concurgc_r.sh
+JIT/Methodical/cctor/misc/threads2_cs_d/threads2_cs_d.sh
+JIT/Methodical/cctor/misc/threads2_cs_do/threads2_cs_do.sh
+JIT/Methodical/cctor/misc/threads2_cs_r/threads2_cs_r.sh
+JIT/Methodical/cctor/misc/threads2_cs_ro/threads2_cs_ro.sh
+JIT/Methodical/tailcall_v4/hijacking/hijacking.sh
+
+# ----- vararg calling convention (WASM interpreter gap) ----------------------
+#
+# Same family as the JIT/Regression b* tests:
+# InvalidProgramException: Vararg calling convention not supported.
+JIT/Methodical/Coverage/arglist_pos/arglist_pos.sh
+JIT/Methodical/refany/seq_d/seq_d.sh
+JIT/Methodical/refany/seq_r/seq_r.sh
