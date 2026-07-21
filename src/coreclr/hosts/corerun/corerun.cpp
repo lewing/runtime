@@ -313,12 +313,19 @@ extern "C" bool BrowserHost_ExternalAssemblyProbe(const char* pathPtr, /*out*/ v
 //
 // A crossgen2-produced R2R webcil image is merged into this module post-link (its native
 // functions land in the shared indirect function table and its webcil payload/metadata is
-// copied into g_wasi_r2r_image by an injected start function via getWebcilPayload()). This
-// buffer is the fixed, link-time-stable location the merge step targets for imageBase, so the
-// runtime can find the R2R webcil the same way the browser host does via BrowserHost_ExternalAssemblyProbe.
-// Sized to hold the COMPOSITE R2R metadata payload (written by the offline merge's active data segment
-// at this buffer's address == the composite image's imageBase). 3 MB covers the ~2.84 MB composite payload.
-alignas(16) static uint8_t g_wasi_r2r_image[3u * 1024u * 1024u];
+// written into g_wasi_r2r_image by the offline merge's active data segment at this buffer's
+// address == the composite image's imageBase). The runtime then finds the R2R webcil the same
+// way the browser host does via BrowserHost_ExternalAssemblyProbe.
+//
+// This buffer is a composite-AGNOSTIC cap: its address is exported (wasi_r2r_image_base) for the
+// merge step to target, but its size is NOT tuned per composite. The actual payload size and the
+// merge-time table base are discovered at runtime from the self-describing WbIL header (see
+// WasiWebcilPayloadSize / WebcilHeader_1.TableBase), so this host never needs rebuilding when the
+// composite changes. It only requires the composite's metadata payload to fit under the cap below.
+#ifndef WASI_R2R_IMAGE_CAP
+#define WASI_R2R_IMAGE_CAP (16u * 1024u * 1024u)
+#endif
+alignas(16) static uint8_t g_wasi_r2r_image[WASI_R2R_IMAGE_CAP];
 
 // Exported so the offline merge step can discover the buffer's address and wire it to the
 // R2R image's imageBase global.
@@ -327,21 +334,40 @@ extern "C" __attribute__((export_name("wasi_r2r_image_base"))) uint32_t wasi_r2r
     return (uint32_t)(uintptr_t)&g_wasi_r2r_image[0];
 }
 
-// Size of the baked composite webcil payload. Set by the merge step to match the composite image.
-#ifndef WASI_R2R_PAYLOAD_SIZE
-#define WASI_R2R_PAYLOAD_SIZE 2837488
-#endif
-
 // The composite native image's bundle-relative file name (the ownerCompositeExecutable named by each
 // per-assembly stub). The runtime asks for this via NativeImage::Open -> external_assembly_probe.
 #ifndef WASI_R2R_COMPOSITE_NAME
 #define WASI_R2R_COMPOSITE_NAME "composite-r2r.wasm"
 #endif
 
-// The wasm table index where the merge step placed the composite's R2R functions (tableBase global).
-#ifndef WASI_R2R_TABLE_BASE
-#define WASI_R2R_TABLE_BASE 6252
-#endif
+// Compute the exact WbIL payload size from its self-describing header - no baked constant needed.
+// WebcilHeader_1 (32 bytes): Id[4] 'WbIL', VersionMajor u16, VersionMinor u16, CoffSections u16,
+// Reserved0 u16, PeCliHeaderRva u32, PeCliHeaderSize u32, PeDebugRva u32, PeDebugSize u32, TableBase u32.
+// Followed by CoffSections * WebcilSectionHeader{VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData}.
+// The payload extent is the maximum (PointerToRawData + SizeOfRawData) across all sections.
+static int64_t WasiWebcilPayloadSize(const uint8_t* p)
+{
+    if (p[0] != 'W' || p[1] != 'b' || p[2] != 'I' || p[3] != 'L')
+        return 0;
+
+    uint16_t coffSections;
+    memcpy(&coffSections, p + 8, sizeof(coffSections));
+
+    const uint8_t* sec = p + 32; // section headers follow the 32-byte WebcilHeader_1
+    uint32_t maxEnd = 0;
+    for (uint16_t i = 0; i < coffSections; i++)
+    {
+        uint32_t sizeOfRawData;
+        uint32_t pointerToRawData;
+        memcpy(&sizeOfRawData, sec + 8, sizeof(sizeOfRawData));
+        memcpy(&pointerToRawData, sec + 12, sizeof(pointerToRawData));
+        uint32_t end = pointerToRawData + sizeOfRawData;
+        if (end > maxEnd)
+            maxEnd = end;
+        sec += 16;
+    }
+    return (int64_t)maxEnd;
+}
 
 // Minimal LEB128 reader for parsing a wasm binary's Data section.
 static uint64_t wasi_read_uleb(const uint8_t* p, size_t len, size_t* pos)
@@ -358,8 +384,9 @@ static uint64_t wasi_read_uleb(const uint8_t* p, size_t len, size_t* pos)
 }
 
 // Extract the raw WbIL webcil payload (passive data segment index 1) from a wasm-wrapped-webcil stub
-// on disk, copy it into a malloc'd buffer, and patch the tableBase field (offset 28) to the composite's
-// tableBase so any stub-side table references resolve into the shared composite function range.
+// on disk and copy it into a malloc'd buffer. The stub's tableBase field (WebcilHeader_1 offset 28) is
+// authoritative: the offline merge step patches it to the composite's merge-time table base, so this
+// host trusts the on-disk value rather than injecting a baked constant.
 // Mirrors what the browser JS loader's getWebcilPayload does, but purely in native code (no instantiation).
 static bool WasiExtractStubPayload(const char* wasmPath, void** data_start, int64_t* size)
 {
@@ -397,8 +424,6 @@ static bool WasiExtractStubPayload(const char* wasmPath, void** data_start, int6
                         if (buf != nullptr)
                         {
                             memcpy(buf, p + dstart, (size_t)dlen);
-                            if (dlen >= 32)
-                                *(uint32_t*)(buf + 28) = (uint32_t)WASI_R2R_TABLE_BASE;
                             *data_start = buf;
                             *size = (int64_t)dlen;
                             ok = true;
@@ -417,12 +442,15 @@ static bool WasiExtractStubPayload(const char* wasmPath, void** data_start, int6
 
 static bool WasiStaticR2RProbe(const char* name, void** data_start, int64_t* size)
 {
-#if WASI_R2R_PAYLOAD_SIZE > 0
-    // The composite native image itself: return the baked composite payload at imageBase.
+    // The composite native image itself: return the merged composite payload at imageBase. Its size is
+    // read from the self-describing WbIL header (no baked constant), and validated against the buffer cap.
     if (strcmp(name, WASI_R2R_COMPOSITE_NAME) == 0)
     {
+        int64_t payloadSize = WasiWebcilPayloadSize(&g_wasi_r2r_image[0]);
+        if (payloadSize <= 0 || (size_t)payloadSize > sizeof(g_wasi_r2r_image))
+            return false; // buffer not populated, or composite payload exceeds the cap
         *data_start = &g_wasi_r2r_image[0];
-        *size = WASI_R2R_PAYLOAD_SIZE;
+        *size = payloadSize;
         return true;
     }
 
@@ -444,9 +472,6 @@ static bool WasiStaticR2RProbe(const char* name, void** data_start, int64_t* siz
             }
         }
     }
-#else
-    (void)name; (void)data_start; (void)size;
-#endif
     return false;
 }
 #endif // TARGET_WASI
