@@ -9292,19 +9292,20 @@ void Lowering::FindInducedParameterRegisterLocals()
 #ifdef TARGET_WASM
         if (varTypeIsSIMD(value) && !varTypeIsSIMD(fld))
         {
-            // On wasm a scalar and its containing vector are distinct value-stack types (unlike
-            // x64/arm64, where the scalar overlaps the low bytes of the vector register and can be read
-            // by simply retyping the access). Extract the scalar lane directly from the SIMD register
-            // local (e.g. f64x2.extract_lane), avoiding an invalid reinterpret or a spill/reload through
-            // memory. The GetElement node is lowered by the subsequent per-block lowering pass.
-            unsigned laneIndex = (fld->GetLclOffs() - regSegment->Offset) / genTypeSize(fld);
-            value              = m_compiler->gtNewSimdGetElementNode(fld->TypeGet(), value,
-                                                                     m_compiler->gtNewIconNode((ssize_t)laneIndex),
-                                                                     fld->TypeGet(), genTypeSize(value));
+            // Unlike native targets, wasm cannot reinterpret a v128 local access as a scalar.
+            const unsigned laneOffset = fld->GetLclOffs() - regSegment->Offset;
+            const unsigned scalarSize = genTypeSize(fld);
+            assert((laneOffset % scalarSize) == 0);
+
+            const unsigned laneIndex = laneOffset / scalarSize;
+            value                    = m_compiler->gtNewSimdGetElementNode(fld->TypeGet(), value,
+                                                                           m_compiler->gtNewIconNode(static_cast<ssize_t>(laneIndex)),
+                                                                           fld->TypeGet(), genTypeSize(value));
         }
-        else
+        else if (varTypeUsesFloatReg(value))
+#else
+        if (varTypeUsesFloatReg(value))
 #endif // TARGET_WASM
-            if (varTypeUsesFloatReg(value))
         {
             assert(fld->GetLclOffs() == regSegment->Offset);
 
