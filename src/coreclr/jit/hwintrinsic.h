@@ -1333,7 +1333,14 @@ struct HWIntrinsicInfo
             }
             case NI_PackedSimd_Shuffle:
             {
-                // (v128, v128, shuffle_mask)
+                // (v128, v128, shuffle_mask): the mask is the immediate operand
+                *imm1Pos = 3;
+                break;
+            }
+            case NI_PackedSimd_Swizzle:
+            {
+                // (v128, v128_control): the control vector is the immediate operand
+                *imm1Pos = 2;
                 break;
             }
             default:
