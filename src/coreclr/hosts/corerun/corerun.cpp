@@ -308,6 +308,174 @@ static char* s_core_root_path = nullptr;
 extern "C" bool BrowserHost_ExternalAssemblyProbe(const char* pathPtr, /*out*/ void **outDataStartPtr, /*out*/ int64_t* outSize);
 #endif // TARGET_BROWSER
 
+#ifdef TARGET_WASI
+// PROTOTYPE: statically-composed WASI R2R support.
+//
+// A crossgen2-produced R2R webcil image is merged into this module post-link (its native
+// functions land in the shared indirect function table and its webcil payload/metadata is
+// written into g_wasi_r2r_image by the offline merge's active data segment at this buffer's
+// address == the composite image's imageBase). The runtime then finds the R2R webcil the same
+// way the browser host does via BrowserHost_ExternalAssemblyProbe.
+//
+// This buffer is a composite-AGNOSTIC cap: its address is exported (wasi_r2r_image_base) for the
+// merge step to target, but its size is NOT tuned per composite. The actual payload size and the
+// merge-time table base are discovered at runtime from the self-describing WbIL header (see
+// WasiWebcilPayloadSize / WebcilHeader_1.TableBase), so this host never needs rebuilding when the
+// composite changes. It only requires the composite's metadata payload to fit under the cap below.
+#ifndef WASI_R2R_IMAGE_CAP
+#define WASI_R2R_IMAGE_CAP (16u * 1024u * 1024u)
+#endif
+alignas(16) static uint8_t g_wasi_r2r_image[WASI_R2R_IMAGE_CAP];
+
+// Exported so the offline merge step can discover the buffer's address and wire it to the
+// R2R image's imageBase global.
+extern "C" __attribute__((export_name("wasi_r2r_image_base"))) uint32_t wasi_r2r_image_base(void)
+{
+    return (uint32_t)(uintptr_t)&g_wasi_r2r_image[0];
+}
+
+// The composite native image's bundle-relative file name (the ownerCompositeExecutable named by each
+// per-assembly stub). The runtime asks for this via NativeImage::Open -> external_assembly_probe.
+#ifndef WASI_R2R_COMPOSITE_NAME
+#define WASI_R2R_COMPOSITE_NAME "composite-r2r.wasm"
+#endif
+
+// Compute the exact WbIL payload size from its self-describing header - no baked constant needed.
+// WebcilHeader_1 (32 bytes): Id[4] 'WbIL', VersionMajor u16, VersionMinor u16, CoffSections u16,
+// Reserved0 u16, PeCliHeaderRva u32, PeCliHeaderSize u32, PeDebugRva u32, PeDebugSize u32, TableBase u32.
+// Followed by CoffSections * WebcilSectionHeader{VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData}.
+// The payload extent is the maximum (PointerToRawData + SizeOfRawData) across all sections.
+static int64_t WasiWebcilPayloadSize(const uint8_t* p)
+{
+    if (p[0] != 'W' || p[1] != 'b' || p[2] != 'I' || p[3] != 'L')
+        return 0;
+
+    uint16_t coffSections;
+    memcpy(&coffSections, p + 8, sizeof(coffSections));
+
+    const uint8_t* sec = p + 32; // section headers follow the 32-byte WebcilHeader_1
+    uint32_t maxEnd = 0;
+    for (uint16_t i = 0; i < coffSections; i++)
+    {
+        uint32_t sizeOfRawData;
+        uint32_t pointerToRawData;
+        memcpy(&sizeOfRawData, sec + 8, sizeof(sizeOfRawData));
+        memcpy(&pointerToRawData, sec + 12, sizeof(pointerToRawData));
+        uint32_t end = pointerToRawData + sizeOfRawData;
+        if (end > maxEnd)
+            maxEnd = end;
+        sec += 16;
+    }
+    return (int64_t)maxEnd;
+}
+
+// Minimal LEB128 reader for parsing a wasm binary's Data section.
+static uint64_t wasi_read_uleb(const uint8_t* p, size_t len, size_t* pos)
+{
+    uint64_t result = 0; int shift = 0;
+    while (*pos < len)
+    {
+        uint8_t b = p[(*pos)++];
+        result |= (uint64_t)(b & 0x7f) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+    }
+    return result;
+}
+
+// Extract the raw WbIL webcil payload (passive data segment index 1) from a wasm-wrapped-webcil stub
+// on disk and copy it into a malloc'd buffer. The stub's tableBase field (WebcilHeader_1 offset 28) is
+// authoritative: the offline merge step patches it to the composite's merge-time table base, so this
+// host trusts the on-disk value rather than injecting a baked constant.
+// Mirrors what the browser JS loader's getWebcilPayload does, but purely in native code (no instantiation).
+static bool WasiExtractStubPayload(const char* wasmPath, void** data_start, int64_t* size)
+{
+    void* filedata = nullptr; int64_t filesize = 0;
+    if (!pal::try_map_file_readonly(wasmPath, &filedata, &filesize))
+        return false;
+
+    const uint8_t* p = (const uint8_t*)filedata;
+    size_t len = (size_t)filesize;
+    bool ok = false;
+    if (len >= 8 && p[0] == 0x00 && p[1] == 0x61 && p[2] == 0x73 && p[3] == 0x6d)
+    {
+        size_t pos = 8;
+        while (pos < len)
+        {
+            uint8_t secId = p[pos++];
+            uint64_t secSize = wasi_read_uleb(p, len, &pos);
+            size_t secEnd = pos + (size_t)secSize;
+            if (secEnd > len) break;
+            if (secId == 11) // Data section
+            {
+                size_t q = pos;
+                uint64_t segCount = wasi_read_uleb(p, len, &q);
+                for (uint64_t s = 0; s < segCount && q < secEnd; s++)
+                {
+                    uint64_t mode = wasi_read_uleb(p, len, &q);
+                    // Only passive segments (mode 1) are used by the webcil wrapper.
+                    if (mode != 1) { break; }
+                    uint64_t dlen = wasi_read_uleb(p, len, &q);
+                    size_t dstart = q;
+                    q += (size_t)dlen;
+                    if (s == 1) // segment[1] == the WbIL payload
+                    {
+                        uint8_t* buf = (uint8_t*)malloc((size_t)dlen);
+                        if (buf != nullptr)
+                        {
+                            memcpy(buf, p + dstart, (size_t)dlen);
+                            *data_start = buf;
+                            *size = (int64_t)dlen;
+                            ok = true;
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+            pos = secEnd;
+        }
+    }
+    munmap(filedata, (size_t)filesize);
+    return ok;
+}
+
+static bool WasiStaticR2RProbe(const char* name, void** data_start, int64_t* size)
+{
+    // The composite native image itself: return the merged composite payload at imageBase. Its size is
+    // read from the self-describing WbIL header (no baked constant), and validated against the buffer cap.
+    if (strcmp(name, WASI_R2R_COMPOSITE_NAME) == 0)
+    {
+        int64_t payloadSize = WasiWebcilPayloadSize(&g_wasi_r2r_image[0]);
+        if (payloadSize <= 0 || (size_t)payloadSize > sizeof(g_wasi_r2r_image))
+            return false; // buffer not populated, or composite payload exceeds the cap
+        *data_start = &g_wasi_r2r_image[0];
+        *size = payloadSize;
+        return true;
+    }
+
+    // A managed assembly: return its per-assembly stub payload (extracted from <base>.wasm on disk).
+    // The stub carries the assembly metadata + the R2R header naming the composite, which drives the
+    // runtime to then request WASI_R2R_COMPOSITE_NAME above.
+    size_t nlen = strlen(name);
+    if (nlen > 4 && strcmp(name + nlen - 4, ".dll") == 0)
+    {
+        char stub[512];
+        for (const char* dir : { s_core_libs_path, s_core_root_path })
+        {
+            if (dir == nullptr) continue;
+            // Build "<dir>/comp/<base>.wasm"
+            snprintf(stub, sizeof(stub), "%scomp/%.*s.wasm", dir, (int)(nlen - 4), name);
+            if (WasiExtractStubPayload(stub, data_start, size))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif // TARGET_WASI
+
 static bool HOST_CONTRACT_CALLTYPE get_native_code_data(
     const host_runtime_contract_native_code_context* context,
     host_runtime_contract_native_code_data* data)
@@ -375,6 +543,11 @@ static bool HOST_CONTRACT_CALLTYPE external_assembly_probe(
     const char* pos = strrchr(name, '/');
     if (pos != NULL)
         name = pos + 1;
+
+#ifdef TARGET_WASI
+    if (WasiStaticR2RProbe(name, data_start, size))
+        return true;
+#endif // TARGET_WASI
 
     // Try to map the file from our known app assembly paths
     for (const char* dir : { s_core_libs_path, s_core_root_path })

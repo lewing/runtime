@@ -126,7 +126,13 @@ else()
                 "-fuse-ld=${_wasi_sdk_bin}/wasm-component-ld"
                 -Wl,-z,stack-size=8388608
                 -Wl,--initial-memory=134217728
-                -Wl,--max-memory=4294967296)
+                -Wl,--max-memory=4294967296
+                # Force-root the cDAC contract descriptor getter: its object has no live
+                # references (the getter is the only one, and DATA symbols aren't auto-exported),
+                # so without an explicit --export root wasm-ld's --gc-sections drops the whole
+                # object and the descriptor never reaches the final module. Mirrors the native
+                # `-Wl,-u,DotNetRuntimeContractDescriptor` used on other non-browser targets.
+                -Wl,--export=GetDotNetRuntimeContractDescriptor)
         endif()
 
         if (CORERUN_IN_BROWSER)
