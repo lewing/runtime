@@ -132,7 +132,12 @@ else()
                 # so without an explicit --export root wasm-ld's --gc-sections drops the whole
                 # object and the descriptor never reaches the final module. Mirrors the native
                 # `-Wl,-u,DotNetRuntimeContractDescriptor` used on other non-browser targets.
-                -Wl,--export=GetDotNetRuntimeContractDescriptor)
+                -Wl,--export=GetDotNetRuntimeContractDescriptor
+                # [wasi][prototype] Export the runtime-owned async continuation global (#131167,
+                # helpers.cpp) so the offline R2R merge can wire each composite's webcil.asyncContinuation
+                # import to this same global (the interp<->R2R accessors use it), and so --gc-sections
+                # doesn't drop it.
+                -Wl,--export=__async_continuation)
         endif()
 
         if (CORERUN_IN_BROWSER)
