@@ -564,6 +564,25 @@ __attribute__((naked)) void ThrowRtlRestoreContextTag()
         "unreachable\n" ::);
 }
 
+// Runtime-owned WebAssembly global carrying the runtime-async continuation return
+// value. Exported so every R2R webcil imports this same global (see libCorerun.js).
+asm(".globl __async_continuation\n"
+    ".globaltype __async_continuation, i32\n"
+    "__async_continuation:\n");
+
+extern "C" __attribute__((naked)) int32_t RuntimeAsync_LoadAsyncContinuation()
+{
+    asm("global.get __async_continuation\n"
+        "return\n" ::);
+}
+
+extern "C" __attribute__((naked)) void RuntimeAsync_StoreAsyncContinuation(int32_t value)
+{
+    asm("local.get 0\n"
+        "global.set __async_continuation\n"
+        "return\n" ::);
+}
+
 VOID PALAPI RtlRestoreContext(IN PCONTEXT ContextRecord, IN PEXCEPTION_RECORD ExceptionRecord)
 {
     UNREFERENCED_PARAMETER(ContextRecord);
@@ -966,6 +985,13 @@ void InvokeCalliStub(PCODE ftn, InterpreterCalliCookie cookie, int8_t *pArgs, in
     _ASSERTE(cookie != NULL);
 
     (cookie)(ftn, pArgs, pRet);
+
+    // Async callees write their continuation to the shared global; hand it back to the caller.
+    //
+    if (pContinuationRet != nullptr)
+    {
+        *pContinuationRet = (Object*)(uintptr_t)(uint32_t)RuntimeAsync_LoadAsyncContinuation();
+    }
 }
 
 void InvokeUnmanagedCalli(PCODE ftn, InterpreterCalliCookie cookie, int8_t *pArgs, int8_t *pRet)
@@ -1179,6 +1205,13 @@ namespace
         {
             if (pos < maxSize)
                 keyBuffer[pos] = 'i';
+            pos++;
+        }
+
+        if (sig.HasAsyncContinuation())
+        {
+            if (pos < maxSize)
+                keyBuffer[pos] = 'a';
             pos++;
         }
 
@@ -1644,7 +1677,10 @@ void InvokeManagedMethod(MethodDesc *pMD, int8_t *pArgs, int8_t *pRet, PCODE tar
         cookie = pMD->GetCalliCookie();
     }
 
-    InvokeCalliStub(target == NULL ? pMD->GetMultiCallableAddrOfCode(CORINFO_ACCESS_ANY) : target, cookie, pArgs, pRet, pContinuationRet);
+    // Only pass the continuation arg to async callees.
+    //
+    Object** pCalleeContinuationRet = pMD->IsAsyncMethod() ? pContinuationRet : nullptr;
+    InvokeCalliStub(target == NULL ? pMD->GetMultiCallableAddrOfCode(CORINFO_ACCESS_ANY) : target, cookie, pArgs, pRet, pCalleeContinuationRet);
 }
 
 void InvokeUnmanagedMethod(MethodDesc *targetMethod, int8_t *pArgs, int8_t *pRet, PCODE callTarget)
