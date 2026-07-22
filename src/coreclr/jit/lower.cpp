@@ -9289,7 +9289,22 @@ void Lowering::FindInducedParameterRegisterLocals()
 
         GenTree* value = m_compiler->gtNewLclVarNode(remappedLclNum);
 
-        if (varTypeUsesFloatReg(value))
+#ifdef TARGET_WASM
+        if (varTypeIsSIMD(value) && !varTypeIsSIMD(fld))
+        {
+            // On wasm a scalar and its containing vector are distinct value-stack types (unlike
+            // x64/arm64, where the scalar overlaps the low bytes of the vector register and can be read
+            // by simply retyping the access). Extract the scalar lane directly from the SIMD register
+            // local (e.g. f64x2.extract_lane), avoiding an invalid reinterpret or a spill/reload through
+            // memory. The GetElement node is lowered by the subsequent per-block lowering pass.
+            unsigned laneIndex = (fld->GetLclOffs() - regSegment->Offset) / genTypeSize(fld);
+            value              = m_compiler->gtNewSimdGetElementNode(fld->TypeGet(), value,
+                                                                     m_compiler->gtNewIconNode((ssize_t)laneIndex),
+                                                                     fld->TypeGet(), genTypeSize(value));
+        }
+        else
+#endif // TARGET_WASM
+            if (varTypeUsesFloatReg(value))
         {
             assert(fld->GetLclOffs() == regSegment->Offset);
 
