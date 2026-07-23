@@ -1345,6 +1345,18 @@ struct HWIntrinsicInfo
                 *imm1Pos = 3;
                 break;
             }
+            case NI_PackedSimd_Shuffle:
+            {
+                // (v128, v128, shuffle_mask): the mask is the immediate operand
+                *imm1Pos = 3;
+                break;
+            }
+            case NI_PackedSimd_Swizzle:
+            {
+                // (v128, v128_control): the control vector is the immediate operand
+                *imm1Pos = 2;
+                break;
+            }
             default:
             {
                 unreached();
@@ -1507,6 +1519,13 @@ struct HWIntrinsic final
         assert(FitsIn<uint8_t>(lane));
 
         return static_cast<uint8_t>(lane);
+    }
+
+    simd16_t GetImmediateVecOperand() const
+    {
+        GenTree* immOp = m_node->GetImmOp();
+        assert(immOp->IsCnsVec());
+        return immOp->AsVecCon()->gtSimdVal;
     }
 
     NamedIntrinsic      id;

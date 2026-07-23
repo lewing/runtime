@@ -1407,6 +1407,14 @@ void emitter::emitDispIns(
         }
         break;
 
+        case IF_DATAOFFS:
+        {
+            cnsval_ssize_t imm = emitGetInsSC(id);
+            printf("data 0x%llx", (uint64_t)imm);
+            dispLclVarInfoIfAny();
+        }
+        break;
+
         case IF_F32:
         case IF_F64:
         {
