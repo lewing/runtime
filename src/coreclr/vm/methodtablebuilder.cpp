@@ -10589,6 +10589,26 @@ void MethodTableBuilder::InterfaceAmbiguityCheck(bmtInterfaceAmbiguityCheckInfo 
 
 
 //*******************************************************************************
+// The alignment of a SIMD vector is its size, capped by the maximum vector alignment the target
+// ABI supports. This single rule reproduces the historical per-type/per-architecture values for
+// Vector64/128/256/512<T> and extends naturally to System.Numerics.Vector<T> at its ISA-determined
+// size:
+//   * x86/amd64: cap 64 -> alignment == size (__m64 / __m128 / __m256 / __m512)
+//   * arm64 / loongarch64 / riscv64 / wasm: cap 16
+//   * arm: cap 8 (the PCS aligns __m128 at 8 and defines no larger vector)
+static unsigned GetSimdVectorAlignment(unsigned size)
+{
+#if defined(TARGET_ARM)
+    const unsigned cap = 8;
+#elif defined(TARGET_ARM64) || defined(TARGET_LOONGARCH64) || defined(TARGET_RISCV64) || defined(TARGET_WASM)
+    const unsigned cap = 16;
+#else
+    const unsigned cap = 64;
+#endif
+    return (size < cap) ? size : cap;
+}
+
+//*******************************************************************************
 void MethodTableBuilder::CheckForSystemTypes()
 {
     STANDARD_VM_CONTRACT;
@@ -10620,71 +10640,26 @@ void MethodTableBuilder::CheckForSystemTypes()
                 // These __m128 and __m256 types, among other requirements, are special in that they must always
                 // be aligned properly.
 
+                // Each intrinsic vector corresponds to a fundamental ABI data type
+                // (__m64 / __m128 / __m256 / __m512) whose alignment tracks its size, capped by what
+                // the target ABI supports. GetSimdVectorAlignment encodes that single rule.
+                unsigned size = 0;
+
                 if (strcmp(name, g_Vector64Name) == 0)
                 {
-                    // The System V ABI for i386 defaults to 8-byte alignment for __m64, except for parameter passing,
-                    // where it has an alignment of 4.
-
-                    pLayout->SetAlignmentRequirement(8); // sizeof(__m64)
+                    size = 8;  // sizeof(__m64)
                 }
                 else if (strcmp(name, g_Vector128Name) == 0)
                 {
-    #ifdef TARGET_ARM
-                    // The Procedure Call Standard for ARM defaults to 8-byte alignment for __m128
-
-                    pLayout->SetAlignmentRequirement(8);
-    #else
-                    pLayout->SetAlignmentRequirement(16); // sizeof(__m128)
-    #endif // TARGET_ARM
+                    size = 16; // sizeof(__m128)
                 }
                 else if (strcmp(name, g_Vector256Name) == 0)
                 {
-    #ifdef TARGET_ARM
-                    // No such type exists for the Procedure Call Standard for ARM. We will default
-                    // to the same alignment as __m128, which is supported by the ABI.
-
-                    pLayout->SetAlignmentRequirement(8);
-    #elif defined(TARGET_ARM64)
-                    // The Procedure Call Standard for ARM 64-bit (with SVE support) defaults to
-                    // 16-byte alignment for __m256.
-
-                    pLayout->SetAlignmentRequirement(16);
-    #elif defined(TARGET_LOONGARCH64)
-                    // TODO-LoongArch64: Update alignment to proper value when implement LoongArch64 intrinsic.
-                    pLayout->SetAlignmentRequirement(16);
-    #elif defined(TARGET_RISCV64)
-                    // TODO-RISCV64: Update alignment to proper value when we implement RISC-V intrinsic.
-                    // RISC-V Vector Extenstion Intrinsic Document
-                    // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/vector_type_infos.adoc
-                    pLayout->SetAlignmentRequirement(16);
-    #else
-                    pLayout->SetAlignmentRequirement(32); // sizeof(__m256)
-    #endif // TARGET_ARM elif TARGET_ARM64
+                    size = 32; // sizeof(__m256)
                 }
                 else if (strcmp(name, g_Vector512Name) == 0)
                 {
-    #ifdef TARGET_ARM
-                    // No such type exists for the Procedure Call Standard for ARM. We will default
-                    // to the same alignment as __m128, which is supported by the ABI.
-
-                    pLayout->SetAlignmentRequirement(8);
-    #elif defined(TARGET_ARM64)
-                    // The Procedure Call Standard for ARM 64-bit (with SVE support) defaults to
-                    // 16-byte alignment for __m256.
-
-                    pLayout->SetAlignmentRequirement(16);
-
-    #elif defined(TARGET_LOONGARCH64)
-                    // TODO-LoongArch64: Update alignment to proper value when implement LoongArch64 intrinsic.
-                    pLayout->SetAlignmentRequirement(16);
-    #elif defined(TARGET_RISCV64)
-                    // TODO-RISCV64: Update alignment to proper value when we implement RISC-V intrinsic.
-                    // RISC-V Vector Extenstion Intrinsic Document
-                    // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/vector_type_infos.adoc
-                    pLayout->SetAlignmentRequirement(16);
-    #else
-                    pLayout->SetAlignmentRequirement(64); // sizeof(__m512)
-    #endif // TARGET_ARM elif TARGET_ARM64
+                    size = 64; // sizeof(__m512)
                 }
                 else
                 {
@@ -10694,20 +10669,28 @@ void MethodTableBuilder::CheckForSystemTypes()
                     _ASSERTE_MSG(FALSE, "Unhandled Hardware Intrinsic Type.");
                 }
 
+                if (size != 0)
+                {
+                    pLayout->SetAlignmentRequirement(GetSimdVectorAlignment(size));
+                }
+
                 return;
             }
 
-#ifdef TARGET_WASM
-            // System.Numerics.Vector<T> is a v128 value on wasm, so it needs the same 16-byte
-            // alignment as System.Runtime.Intrinsics.Vector128<T> above. Its metadata layout is
-            // already 16 bytes (two UInt64 fields), but those only give it 8-byte alignment,
-            // which disagrees with crossgen2 and the interpreter.
             if ((strcmp(nameSpace, g_NumericsNS) == 0) && (strcmp(name, "Vector`1") == 0))
             {
-                pClass->GetLayoutInfo()->SetAlignmentRequirement(16); // sizeof(v128)
+                // System.Numerics.Vector<T> is passed like the matching fixed-size intrinsic vector, so
+                // its alignment must track its (ISA-dependent) size the same way rather than the 8-byte
+                // alignment its two-UInt64 metadata layout would otherwise yield. bmtFP->NumInstanceFieldBytes
+                // already holds the resolved SIMD size (see CheckIfSIMDAndUpdateSize).
+                //
+                // This generalizes the wasm-only 16-byte alignment added by #131328: on wasm Vector<T> is a
+                // v128, so the capped rule still yields 16 there. On other targets it is an ABI/layout change
+                // that requires an R2R version bump (mirroring MATCHING_HARDWARE_VECTOR in crossgen2)
+                // -- prototype only.
+                pClass->GetLayoutInfo()->SetAlignmentRequirement(GetSimdVectorAlignment(bmtFP->NumInstanceFieldBytes));
                 return;
             }
-#endif // TARGET_WASM
         }
 
         if (g_pNullableClass != NULL)

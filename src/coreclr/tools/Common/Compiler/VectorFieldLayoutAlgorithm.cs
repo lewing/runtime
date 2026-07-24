@@ -25,88 +25,27 @@ namespace ILCompiler
         {
             Debug.Assert(IsVectorType(defType));
 
-            LayoutInt alignment;
+            int size;
 
             if (defType.Name == "Vector64`1"u8)
             {
-                alignment = new LayoutInt(8);
+                size = 8;
             }
             else if (defType.Name == "Vector128`1"u8)
             {
-                if (defType.Context.Target.Architecture == TargetArchitecture.ARM)
-                {
-                    // The Procedure Call Standard for ARM defaults to 8-byte alignment for __m128
-                    alignment = new LayoutInt(8);
-                }
-                else
-                {
-                    alignment = new LayoutInt(16);
-                }
+                size = 16;
             }
             else if (defType.Name == "Vector256`1"u8)
             {
-                if (defType.Context.Target.Architecture == TargetArchitecture.ARM)
-                {
-                    // No such type exists for the Procedure Call Standard for ARM. We will default
-                    // to the same alignment as __m128, which is supported by the ABI.
-                    alignment = new LayoutInt(8);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.ARM64)
-                {
-                    // The Procedure Call Standard for ARM 64-bit (with SVE support) defaults to
-                    // 16-byte alignment for __m256.
-                    alignment = new LayoutInt(16);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.LoongArch64)
-                {
-                    // TODO-LoongArch64: Update alignment to proper value when implement LoongArch64 intrinsic.
-                    alignment = new LayoutInt(16);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.RiscV64)
-                {
-                    // TODO-RISCV64: Update alignment to proper value when we implement RISC-V intrinsic.
-                    // RISC-V Vector Extenstion Intrinsic Document
-                    // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/vector_type_infos.adoc
-                    alignment = new LayoutInt(16);
-                }
-                else
-                {
-                    alignment = new LayoutInt(32);
-                }
+                size = 32;
             }
             else
             {
                 Debug.Assert(defType.Name == "Vector512`1"u8);
-
-                if (defType.Context.Target.Architecture == TargetArchitecture.ARM)
-                {
-                    // No such type exists for the Procedure Call Standard for ARM. We will default
-                    // to the same alignment as __m128, which is supported by the ABI.
-                    alignment = new LayoutInt(8);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.ARM64)
-                {
-                    // The Procedure Call Standard for ARM 64-bit (with SVE support) defaults to
-                    // 16-byte alignment for __m256.
-                    alignment = new LayoutInt(16);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.LoongArch64)
-                {
-                    // TODO-LoongArch64: Update alignment to proper value when implement LoongArch64 intrinsic.
-                    alignment = new LayoutInt(16);
-                }
-                else if (defType.Context.Target.Architecture == TargetArchitecture.RiscV64)
-                {
-                    // TODO-RISCV64: Update alignment to proper value when we implement RISC-V intrinsic.
-                    // RISC-V Vector Extenstion Intrinsic Document
-                    // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/vector_type_infos.adoc
-                    alignment = new LayoutInt(16);
-                }
-                else
-                {
-                    alignment = new LayoutInt(64);
-                }
+                size = 64;
             }
+
+            LayoutInt alignment = new LayoutInt(GetVectorAlignment(size, defType.Context.Target.Architecture));
 
             ComputedInstanceFieldLayout layoutFromMetadata = _fallbackAlgorithm.ComputeInstanceLayout(defType, layoutKind);
 
@@ -119,6 +58,26 @@ namespace ILCompiler
                 Offsets = layoutFromMetadata.Offsets,
                 LayoutAbiStable = true
             };
+        }
+
+        /// <summary>
+        /// The alignment of a SIMD vector is its size, capped by the maximum vector alignment the
+        /// target ABI supports. This single rule reproduces the historical per-type/per-architecture
+        /// values and mirrors the runtime's GetSimdVectorAlignment in methodtablebuilder.cpp.
+        /// </summary>
+        internal static int GetVectorAlignment(int size, TargetArchitecture architecture)
+        {
+            int cap = architecture switch
+            {
+                TargetArchitecture.ARM => 8,          // PCS aligns __m128 at 8; defines no larger vector
+                TargetArchitecture.ARM64 => 16,       // PCS (with SVE): 16-byte aligned
+                TargetArchitecture.LoongArch64 => 16, // TODO: revisit when LoongArch64 intrinsics land
+                TargetArchitecture.RiscV64 => 16,     // TODO: revisit when RISC-V intrinsics land
+                TargetArchitecture.Wasm32 => 16,      // single 16-byte v128
+                _ => 64,                              // x86 / x64: alignment == size
+            };
+
+            return Math.Min(size, cap);
         }
 
         public override ComputedStaticFieldLayout ComputeStaticFieldLayout(DefType defType, StaticLayoutKind layoutKind)

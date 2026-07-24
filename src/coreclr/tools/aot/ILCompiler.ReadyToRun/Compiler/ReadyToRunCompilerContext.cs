@@ -294,8 +294,11 @@ namespace ILCompiler
                 ComputedInstanceFieldLayout layoutFromMetadata = _fallbackAlgorithm.ComputeInstanceLayout(type, layoutKind);
                 ComputedInstanceFieldLayout layoutFromSimilarIntrinsicVector = _vectorFallbackAlgorithm.ComputeInstanceLayout(similarSpecifiedVector, layoutKind);
 
-                // TODO, enable this code when we switch Vector<T> to follow the same calling convention as its matching similar intrinsic vector
-#if MATCHING_HARDWARE_VECTOR
+                // Vector<T> follows the same calling convention as its matching similar intrinsic
+                // vector, so it takes that type's (size-capped) alignment on every target. This
+                // generalizes the wasm-only special case added by #131328 and supersedes the former
+                // MATCHING_HARDWARE_VECTOR gate. Enabling it on non-wasm targets is an ABI/layout
+                // change that requires an R2R version bump -- prototype only.
                 return new ComputedInstanceFieldLayout
                 {
                     ByteCountUnaligned = layoutFromSimilarIntrinsicVector.ByteCountUnaligned,
@@ -306,21 +309,6 @@ namespace ILCompiler
                     LayoutAbiStable = true,
                     IsVectorTOrHasVectorTFields = true,
                 };
-#else
-                return new ComputedInstanceFieldLayout
-                {
-                    ByteCountUnaligned = layoutFromSimilarIntrinsicVector.ByteCountUnaligned,
-                    ByteCountAlignment = layoutFromMetadata.ByteCountAlignment,
-                    // On wasm Vector<T> is passed as a v128 and must share its 16-byte alignment.
-                    FieldAlignment = type.Context.Target.Architecture == TargetArchitecture.Wasm32
-                        ? layoutFromSimilarIntrinsicVector.FieldAlignment
-                        : layoutFromMetadata.FieldAlignment,
-                    FieldSize = layoutFromSimilarIntrinsicVector.FieldSize,
-                    Offsets = layoutFromMetadata.Offsets,
-                    LayoutAbiStable = true,
-                    IsVectorTOrHasVectorTFields = true,
-                };
-#endif
             }
         }
 

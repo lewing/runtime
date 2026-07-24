@@ -53,7 +53,10 @@ namespace ILCompiler
             {
                 ByteCountUnaligned = instanceFieldSize,
                 ByteCountAlignment = layoutFromMetadata.ByteCountAlignment,
-                FieldAlignment = layoutFromMetadata.FieldAlignment,
+                // Vector<T> is passed like the matching fixed-size intrinsic vector, so its alignment
+                // tracks its size the same way (capped by what the target ABI supports) rather than the
+                // 8-byte alignment its two-UInt64 metadata layout would otherwise yield.
+                FieldAlignment = new LayoutInt(VectorFieldLayoutAlgorithm.GetVectorAlignment(instanceFieldSize.AsInt, targetDetails.Architecture)),
                 FieldSize = instanceFieldSize,
                 Offsets = layoutFromMetadata.Offsets,
                 IsVectorTOrHasVectorTFields = true,
