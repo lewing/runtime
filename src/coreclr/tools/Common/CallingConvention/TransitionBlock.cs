@@ -54,6 +54,13 @@ namespace Internal.CallingConvention
 
         public const int MaxArgSize = 0xFFFFFF;
 
+        // The interpreter stack ABI, mirrored from INTERP_STACK_SLOT_SIZE and INTERP_STACK_ALIGNMENT
+        // in src/coreclr/interpreter/inc/interpretershared.h. crossgen2 computes R2R argument offsets
+        // with these values and the runtime interpreter must agree exactly; if they drift, arguments
+        // are placed at different offsets on each side and silently corrupt each other.
+        public const int InterpStackSlotSize = 8;
+        public const int InterpStackAlignment = 16;
+
         // Unix AMD64 ABI: Special offset value to represent  struct passed in registers. Such a struct can span both
         // general purpose and floating point registers, so it can have two different offsets.
         public const int StructInRegsOffset = -2;
@@ -743,8 +750,7 @@ namespace Internal.CallingConvention
 
             public override int StackElemSize(int parmSize, bool isValueType, bool isFloatHfa)
             {
-                int stackSlotSize = 8;
-                return ALIGN_UP(parmSize, stackSlotSize);
+                return ALIGN_UP(parmSize, InterpStackSlotSize);
             }
         }
     }

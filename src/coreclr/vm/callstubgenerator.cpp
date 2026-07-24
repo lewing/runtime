@@ -2224,7 +2224,10 @@ void CallStubGenerator::ComputeCallStubWorker(bool hasUnmanagedCallConv, CorInfo
         if ((corType == ELEMENT_TYPE_VALUETYPE) && thArgTypeHandle.GetSize() > INTERP_STACK_SLOT_SIZE)
         {
             unsigned align = std::clamp(CEEInfo::getClassAlignmentRequirementStatic(thArgTypeHandle), INTERP_STACK_SLOT_SIZE, INTERP_STACK_ALIGNMENT);
-            assert(align == 8 || align == 16); // At the moment, we can only have an 8 or 16 byte alignment requirement here
+            // std::clamp already bounds this to [INTERP_STACK_SLOT_SIZE, INTERP_STACK_ALIGNMENT];
+            // alignments beyond the interpreter stack alignment are intentionally dropped. Assert the
+            // result is a power of two so the ALIGN_UP calls below are well defined.
+            assert((align & (align - 1)) == 0);
             if (interpreterStackOffset != ALIGN_UP(interpreterStackOffset, align))
             {
                 TerminateCurrentRoutineIfNotOfNewType(RoutineType::None, pRoutines);

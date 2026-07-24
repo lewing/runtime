@@ -14,8 +14,29 @@
 #define INTERP_API __attribute__ ((visibility ("default")))
 #endif // _MSC_VER
 
+// The interpreter stack ABI. Argument and local offsets on the interpreter stack are computed from
+// these two values, and they are part of the contract between the interpreter, the callstub
+// generator, and crossgen2's R2R ArgIterator. Every consumer must agree exactly: if one side lays
+// out a v128 (or any over-aligned value type) at a different offset than another, arguments silently
+// desync and later arguments are corrupted.
+//
+// The managed mirrors of these live in TransitionBlock.InterpStackSlotSize /
+// TransitionBlock.InterpStackAlignment (src/coreclr/tools/Common/CallingConvention/TransitionBlock.cs)
+// and must be updated together with these.
+//
+// Note that alignment requirements larger than INTERP_STACK_ALIGNMENT are deliberately not honored:
+// value types are aligned within their own layout, but are clamped to INTERP_STACK_ALIGNMENT on the
+// interpreter stack. That is safe because the interpreter copies value types with memcpy and never
+// issues alignment-sensitive SIMD accesses against interpreter stack slots.
 #define INTERP_STACK_SLOT_SIZE 8u    // Alignment of each var offset on the interpreter stack
 #define INTERP_STACK_ALIGNMENT 16u   // Alignment of interpreter stack at the start of a frame
+
+static_assert(INTERP_STACK_ALIGNMENT >= INTERP_STACK_SLOT_SIZE,
+    "The interpreter stack alignment must be at least as large as a single stack slot.");
+static_assert((INTERP_STACK_SLOT_SIZE & (INTERP_STACK_SLOT_SIZE - 1)) == 0,
+    "INTERP_STACK_SLOT_SIZE must be a power of two; offsets are computed with ALIGN_UP.");
+static_assert((INTERP_STACK_ALIGNMENT & (INTERP_STACK_ALIGNMENT - 1)) == 0,
+    "INTERP_STACK_ALIGNMENT must be a power of two; offsets are computed with ALIGN_UP.");
 
 struct InterpHelperData {
     uint32_t addressDataItemIndex : 29;

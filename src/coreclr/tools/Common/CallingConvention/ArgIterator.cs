@@ -925,15 +925,18 @@ namespace Internal.CallingConvention
                 case TargetArchitecture.Wasm32:
                     {
                         bool isValueType = (argType == CorElementType.ELEMENT_TYPE_VALUETYPE);
-                        int cbArg = ALIGN_UP(argSize, 8);
+                        int cbArg = ALIGN_UP(argSize, TransitionBlock.InterpStackSlotSize);
                         int align;
                         if (isValueType)
                         {
-                            align = Math.Clamp(_argTypeHandle.GetFieldAlignment(), 8, 16);
+                            // Must match the clamp the runtime applies in ArgIteratorTemplate::GetNextOffset
+                            // (callingconvention.h) and CallStubGenerator (callstubgenerator.cpp). Alignment
+                            // beyond the interpreter stack alignment is deliberately not honored.
+                            align = Math.Clamp(_argTypeHandle.GetFieldAlignment(), TransitionBlock.InterpStackSlotSize, TransitionBlock.InterpStackAlignment);
                         }
                         else
                         {
-                            align = 8;
+                            align = TransitionBlock.InterpStackSlotSize;
                         }
 
                         _wasmOfsStack = ALIGN_UP(_wasmOfsStack, align);
