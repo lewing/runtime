@@ -10591,16 +10591,22 @@ void MethodTableBuilder::InterfaceAmbiguityCheck(bmtInterfaceAmbiguityCheckInfo 
 //*******************************************************************************
 // The alignment of a SIMD vector is its size, capped by the maximum vector alignment the target
 // ABI supports. This single rule reproduces the historical per-type/per-architecture values for
-// Vector64/128/256/512<T> and extends naturally to System.Numerics.Vector<T> at its ISA-determined
-// size:
-//   * x86/amd64: cap 64 -> alignment == size (__m64 / __m128 / __m256 / __m512)
-//   * arm64 / loongarch64 / riscv64 / wasm: cap 16
+// Vector64/128/256/512<T> on every target, and extends naturally to System.Numerics.Vector<T> at
+// its ISA-determined size:
 //   * arm: cap 8 (the PCS aligns __m128 at 8 and defines no larger vector)
+//   * arm64 / loongarch64 / riscv64: cap 16
+//   * everything else, including x86/amd64 and wasm: cap 64, so alignment == size
+//     (__m64 / __m128 / __m256 / __m512)
+//
+// Note that wasm intentionally uses the default cap rather than 16. Only v128 exists in the wasm
+// ABI, but Vector256<T>/Vector512<T> have always been 32/64-byte aligned there and narrowing that
+// would be a separate layout change. Vector<T> lowers to a v128 on wasm, so it is 16-byte aligned
+// under either cap.
 static unsigned GetSimdVectorAlignment(unsigned size)
 {
 #if defined(TARGET_ARM)
     const unsigned cap = 8;
-#elif defined(TARGET_ARM64) || defined(TARGET_LOONGARCH64) || defined(TARGET_RISCV64) || defined(TARGET_WASM)
+#elif defined(TARGET_ARM64) || defined(TARGET_LOONGARCH64) || defined(TARGET_RISCV64)
     const unsigned cap = 16;
 #else
     const unsigned cap = 64;

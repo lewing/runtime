@@ -42,11 +42,12 @@ namespace VectorTAlignmentTests
             {
                 // The Procedure Call Standard for ARM aligns __m128 at 8 and defines no larger vector.
                 Architecture.Arm => 8,
+                Architecture.Armv6 => 8,
                 Architecture.Arm64 => 16,
-                Architecture.Wasm => 16,
                 Architecture.LoongArch64 => 16,
                 Architecture.RiscV64 => 16,
-                // x86/x64 align each vector to its own size, up to __m512.
+                // x86/x64 align each vector to its own size, up to __m512. Wasm uses the same cap:
+                // Vector<T> is a v128 there, so it lands at 16 regardless.
                 _ => 64,
             };
 

@@ -46,6 +46,12 @@ namespace ILCompiler
             else
             {
                 Debug.Assert(targetDetails.MaximumSimdVectorLength == SimdVectorLength.None);
+
+                // Vector<T> keeps its metadata size here, but its alignment still follows the same
+                // capped rule the runtime applies, so the two engines agree on targets that report
+                // no SIMD vector length (for example LoongArch64 and RiscV64).
+                layoutFromMetadata.FieldAlignment = new LayoutInt(
+                    VectorFieldLayoutAlgorithm.GetVectorAlignment(layoutFromMetadata.FieldSize.AsInt, targetDetails.Architecture));
                 return layoutFromMetadata;
             }
 

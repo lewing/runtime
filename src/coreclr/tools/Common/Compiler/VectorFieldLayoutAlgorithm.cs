@@ -63,8 +63,15 @@ namespace ILCompiler
         /// <summary>
         /// The alignment of a SIMD vector is its size, capped by the maximum vector alignment the
         /// target ABI supports. This single rule reproduces the historical per-type/per-architecture
-        /// values and mirrors the runtime's GetSimdVectorAlignment in methodtablebuilder.cpp.
+        /// values on every target and mirrors the runtime's GetSimdVectorAlignment in
+        /// methodtablebuilder.cpp.
         /// </summary>
+        /// <remarks>
+        /// Wasm intentionally uses the default cap rather than 16. Only v128 exists in the wasm ABI,
+        /// but Vector256&lt;T&gt;/Vector512&lt;T&gt; have always been 32/64-byte aligned there and
+        /// narrowing that would be a separate layout change. Vector&lt;T&gt; lowers to a v128 on wasm,
+        /// so it is 16-byte aligned under either cap.
+        /// </remarks>
         internal static int GetVectorAlignment(int size, TargetArchitecture architecture)
         {
             int cap = architecture switch
@@ -73,8 +80,7 @@ namespace ILCompiler
                 TargetArchitecture.ARM64 => 16,       // PCS (with SVE): 16-byte aligned
                 TargetArchitecture.LoongArch64 => 16, // TODO: revisit when LoongArch64 intrinsics land
                 TargetArchitecture.RiscV64 => 16,     // TODO: revisit when RISC-V intrinsics land
-                TargetArchitecture.Wasm32 => 16,      // single 16-byte v128
-                _ => 64,                              // x86 / x64: alignment == size
+                _ => 64,                              // x86 / x64 / wasm: alignment == size
             };
 
             return Math.Min(size, cap);
