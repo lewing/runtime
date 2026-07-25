@@ -39,8 +39,8 @@ void CodeGen::genHWIntrinsic(GenTreeHWIntrinsic* node)
             {
                 if (info.id == NI_PackedSimd_Shuffle)
                 {
-                    simd16_t shuffleMask = info.GetImmediateVecOperand();
-                    GetEmitter()->emitIns_V128Imm(ins, shuffleMask.u8);
+                    assert(node->Op(3)->isContained());
+                    GetEmitter()->emitIns_V128Imm(ins, node->Op(3)->AsVecCon()->gtSimdVal.u8);
                 }
                 else if ((info.id == NI_PackedSimd_Swizzle) && node->Op(2)->isContained())
                 {
@@ -52,7 +52,7 @@ void CodeGen::genHWIntrinsic(GenTreeHWIntrinsic* node)
                     GenTree*  src    = node->Op(1);
                     regNumber srcReg = GetMultiUseOperandReg(src);
                     GetEmitter()->emitIns_I(INS_local_get, emitActualTypeSize(src), WasmRegToIndex(srcReg));
-                    GetEmitter()->emitIns_V128Imm(INS_i8x16_shuffle, info.GetImmediateVecOperand().u8);
+                    GetEmitter()->emitIns_V128Imm(INS_i8x16_shuffle, node->Op(2)->AsVecCon()->gtSimdVal.u8);
                 }
                 else
                 {
