@@ -182,6 +182,21 @@ cd src/tests
 
 **Test:** `./build.sh libs.tests -test -os browser`
 
+### CoreCLR ReadyToRun on wasm (WASI / browser)
+
+**Baseline sentinel:** `artifacts/bin/coreclr/wasi.wasm.<config>/corerun` and
+`artifacts/bin/coreclr/wasi.wasm.<config>/<host-arch>/crossgen2/crossgen2`.
+
+**Build:** `./build.sh clr+host -os wasi -c Release` then `./build.sh libs+packs -os wasi -c Release`
+(the Mono `sfxproj` packs failure is expected on a CoreCLR-only WASI build).
+
+**CoreCLR R2R on WASI works.** It is driven by hand — there is no `PublishReadyToRun` or
+WasmAppBuilder path for wasm R2R — so a failing build or run is far more likely to be a stale
+artifact, a deployment gap, or a misread diagnostic than a platform limitation. Read
+[`/docs/workflow/building/coreclr/wasi-r2r.md`](/docs/workflow/building/coreclr/wasi-r2r.md) before
+starting or triaging wasm R2R work; supporting tooling is in
+[`/eng/wasi-r2r/`](/eng/wasi-r2r/README.md).
+
 ### Host
 
 **Baseline sentinel:** `artifacts/bin/coreclr/<OS>.<arch>.<config>/` and `artifacts/bin/testhost/` (host build/tests need both clr and libs in place).
@@ -282,4 +297,5 @@ Do not mark a regression test task as complete until both conditions are confirm
 - [Build CoreCLR](/docs/workflow/building/coreclr/README.md) · [Test CoreCLR](/docs/workflow/testing/coreclr/testing.md)
 - [Build Mono](/docs/workflow/building/mono/README.md) · [Test Mono](/docs/workflow/testing/mono/testing.md)
 - [WASM Build](/docs/workflow/building/libraries/webassembly-instructions.md) · [WASM Test](/docs/workflow/testing/libraries/testing-wasm.md)
+- [CoreCLR R2R on WASI](/docs/workflow/building/coreclr/wasi-r2r.md) · [WASI R2R tooling](/eng/wasi-r2r/README.md)
 - [Host Tests](/docs/workflow/testing/host/testing.md)

@@ -1,0 +1,22 @@
+<Project>
+  <!--
+    Both splice tools reference Nesm.dll, a wasm binary reader/writer that lives outside this repo
+    (https://github.com/Blazor-Playground/nesm). Point at it with either:
+
+      export NESM_ASSEMBLY=/path/to/nesm/src/Nesm/bin/Release/net10.0/Nesm.dll
+      dotnet run -c Release -p:NesmAssemblyPath=/path/to/Nesm.dll
+  -->
+  <PropertyGroup>
+    <NesmAssemblyPath Condition="'$(NesmAssemblyPath)' == ''">$(NESM_ASSEMBLY)</NesmAssemblyPath>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(NesmAssemblyPath)' != ''">
+    <Reference Include="Nesm">
+      <HintPath>$(NesmAssemblyPath)</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="EnsureNesmAssemblyPath" BeforeTargets="ResolveAssemblyReferences" Condition="'$(NesmAssemblyPath)' == ''">
+    <Error Text="Nesm.dll not located. Set the NESM_ASSEMBLY environment variable (or pass -p:NesmAssemblyPath=...) to a built Nesm.dll. See eng/wasi-r2r/README.md." />
+  </Target>
+</Project>

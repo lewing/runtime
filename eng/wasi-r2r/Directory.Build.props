@@ -1,0 +1,7 @@
+<Project>
+  <!--
+    Intentionally empty. The helper tools under eng/wasi-r2r are standalone utilities that are
+    built directly with `dotnet run`; they must not inherit the runtime repo's build
+    infrastructure from the root Directory.Build.props.
+  -->
+</Project>
