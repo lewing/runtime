@@ -316,7 +316,9 @@ hardcoded `true` only for `UNIX_AMD64_ABI`, `TARGET_ARM`, and `TARGET_X86`. The 
 assumes promoted parameter field offsets are assigned by `lvaAssignVirtualFrameOffsetToArg()`, which
 is not true on wasm — parameters arrive as wasm locals and are homed by the prolog. The only other
 propagation site requires `lvIsRegArg` and is gated to ARM/LoongArch/RISC-V, so it cannot cover wasm
-either. Adding `TARGET_WASM` to that gate fixes it.
+either. Adding `TARGET_WASM` to that gate fixes it — see
+[dotnet/runtime#131401](https://github.com/dotnet/runtime/pull/131401), which also carries the full
+evidence trail and a note on testing.
 
 Two lessons worth carrying:
 
@@ -388,7 +390,8 @@ entirely free from triaging the 39 that remained after a fix that took DateTime 
 0. Grouping the residue by type or by assertion shape usually separates "distinct codegen bug",
 "pre-existing, fails under the interpreter too", and "legitimate test expectation" in a few minutes.
 
-A worked reference point — `System.Text.Json.Tests` on browser R2R, after the frame-offset fix:
+A worked reference point — `System.Text.Json.Tests` on browser R2R, before and after
+[dotnet/runtime#131401](https://github.com/dotnet/runtime/pull/131401):
 
 | Run | Result |
 | --- | --- |
