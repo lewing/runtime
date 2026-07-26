@@ -299,6 +299,10 @@ runtime one:
 crossgen2 --parallelism:1 --codegenopt JitDump=Format ...
 ```
 
+`--parallelism:1` is not optional: without it the dump is interleaved across compilation threads and
+unreadable. Note also that `--codegenopt JitDump=` is a **crossgen2-time** flag — these dumps come
+from compilation, not from the run.
+
 The tell is in `lvaAssignFrameOffsets`' **Assign list**. The promoted field of the `DateTime`
 parameter (`V153 ... "field V01._dateData"`, marked `addr-exposed` and `P-DEP` because `Format`
 passes the parameter by `ref`) never appeared in that list, so it kept stack offset 0 — which, after
@@ -323,6 +327,19 @@ Two lessons worth carrying:
 
 Only the address-exposed promoted parameter is affected, so this presents as a single argument being
 wrong while every other argument homes correctly — not as a positional shift.
+
+**Writing a regression test for this is harder than it looks — the naive repro does not reproduce.**
+A minimal case like `static long Test(Wrap w) { Touch(ref w); return Consume(w, 1, 2); }` (where
+`Touch` takes `ref` and so address-exposes the parameter) produces all the right *local shape* —
+`V01 arg0 addr-exposed`, a `P-DEP addr-exposed` field local, even the telltale `-- V04 was 0, now 16`
+in the fix pass — yet emits `i64.load 0 8` against the **parent** struct local, so the bad field
+offset is never used. Fixed and unfixed crossgen2 output for that repro are byte-identical.
+
+The wrong offset is only *observable* when codegen actually references the field local (`V153`)
+rather than the parent (`V01`). Having a `P-DEP` address-exposed promoted parameter field is
+necessary but **not sufficient**. Do not conclude "not reproducible, must already be fixed" from a
+minimal test — verify your test actually emits a load of the field local, and confirm it fails before
+the fix and passes after.
 
 
 ## Known-broken
