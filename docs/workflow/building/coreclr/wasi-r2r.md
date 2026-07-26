@@ -365,8 +365,37 @@ whose output happens to be correct.
 
 ## Known-broken
 
+- **`Int128`/`UInt128` comparison or equality is miscompiled under wasm R2R.** Smoking gun:
+  `RoundtripValues<Int128>(-1)` fails with `Expected: -1  Actual: -1` — the values render identically
+  but compare unequal, which points at the halves being compared wrongly. The same root appears in
+  `PrimitiveTypes_EqualThemselves<Int128>`, the `GetConverter_*128_*` and `Number_As*_RoundTrip`
+  clusters, and in `TestEscapedValuesOnDeserialize` (whose dictionary keys are `UInt128.MaxValue`).
+  Accounts for 25 of the 39 residual `System.Text.Json` failures. Not yet root-caused.
 - Browser only: `Enum.ToObject`'s virtual dispatch to `GetTypeCodeImpl()` traps on a `call_indirect`
   return-type mismatch (expected `void`, actual `i32`). WASI dispatches the identical call cleanly on
   the same codegen; the suspected cause is emscripten-side R2R/interpreter thunk resolution.
 - `src/tasks/WasmAppBuilder/coreclr/SignatureMapper.cs` has no `'V'` (v128) case in
   `TokenToSlotCount`, which should be 2 slots. Latent, in the same v128-thunk family.
+
+## Validating a fix at suite level
+
+Always compare against the **interpreter (R2R off) baseline** for the same suite, not against zero.
+That is what separates "my fix regressed something" from "this was already failing".
+
+Then **characterise the residual failures instead of declaring victory** once the failures you were
+chasing hit zero. The leftovers are the cheapest source of the next bug: the `Int128` lead above came
+entirely free from triaging the 39 that remained after a fix that took DateTime failures from 187 to
+0. Grouping the residue by type or by assertion shape usually separates "distinct codegen bug",
+"pre-existing, fails under the interpreter too", and "legitimate test expectation" in a few minutes.
+
+A worked reference point — `System.Text.Json.Tests` on browser R2R, after the frame-offset fix:
+
+| Run | Result |
+| --- | --- |
+| R2R on, before the fix | 216 failures, hard `abort()` partway, no result XML — never completed |
+| R2R on, after the fix | 59,365 run / 59,284 passed / 39 failed / 42 skipped, 0 aborts |
+| Interpreter baseline | 59,312 passed / 11 failed |
+
+Note that the headline there is not "fewer failures" but "the suite completes at all" — a run that
+aborts without producing result XML is easy to mistake for a run that merely failed.
+
