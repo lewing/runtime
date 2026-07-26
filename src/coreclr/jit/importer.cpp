@@ -10700,7 +10700,20 @@ void Compiler::impImportBlockCode(BasicBlock* block)
                     { // compDonotInline()
                         return;
                     }
-                    op1 = gtNewHelperCallNode(helper, TYP_VOID, op2, op1);
+                    // On wasm the unbox helper is dispatched through a portable entry point whose
+                    // compiled function returns a byref; the call_indirect signature emitted at the call
+                    // site must match the callee's return arity exactly (see #130813 for the analogous
+                    // class-init helpers). Model the helper as value-returning here even though its result
+                    // is unused (the byref is formed from clone + TARGET_POINTER_SIZE below), and discard
+                    // the value via a COMMA so the enclosing COLON/QMARK remain void.
+                    var_types unboxHelperRetType = TYP_VOID;
+#ifdef TARGET_WASM
+                    unboxHelperRetType = TYP_BYREF;
+#endif // TARGET_WASM
+                    op1 = gtNewHelperCallNode(helper, unboxHelperRetType, op2, op1);
+#ifdef TARGET_WASM
+                    op1 = gtNewOperNode(GT_COMMA, TYP_VOID, op1, gtNewNothingNode());
+#endif // TARGET_WASM
 
                     op1 = new (this, GT_COLON) GenTreeColon(TYP_VOID, gtNewNothingNode(), op1);
                     op1 = gtNewQmarkNode(TYP_VOID, condBox, op1->AsColon());
