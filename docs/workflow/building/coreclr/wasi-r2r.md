@@ -141,6 +141,33 @@ cp "$CORELIB" "$DEST/"   # CoreCLR's CoreLib must win over the pack's Mono one
 See [`eng/wasi-r2r/README.md`](../../../../eng/wasi-r2r/README.md) for how
 `corerun-composite-sym.wasm` is produced, and for whether the splice step is still required at all.
 
+### How the WASI host finds R2R images
+
+Unlike the browser host, the WASI host serves R2R images through a
+`host_runtime_contract::external_assembly_probe` callback
+([`src/coreclr/hosts/corerun/wasi_r2r_probe.hpp`](../../../../src/coreclr/hosts/corerun/wasi_r2r_probe.hpp),
+shared by the standalone `corerun` and the per-app `wasihost`). Four things must line up, and if any
+one is wrong every assembly reports `Ready to Run header not found` — which reads exactly like "R2R
+is unsupported here":
+
+1. **`APP_ASSEMBLIES=EXTERNAL` is mandatory.** The probe is auto-enabled only for `TARGET_BROWSER`;
+   on WASI it is installed *only* when this variable is set. Without it the host uses a TPA list, the
+   probe never runs, and no R2R image is ever consulted.
+2. **The composite is served from a baked buffer, never from disk.** The probe answers the composite
+   request out of `g_wasi_r2r_image`, a buffer inside the host module that the splice step fills via
+   an active data segment aimed at the exported `wasi_r2r_image_base`. A stock
+   `artifacts/bin/coreclr/wasi.wasm.Release/corerun` has an empty buffer, so it can *never* load a
+   composite no matter how the files are laid out. You must run the spliced host.
+3. **The composite must be named `composite-r2r.wasm`.** That literal is `WASI_R2R_COMPOSITE_NAME`,
+   and it is the `ownerCompositeExecutable` each per-assembly stub names. Emit it under exactly that
+   name from `crossgen2`.
+4. **Per-assembly stubs live in a `comp/` subdirectory**, as `<CORE_ROOT>/comp/<AssemblyName>.wasm`
+   — *not* flat beside the `.dll` the way the browser host wants them. The probe searches
+   `CORE_LIBS` then `CORE_ROOT`.
+
+Prefer setting `CORE_ROOT` over passing `-c`: it avoids WASI argument-plumbing quirks, and it must
+match the guest side of the `--dir` mapping either way.
+
 ```bash
 cd "$DEST"
 wasmtime run \
@@ -196,21 +223,27 @@ A live debugger tracepoint on an R2R'd method is the other reliable test.
 These are the failure modes that have repeatedly produced the false conclusion that CoreCLR R2R on
 WASI is broken.
 
-**1. `DOTNET_ReadyToRun=0` and `=1` producing identical output does not mean R2R is inactive.**
+**1. `Ready to Run header not found` for every assembly means the probe never ran or found nothing.**
+It does **not** mean R2R is unsupported on WASI. Work through the four requirements in
+[How the WASI host finds R2R images](#how-the-wasi-host-finds-r2r-images): `APP_ASSEMBLIES=EXTERNAL`
+set, a spliced host (a stock `corerun` has an empty composite buffer), the composite named
+`composite-r2r.wasm`, and the per-assembly stubs under `comp/`.
+
+**2. `DOTNET_ReadyToRun=0` and `=1` producing identical output does not mean R2R is inactive.**
 When the composite is baked into `corerun*.wasm` rather than loaded externally, the environment
 variable is a **no-op** — it only gates external R2R image loading, and R2R is unconditionally
 active in that binary. Identical output is the *expected* result. Use `DOTNET_ReadyToRunLogFile` or
 a debugger tracepoint instead. A prior investigation reached and later had to reverse exactly this
 conclusion.
 
-**2. A missing framework assembly manifests as an infinite loop, not an error.**
+**3. A missing framework assembly manifests as an infinite loop, not an error.**
 The run directory needs the full framework IL closure; `Console.WriteLine` transitively pulls in
 `System.Threading` and more. With R2R off you get a clean `FileNotFoundException`; with R2R on the
 same missing assembly hangs in the binder/EH path. **Always gate a suspected trap or hang with a
 `DOTNET_ReadyToRun=0` run first** — a clean `FileNotFoundException` means a deployment gap, not a
 codegen bug.
 
-**3. Stale or mixed-vintage artifacts.**
+**4. Stale or mixed-vintage artifacts.**
 Mixing an old CoreLib IL or JIT with a freshly built crossgen2 (or the reverse) has produced
 phantom `NullReferenceException`s and phantom "config X is broken" results more than once. Before
 trusting any negative result, check timestamps on `IL/System.Private.CoreLib.dll`, the `crossgen2`
@@ -218,19 +251,19 @@ binary, and the JIT, and confirm with one clean rebuild of the exact configurati
 handed a prebuilt `.wasm` rig, verify its provenance (`stat`, `sha256sum`) before believing anything
 it tells you.
 
-**4. `./build.sh clr.jit` does not refresh the JIT that crossgen2 loads.**
+**5. `./build.sh clr.jit` does not refresh the JIT that crossgen2 loads.**
 `crossgen2`'s directory holds its own *copy* of the wasm-targeting JIT
 (`libclrjit_universal_wasm_<arch>.dylib`). A `clr.jit` build updates the copy under `artifacts/obj`
 but not the one next to `crossgen2`, so JIT fixes are silently ignored. Either copy it over
 manually or use `./build.sh clr.aot`.
 
-**5. A bare `./build.sh clr -os wasi` link failure is a build-configuration gap, not a platform gap.**
+**6. A bare `./build.sh clr -os wasi` link failure is a build-configuration gap, not a platform gap.**
 Undefined symbols such as `PAL_ProbeMemory`, `shm_open`, or `shm_unlink` from `debughelp.cpp` and
 `doublemapping.cpp` come from missing WASI PAL stubs
 (`src/coreclr/pal/src/include/pal/wasi/pal_wasi_missing.h`), not from a fundamental limitation.
 Build `clr+host`, which is the recipe recorded as working end to end.
 
-**6. The branch must track upstream R2R/async thunk fixes.**
+**7. The branch must track upstream R2R/async thunk fixes.**
 Dropping [#131167](https://github.com/dotnet/runtime/pull/131167)-family fixes regresses a fixed
 async/R2R thunk-signature bug and reintroduces `call_indirect` signature-mismatch traps. After any
 rebase, do one full rebuild before re-testing.
