@@ -1898,8 +1898,10 @@ PhaseStatus Compiler::fgWasmSpillRefs()
             if (tree->IsCall())
             {
                 // A ref sourced from a non-address-exposed local already has a linear-stack home, so
-                //  rather than spilling it to a second slot we pin the home. The GC then can't move the
-                //  referent, and the copy on the operand stack stays valid across the call.
+                //  rather than spilling it to a second slot we report that home as pinned. The GC then
+                //  can't move the referent, and the copy on the operand stack stays valid across the
+                //  call. This is only safe because the local can't be stored to between its def and its
+                //  use, so the home still holds the object the operand stack refers to.
                 //
                 // A value this call consumes directly needs neither: there is no safepoint between
                 //  loading it and the call, and the local's home keeps the referent reachable meanwhile.
@@ -1920,8 +1922,8 @@ PhaseStatus Compiler::fgWasmSpillRefs()
 
                     if (!fgWasmIsOperandOf(tree, def))
                     {
-                        JITDUMP("Pinning V%02u held across call\n", def->AsLclVarCommon()->GetLclNum());
-                        dsc->lvPinned = true;
+                        JITDUMP("Reporting V%02u pinned, held across call\n", def->AsLclVarCommon()->GetLclNum());
+                        dsc->lvWasmReportPinned = true;
                     }
 
                     // Swapping with the last element is safe because we walk backwards, so whatever

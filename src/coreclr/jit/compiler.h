@@ -537,6 +537,13 @@ public:
 #endif
     unsigned char lvPinned : 1; // is this a pinned variable?
 
+#ifdef TARGET_WASM
+    unsigned char lvWasmReportPinned : 1; // report this local's frame home as pinned to the GC, because a copy of
+                                          // it is held on the wasm operand stack across a safepoint. Unlike
+                                          // lvPinned this says nothing about the local itself, so it is safe to
+                                          // set after liveness and is consulted only when encoding GC info.
+#endif
+
     unsigned char lvMustInit : 1; // must be initialized
 
 private:
