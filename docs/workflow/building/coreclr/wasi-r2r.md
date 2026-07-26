@@ -381,24 +381,28 @@ whose output happens to be correct.
 
 ## Validating a fix at suite level
 
-Always compare against the **interpreter (R2R off) baseline** for the same suite, not against zero.
-That is what separates "my fix regressed something" from "this was already failing".
+Always compare against the **interpreter (R2R off) baseline** for the same suite, not against zero,
+and **characterise the residual failures** instead of declaring victory once the failures you were
+chasing hit zero. These are really one technique: the baseline is what turns a residual *count* into
+a *decomposition*. Without it you can report "39 failures" but you cannot say which of them you own —
+and "we went from 216 to 39" invites the obvious question "so what are the 39?", which you then can't
+answer.
 
-Then **characterise the residual failures instead of declaring victory** once the failures you were
-chasing hit zero. The leftovers are the cheapest source of the next bug: the `Int128` lead above came
-entirely free from triaging the 39 that remained after a fix that took DateTime failures from 187 to
-0. Grouping the residue by type or by assertion shape usually separates "distinct codegen bug",
-"pre-existing, fails under the interpreter too", and "legitimate test expectation" in a few minutes.
+With it, the residue splits quickly — grouping by type or by assertion shape usually separates
+"distinct codegen bug", "pre-existing, fails under the interpreter too", and "legitimate test
+expectation" in a few minutes. Here that was 2 pre-existing, 25 one new bug, 12 assorted. The
+leftovers are also the cheapest source of the next bug: the `Int128` lead above came entirely free
+from triaging the 39 that remained after a fix that took DateTime failures from 187 to 0.
 
 A worked reference point — `System.Text.Json.Tests` on browser R2R, before and after
 [dotnet/runtime#131401](https://github.com/dotnet/runtime/pull/131401):
 
 | Run | Result |
 | --- | --- |
-| R2R on, before the fix | 216 failures, hard `abort()` partway, no result XML — never completed |
-| R2R on, after the fix | 59,365 run / 59,284 passed / 39 failed / 42 skipped, 0 aborts |
+| R2R on, before the fix | aborted partway, no result XML — 216 failures, run never completed |
+| R2R on, after the fix | completed — 59,365 run / 59,284 passed / 39 failed / 42 skipped, 0 aborts |
 | Interpreter baseline | 59,312 passed / 11 failed |
 
-Note that the headline there is not "fewer failures" but "the suite completes at all" — a run that
-aborts without producing result XML is easy to mistake for a run that merely failed.
+Report the run *outcome* before the failure count: a run that aborts without producing result XML is
+easy to mistake for a run that merely failed, and the two are categorically different.
 
