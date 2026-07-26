@@ -328,18 +328,39 @@ Two lessons worth carrying:
 Only the address-exposed promoted parameter is affected, so this presents as a single argument being
 wrong while every other argument homes correctly — not as a positional shift.
 
-**Writing a regression test for this is harder than it looks — the naive repro does not reproduce.**
-A minimal case like `static long Test(Wrap w) { Touch(ref w); return Consume(w, 1, 2); }` (where
-`Touch` takes `ref` and so address-exposes the parameter) produces all the right *local shape* —
-`V01 arg0 addr-exposed`, a `P-DEP addr-exposed` field local, even the telltale `-- V04 was 0, now 16`
-in the fix pass — yet emits `i64.load 0 8` against the **parent** struct local, so the bad field
-offset is never used. Fixed and unfixed crossgen2 output for that repro are byte-identical.
+**Writing a regression test for this needs care: the wrong codegen reproduces easily, but the wrong
+*value* does not.**
 
-The wrong offset is only *observable* when codegen actually references the field local (`V153`)
-rather than the parent (`V01`). Having a `P-DEP` address-exposed promoted parameter field is
-necessary but **not sufficient**. Do not conclude "not reproducible, must already be fixed" from a
-minimal test — verify your test actually emits a load of the field local, and confirm it fails before
-the fix and passes after.
+The trigger is **dominance**, not merely address exposure. If the address exposure dominates the use,
+codegen rereads the parent struct local and the bad field offset is never touched — a naive
+`static long Test(Wrap w) { Touch(ref w); return Consume(w, 1, 2); }` produces every correct
+diagnostic signal (`V01 arg0 addr-exposed`, a `P-DEP` field local, even the `-- V04 was 0, now 16`
+line in the fix pass) yet emits byte-identical output before and after the fix. Put the exposure on a
+*non-dominating* path and the main path stays bound to the field local while it is still
+memory-homed, which is what `Format` does via `case 'U': PrepareFormatU(ref dateTime, ...)`:
+
+```csharp
+static long Test(Wrap w, int mode)
+{
+    if (mode == 42) { Rare(ref w); }    // address-exposes on a rare path only
+    long extra = w.Value > 0 ? 1 : 0;   // field use on the main path
+    return Consume(w, (int)extra);
+}
+```
+
+That diverges as expected — `i64.load 0 8` fixed versus `i64.load 0 16` unfixed.
+
+It still will not *fail* observably, though: the wrong slot is the caller's frame base, which usually
+holds the caller's own copy of the same struct, so both arms print the right answer. Poisoning an
+intervening frame with a `stackalloc` does not help. The value only turns to garbage when the caller
+is structurally unrelated — a thunk, in `Format`'s case.
+
+So **assert on the generated code, not on program output**: the emitted load offset, or the fix
+pass's `V## was 0, now <frameSize>` line. SuperPMI asm diffs surface this immediately as a changed
+load offset and are the natural home in this repo. For an end-to-end test, use a real scenario that
+does fail deterministically — `DateTime.ToString` under wasm R2R, as covered by `Utf8JsonWriter`'s
+DateTime tests. And never conclude "not reproducible, must already be fixed" from a minimal test
+whose output happens to be correct.
 
 
 ## Known-broken
