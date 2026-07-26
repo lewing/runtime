@@ -1850,6 +1850,24 @@ PhaseStatus Compiler::fgWasmControlFlow()
     return PhaseStatus::MODIFIED_EVERYTHING;
 }
 
+// Determine whether `operand` is a direct operand of `user`.
+static bool fgWasmIsOperandOf(GenTree* user, GenTree* operand)
+{
+    bool isOperand = false;
+
+    user->VisitOperands([operand, &isOperand](GenTree* op) {
+        if (op != operand)
+        {
+            return GenTree::VisitResult::Continue;
+        }
+
+        isOperand = true;
+        return GenTree::VisitResult::Abort;
+    });
+
+    return isOperand;
+}
+
 PhaseStatus Compiler::fgWasmSpillRefs()
 {
     bool anyChanges = false;
@@ -1882,6 +1900,9 @@ PhaseStatus Compiler::fgWasmSpillRefs()
                 // A ref sourced from a non-address-exposed local already has a linear-stack home, so
                 //  rather than spilling it to a second slot we pin the home. The GC then can't move the
                 //  referent, and the copy on the operand stack stays valid across the call.
+                //
+                // A value this call consumes directly needs neither: there is no safepoint between
+                //  loading it and the call, and the local's home keeps the referent reachable meanwhile.
                 for (size_t i = defs.size(); i > 0; i--)
                 {
                     GenTree* const def = defs[i - 1];
@@ -1897,9 +1918,11 @@ PhaseStatus Compiler::fgWasmSpillRefs()
                         continue;
                     }
 
-                    JITDUMP("Pinning V%02u held across call\n", def->AsLclVarCommon()->GetLclNum());
-                    dsc->lvPinned = true;
-                    anyChanges    = true;
+                    if (!fgWasmIsOperandOf(tree, def))
+                    {
+                        JITDUMP("Pinning V%02u held across call\n", def->AsLclVarCommon()->GetLclNum());
+                        dsc->lvPinned = true;
+                    }
 
                     // Swapping with the last element is safe because we walk backwards, so whatever
                     //  lands here has already been examined.
