@@ -282,6 +282,49 @@ rather than relying on an exception pause — the host wrapper catches and rethr
 surfaces as uncaught. When handing a `.wasm` fixture to another session for debugging, tag it with
 its `sha256sum`; ambiguity between similarly named rigs has cost real debugging time.
 
+### Worked example: a value that is correct in the caller and garbage one hop later
+
+Symptom: under R2R, `DateTime.ToString("yyyy-MM-ddTHH:mm:ss")` returned a constant
+`0001-01-01T00:07:09` regardless of input, while `.Ticks`/`.Year`/`.Month` read correctly. The
+`DateTime` was correct in `DateTimeFormat.Format`'s own frame and wrong by the time
+`FormatCustomized` saw it, which looks exactly like a thunk marshaling or argument-homing bug.
+
+It was neither. It was **JIT frame layout**, and the wrong value was uninitialized memory one slot
+past the end of the caller's frame.
+
+Get a serialized JIT dump for the offending method at compile time — this is a crossgen2 flag, not a
+runtime one:
+
+```bash
+crossgen2 --parallelism:1 --codegenopt JitDump=Format ...
+```
+
+The tell is in `lvaAssignFrameOffsets`' **Assign list**. The promoted field of the `DateTime`
+parameter (`V153 ... "field V01._dateData"`, marked `addr-exposed` and `P-DEP` because `Format`
+passes the parameter by `ref`) never appeared in that list, so it kept stack offset 0 — which, after
+the virtual-to-actual frame delta, silently aliased it to `frameSize`. Codegen then loaded the
+argument from off the end of the frame.
+
+Root cause: `Compiler::lvaAssignFrameOffsetsToPromotedStructs()` in
+[`src/coreclr/jit/lclvars.cpp`](../../../../src/coreclr/jit/lclvars.cpp) gates the
+`SetStackOffset(parent + lvFldOffset)` fixup for *parameters* on `mustProcessParams`, which is
+hardcoded `true` only for `UNIX_AMD64_ABI`, `TARGET_ARM`, and `TARGET_X86`. The comment above it
+assumes promoted parameter field offsets are assigned by `lvaAssignVirtualFrameOffsetToArg()`, which
+is not true on wasm — parameters arrive as wasm locals and are homed by the prolog. The only other
+propagation site requires `lvIsRegArg` and is gated to ARM/LoongArch/RISC-V, so it cannot cover wasm
+either. Adding `TARGET_WASM` to that gate fixes it.
+
+Two lessons worth carrying:
+
+- On wasm, a value that is **correct in the caller and garbage one hop later** may be a frame-offset
+  bug rather than a marshaling bug. Check frame layout before dissecting thunks.
+- A local **missing from the Assign list** has offset 0, and the frame delta will alias it to
+  `frameSize` rather than trapping. Absence is the signal.
+
+Only the address-exposed promoted parameter is affected, so this presents as a single argument being
+wrong while every other argument homes correctly — not as a positional shift.
+
+
 ## Known-broken
 
 - Browser only: `Enum.ToObject`'s virtual dispatch to `GetTypeCodeImpl()` traps on a `call_indirect`
