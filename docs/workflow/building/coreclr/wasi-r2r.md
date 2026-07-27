@@ -282,7 +282,38 @@ rather than relying on an exception pause — the host wrapper catches and rethr
 surfaces as uncaught. When handing a `.wasm` fixture to another session for debugging, tag it with
 its `sha256sum`; ambiguity between similarly named rigs has cost real debugging time.
 
-### Worked example: a value that is correct in the caller and garbage one hop later
+### Getting diagnostics out of crossgen2
+
+Several JIT diagnostic knobs are **inert by design** under crossgen2, in ways that look like
+misconfiguration. Two pipes matter, and neither is `jitstdout`:
+
+**Fatal JIT errors are silently discarded.** A `CodeGenerationFailedException` with *no* inner
+exception ([`CorInfoImpl.cs`](../../../../src/coreclr/tools/Common/JitInterface/CorInfoImpl.cs), the
+`result != CORJIT_OK` tail of `CompileMethod`) means the JIT signalled a fatal error that was not
+BADCODE / IMPLLIMITATION / R2R_UNSUPPORTED / OUTOFMEM. That path runs `fatal()` →
+`RaiseException(FATAL_JIT_EXCEPTION)` → `__JITfilter` → `jitInfo->reportFatalError()`, and
+crossgen2's managed `reportFatalError` is an empty method — the `CorJitResult` reaches managed code
+and is dropped. A bare exception with no reason text is the expected outcome, not a broken flag. To
+see the reason, add a line to `reportFatalError`; it is managed-only, so no JIT rebuild is needed.
+
+**JIT assert text does not go to `jitstdout`.** `assertAbort`
+([`src/coreclr/jit/error.cpp`](../../../../src/coreclr/jit/error.cpp)) formats the
+`Assertion failed '...' in '...' during '...'` message and routes it through
+`compHnd->doAssert(...)` — a JIT-EE callback into managed crossgen2, which forwards to its `Logger`.
+So `--codegenopt:JitStdOutFile=...` never receiving assert output tells you nothing; no assert would
+ever write there. `JitFuncInfoLogFile` additionally requires `FUNC_INFO_LOGGING` compiled in.
+
+**The managed crossgen2 configuration is independent of the JIT dylib's.** `DumpReproArguments`, and
+other managed diagnostics, are `#if DEBUG` on the *managed* build. A Debug native JIT paired with a
+Release managed crossgen2 has them compiled out. If a failure does not print repro instructions,
+check that before concluding a managed-side knob is broken.
+
+**The JIT is `dlopen`'d, not linked.** `JitConfigProvider` installs a `SetDllImportResolver` mapping
+the `DllImport` name `clrjitilc` to `clrjit_<targetspec>` (e.g. `clrjit_universal_wasm_arm64`). Use
+`--jitpath` to pin exactly which JIT loads. For a debugger, set breakpoints *after* the library
+loads, and take the module name from `image list` rather than guessing the file name — a pending
+breakpoint that never resolves usually means the name does not match what the debugger recorded.
+
 
 Symptom: under R2R, `DateTime.ToString("yyyy-MM-ddTHH:mm:ss")` returned a constant
 `0001-01-01T00:07:09` regardless of input, while `.Ticks`/`.Year`/`.Month` read correctly. The
