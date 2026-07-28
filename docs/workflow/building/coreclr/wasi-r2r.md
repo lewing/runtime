@@ -223,7 +223,7 @@ The product path extracts the webcil **metadata payload only** — no table grow
 under `corerun` and nowhere else today.** A flat directory driven by `corerun.js` is therefore the
 canonical browser R2R layout, not an approximation of one.
 
-Two related consequences:
+Several related consequences:
 
 - **There is no bundle scenario to test on browser.** `AssemblyProbeExtension::Probe`
   ([`assemblyprobeextension.cpp`](../../../../src/coreclr/vm/assemblyprobeextension.cpp)) has a
@@ -236,6 +236,16 @@ Two related consequences:
   been measured to simply not resolve, falling back to the interpreter silently (see
   [Proving R2R is actually active](#proving-r2r-is-actually-active)). A flat directory alongside
   `corerun.js` is not merely the conventional browser R2R layout, it is the only one known to work.
+- **A composite crossgen'd as `foo.dll` is probed for as `foo.wasm`.** Combined with the silent
+  fallback described below, a naming mismatch does not surface as an error — it produces a **false
+  pass**, with the suite running green entirely under the interpreter. Deploy the composite under both
+  names if in any doubt, and confirm activation independently.
+- **`corerun` has no JS interop implementation.** The `SystemInteropJS_*` entry points in
+  [`pinvoke_override.cpp`](../../../../src/coreclr/hosts/corerun/wasm/pinvoke_override.cpp) are
+  deliberate linker-satisfying stubs, each `_ASSERTE(!"Should not be reached")`, so that `corerun`
+  need not link `libSystem.Runtime.InteropServices.JavaScript.Native`. Any suite touching JS interop
+  will assert there. That is a ceiling of the host rather than a fault in the code under test — check
+  whether the assert fires *after* the run's `Finished` marker before treating it as a failure.
 
 ### Building a composite through the runtime test infrastructure
 
@@ -256,9 +266,13 @@ Driven with `CompositeBuildMode=1` plus `src/tests/run.sh --runcrossgen2tests` (
 `AlwaysUseCrossGen2` in a test project, which sets both).
 
 Two switches that path passes and a hand-rolled rig usually does not — `--verify-type-and-field-layout`
-and `--method-layout:random`. The first is worth adopting for any ABI or layout work, since it checks
-crossgen's view of type and field layout against the runtime's rather than waiting for a
-miscompilation to surface downstream.
+and `--method-layout:random`. The first is worth adopting for any ABI or layout work: it embeds
+`Verify_TypeLayout` / `Verify_FieldOffset` fixups that the runtime checks at load
+([`jitinterface.cpp`](../../../../src/coreclr/vm/jitinterface.cpp)), raising a fatal error on
+disagreement rather than letting a layout mismatch surface later as a miscompilation. It is genuinely
+enforced, not advisory. Expect the composite to grow noticeably — one measured case went from 29.1 MB
+to 37.3 MB (+28%) — so use it for validation runs rather than for artifacts you intend to ship or
+profile.
 
 Note `-f wasm` is optional in general: crossgen2 promotes the container format from PE to Wasm
 automatically when the target architecture is wasm32, so a hand-rolled invocation that omits it still
