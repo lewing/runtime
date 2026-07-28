@@ -141,6 +141,44 @@ cp "$CORELIB" "$DEST/"   # CoreCLR's CoreLib must win over the pack's Mono one
 See [`eng/wasi-r2r/README.md`](../../../../eng/wasi-r2r/README.md) for how
 `corerun-composite-sym.wasm` is produced, and for whether the splice step is still required at all.
 
+```bash
+cd "$DEST"
+wasmtime run \
+    -S http=y \
+    -W exceptions=y,gc=y,function-references=y,tail-call=y,threads=y,simd=y,relaxed-simd=y \
+    --env DOTNET_ReadyToRun=1 \
+    --env CORE_ROOT=/core \
+    --env APP_ASSEMBLIES=EXTERNAL \
+    --env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true \
+    --env DOTNET_WASI_PRINT_EXIT_CODE=1 \
+    --dir "$PWD::/core" \
+    corerun-composite-sym.wasm Hello.dll
+```
+
+- `CORE_ROOT` must exactly match the guest side of the `--dir` mapping.
+- `-S http=y` is required even for tests that do no HTTP, because this `corerun` links
+  `WasiHttpWorld` and instantiation fails without it.
+- The reference `Hello` app exits 42, printed as `WASM EXIT 42`.
+
+Running an xUnit suite is the same shape with a different entry assembly:
+
+```bash
+wasmtime run -S http=y -W exceptions=y,gc=y,function-references=y,tail-call=y,threads=y,simd=y,relaxed-simd=y \
+    --env DOTNET_ReadyToRun=1 --env CORE_ROOT=/core --env APP_ASSEMBLIES=EXTERNAL \
+    --env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    --dir "$PWD::/core" \
+    corerun-composite-sym.wasm WasmTestRunner.dll System.Text.Json.Tests.dll
+```
+
+To produce a realistic deployment layout to compile against, build a library test for WASI first —
+it lays out `AppBundle/managed/` with `corerun`, the framework, and `WasmTestRunner.dll`:
+
+```bash
+./dotnet.sh build /t:Test \
+    src/libraries/System.Runtime/tests/System.Runtime.CompilerServices.Unsafe.Tests/System.Runtime.CompilerServices.Unsafe.Tests.csproj \
+    /p:TargetOS=wasi /p:TargetArchitecture=wasm /p:RuntimeFlavor=coreclr /p:Configuration=Release
+```
+
 ### How the WASI host finds R2R images
 
 Unlike the browser host, the WASI host serves R2R images through a
@@ -197,58 +235,46 @@ Two related consequences:
   cannot distinguish that from a cwd-relative lookup; putting the component assemblies in a
   subdirectory does.
 
-### Product-build composite is not plumbed for wasm
+### Building a composite through the runtime test infrastructure
 
-There is no supported product build that produces a wasm R2R composite. `crossgen-corelib.proj`
-routes the wasm R2R CoreLib to `System.Private.CoreLib.NotReadyYet.wasm`, and `NotReadyYet` appears
-exactly once in the tree — its own definition, with no consumer. Enabling `UseComposite` there also
-runs into `CopyR2RComponentCoreLib`, which expects a rewritten managed `.dll` under `artifacts/obj`;
-that is a PE/Mach-O-shaped assumption and does not hold when crossgen2 emits `.wasm` components to
-`BinDir`.
+`src/tests` has **browser-aware composite R2R plumbing in tree**, and it is the closest thing to a
+canonical wasm composite build. Prefer it over a hand-rolled `crossgen2` rig when you can: it is the
+analogue of what `tests.ioslike.targets` does for Apple mobile.
 
-Fixing the build glue would not be enough on its own: per the section above, the product browser boot
-path cannot wire the table, so a product-built composite still would not execute R2R. An app-level
-`PublishReadyToRunComposite` (the shape `tests.ioslike.targets` uses for Apple mobile) does not help
-for the same reason. Driving `crossgen2` by hand remains the only way to exercise wasm composite R2R.
+- [`src/tests/Directory.Build.props`](../../../../src/tests/Directory.Build.props) sets
+  `CrossGen2OutputFormat=wasm` when `TargetOS == browser`.
+- [`CLRTest.CrossGen.targets`](../../../../src/tests/Common/CLRTest.CrossGen.targets) compiles
+  `IL-CG2/*.dll` into `composite-r2r.wasm` when `CompositeBuildMode` is set, passing `-f wasm` and
+  automatically adding `--codegenopt:JitWasmNyiToR2RUnsupported=1` and
+  `--codegenopt:JitWasmSimdNyiToR2RUnsupported=1`.
+- [`CLRTest.Execute.Bash.targets`](../../../../src/tests/Common/CLRTest.Execute.Bash.targets) then runs
+  the result under `node --experimental-wasm-exnref --stack-size=8192 $CORE_ROOT/corerun.js -c $CORE_ROOT ...`.
 
+Driven with `CompositeBuildMode=1` plus `src/tests/run.sh --runcrossgen2tests` (or by setting
+`AlwaysUseCrossGen2` in a test project, which sets both).
 
-```bash
-cd "$DEST"
-wasmtime run \
-    -S http=y \
-    -W exceptions=y,gc=y,function-references=y,tail-call=y,threads=y,simd=y,relaxed-simd=y \
-    --env DOTNET_ReadyToRun=1 \
-    --env CORE_ROOT=/core \
-    --env APP_ASSEMBLIES=EXTERNAL \
-    --env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true \
-    --env DOTNET_WASI_PRINT_EXIT_CODE=1 \
-    --dir "$PWD::/core" \
-    corerun-composite-sym.wasm Hello.dll
-```
+Two switches that path passes and a hand-rolled rig usually does not — `--verify-type-and-field-layout`
+and `--method-layout:random`. The first is worth adopting for any ABI or layout work, since it checks
+crossgen's view of type and field layout against the runtime's rather than waiting for a
+miscompilation to surface downstream.
 
-- `CORE_ROOT` must exactly match the guest side of the `--dir` mapping.
-- `-S http=y` is required even for tests that do no HTTP, because this `corerun` links
-  `WasiHttpWorld` and instantiation fails without it.
-- The reference `Hello` app exits 42, printed as `WASM EXIT 42`.
+Note `-f wasm` is optional in general: crossgen2 promotes the container format from PE to Wasm
+automatically when the target architecture is wasm32, so a hand-rolled invocation that omits it still
+produces a wasm container.
 
-Running an xUnit suite is the same shape with a different entry assembly:
+### What is *not* plumbed: the runtime pack's R2R CoreLib
 
-```bash
-wasmtime run -S http=y -W exceptions=y,gc=y,function-references=y,tail-call=y,threads=y,simd=y,relaxed-simd=y \
-    --env DOTNET_ReadyToRun=1 --env CORE_ROOT=/core --env APP_ASSEMBLIES=EXTERNAL \
-    --env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
-    --dir "$PWD::/core" \
-    corerun-composite-sym.wasm WasmTestRunner.dll System.Text.Json.Tests.dll
-```
+Distinct from the test path above, the **product runtime pack** does not ship an R2R CoreLib for wasm.
+`crossgen-corelib.proj` routes the wasm R2R CoreLib to `System.Private.CoreLib.NotReadyYet.wasm`, and
+`NotReadyYet` appears exactly once in the tree — its own definition, with no consumer. Enabling
+`UseComposite` there also runs into `CopyR2RComponentCoreLib`, which expects a rewritten managed `.dll`
+under `artifacts/obj`; that is a PE/Mach-O-shaped assumption and does not hold when crossgen2 emits
+`.wasm` components to `BinDir`.
 
-To produce a realistic deployment layout to compile against, build a library test for WASI first —
-it lays out `AppBundle/managed/` with `corerun`, the framework, and `WasmTestRunner.dll`:
-
-```bash
-./dotnet.sh build /t:Test \
-    src/libraries/System.Runtime/tests/System.Runtime.CompilerServices.Unsafe.Tests/System.Runtime.CompilerServices.Unsafe.Tests.csproj \
-    /p:TargetOS=wasi /p:TargetArchitecture=wasm /p:RuntimeFlavor=coreclr /p:Configuration=Release
-```
+Fixing that build glue would not be sufficient on its own either: per the section above, the *product
+browser boot path* cannot wire the table, so an R2R image shipped in the runtime pack still would not
+execute under a real browser app host. Composite R2R on browser runs under `corerun`, whether you get
+there through the test infrastructure or by hand.
 
 ## Proving R2R is actually active
 
