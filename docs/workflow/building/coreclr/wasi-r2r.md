@@ -168,6 +168,50 @@ is unsupported here":
 Prefer setting `CORE_ROOT` over passing `-c`: it avoids WASI argument-plumbing quirks, and it must
 match the guest side of the `--dir` mapping either way.
 
+### How the browser host finds R2R images
+
+The browser side has **two different** `BrowserHost_ExternalAssemblyProbe` implementations, and only
+one of them can activate R2R. This matters because it determines what a browser R2R rig can and
+cannot represent:
+
+| | corerun ([`libCorerun.js`](../../../../src/coreclr/hosts/corerun/wasm/libCorerun.js)) | product ([`assets.ts`](../../../../src/native/libs/Common/JavaScript/host/assets.ts)) |
+| --- | --- | --- |
+| Lookup | `FS.readFile`, mapping `<name>.dll` → `<name>.wasm` | `Map` lookup, keyed by both virtual path and base name |
+| Instantiate imports | `memory`, `stackPointer`, `rtlRestoreContextTag`, `table`, `tableBase`, `imageBase`, `asyncContinuation` | `{ webcil: { memory } }` |
+| Table setup | `wasmTable.grow(tableSize)` then `fillWebcilTable()` | none |
+
+The product path extracts the webcil **metadata payload only** — no table growth, no `tableBase` or
+`imageBase`, no `fillWebcilTable()` — so R2R native code has nowhere to land. **Browser R2R runs
+under `corerun` and nowhere else today.** A flat directory driven by `corerun.js` is therefore the
+canonical browser R2R layout, not an approximation of one.
+
+Two related consequences:
+
+- **There is no bundle scenario to test on browser.** `AssemblyProbeExtension::Probe`
+  ([`assemblyprobeextension.cpp`](../../../../src/coreclr/vm/assemblyprobeextension.cpp)) has a
+  `Bundle::AppBundle->Probe(...)` arm and an external-probe arm, but neither browser host calls
+  `Bundle::Init`, so `Bundle::AppIsBundle()` is false and the bundle arm is unreachable there.
+- **Composite path resolution is directory-relative.** `OpenR2RFromPE`
+  ([`nativeimage.cpp`](../../../../src/coreclr/vm/nativeimage.cpp)) builds the composite's path as
+  *the component module's directory* plus the composite file name from the R2R header. A flat layout
+  cannot distinguish that from a cwd-relative lookup; putting the component assemblies in a
+  subdirectory does.
+
+### Product-build composite is not plumbed for wasm
+
+There is no supported product build that produces a wasm R2R composite. `crossgen-corelib.proj`
+routes the wasm R2R CoreLib to `System.Private.CoreLib.NotReadyYet.wasm`, and `NotReadyYet` appears
+exactly once in the tree — its own definition, with no consumer. Enabling `UseComposite` there also
+runs into `CopyR2RComponentCoreLib`, which expects a rewritten managed `.dll` under `artifacts/obj`;
+that is a PE/Mach-O-shaped assumption and does not hold when crossgen2 emits `.wasm` components to
+`BinDir`.
+
+Fixing the build glue would not be enough on its own: per the section above, the product browser boot
+path cannot wire the table, so a product-built composite still would not execute R2R. An app-level
+`PublishReadyToRunComposite` (the shape `tests.ioslike.targets` uses for Apple mobile) does not help
+for the same reason. Driving `crossgen2` by hand remains the only way to exercise wasm composite R2R.
+
+
 ```bash
 cd "$DEST"
 wasmtime run \
