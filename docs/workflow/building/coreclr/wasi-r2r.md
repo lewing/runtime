@@ -231,9 +231,11 @@ Two related consequences:
   `Bundle::Init`, so `Bundle::AppIsBundle()` is false and the bundle arm is unreachable there.
 - **Composite path resolution is directory-relative.** `OpenR2RFromPE`
   ([`nativeimage.cpp`](../../../../src/coreclr/vm/nativeimage.cpp)) builds the composite's path as
-  *the component module's directory* plus the composite file name from the R2R header. A flat layout
-  cannot distinguish that from a cwd-relative lookup; putting the component assemblies in a
-  subdirectory does.
+  *the component module's directory* plus the composite file name from the R2R header. In principle a
+  nested layout would exercise this differently from a flat one — in practice a nested layout has
+  been measured to simply not resolve, falling back to the interpreter silently (see
+  [Proving R2R is actually active](#proving-r2r-is-actually-active)). A flat directory alongside
+  `corerun.js` is not merely the conventional browser R2R layout, it is the only one known to work.
 
 ### Building a composite through the runtime test infrastructure
 
@@ -278,15 +280,26 @@ there through the test infrastructure or by hand.
 
 ## Proving R2R is actually active
 
-Do not infer this from output alone:
+**R2R failure is silent.** If the probe cannot resolve an image — wrong layout, wrong name, missing
+file — the runtime falls back to the interpreter and the run completes normally, with no diagnostic.
+A passing browser or WASI R2R result is therefore *not* evidence that R2R ran. Treat every green
+result as unproven until you have independent confirmation.
+
+The cheapest confirmation is a **negative control**: delete the composite and its component `.wasm`
+files, re-run, and diff. Byte-identical output means R2R was never active and whatever you thought
+you were testing did not happen.
 
 ```bash
-DOTNET_ReadyToRunLogFile=$PWD/r2r.log wasmtime run ... corerun-composite-sym.wasm Hello.dll
+DOTNET_ReadyToRunLogFile=$PWD/r2r.log <run command>
 grep -c "initialized successfully" r2r.log   # >0 means R2R images were really loaded
 grep -c "header not found"          r2r.log   # >0 is expected for assemblies you did not crossgen
 ```
 
 A live debugger tracepoint on an R2R'd method is the other reliable test.
+
+Note the inverse: a run that *fails* inside the R2R load path — for example an assert in
+`NativeImage::Open` — is self-proving, because the failure could only occur if the composite was
+being loaded. When bisecting a fix, an asserting arm carries more information than a passing one.
 
 ## Traps
 
