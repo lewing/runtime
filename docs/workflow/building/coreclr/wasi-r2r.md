@@ -278,6 +278,12 @@ Note `-f wasm` is optional in general: crossgen2 promotes the container format f
 automatically when the target architecture is wasm32, so a hand-rolled invocation that omits it still
 produces a wasm container.
 
+Composites scale further than you might expect: a 181-input composite (full framework plus a Checked
+IL CoreLib, ~180 MB, 182 component images) has been run successfully under `corerun` with layout
+verification enabled. Earlier browser work reported an ~8 MB ceiling on *synchronous* wasm compilation
+in V8/Node, but the `corerun` path evidently does not hit it at that size — treat the ceiling as a
+property of how a module is compiled rather than a hard limit on composite size.
+
 ### What is *not* plumbed: the runtime pack's R2R CoreLib
 
 Distinct from the test path above, the **product runtime pack** does not ship an R2R CoreLib for wasm.
@@ -299,9 +305,19 @@ file — the runtime falls back to the interpreter and the run completes normall
 A passing browser or WASI R2R result is therefore *not* evidence that R2R ran. Treat every green
 result as unproven until you have independent confirmation.
 
-The cheapest confirmation is a **negative control**: delete the composite and its component `.wasm`
-files, re-run, and diff. Byte-identical output means R2R was never active and whatever you thought
-you were testing did not happen.
+**Comparing program output cannot supply that confirmation.** R2R is designed to be
+behaviour-transparent: a correct composite computes exactly what the interpreter computes. So
+identical output is equally consistent with "R2R ran correctly" and "R2R never ran at all", and no
+amount of output diffing separates them.
+
+That includes deleting the composite and re-running. It is a cheap first pass, and a *difference* is
+informative — it means the composite changed observable behaviour, which is itself a bug worth
+chasing. But a null result proves nothing whenever the IL assemblies remain deployable, because the
+runtime just falls back and computes the same answers. This has produced both outcomes in practice:
+in a nested-layout run where R2R genuinely never activated, and in a 181-assembly composite run where
+it demonstrably did.
+
+Use one of these instead:
 
 ```bash
 DOTNET_ReadyToRunLogFile=$PWD/r2r.log <run command>
@@ -309,11 +325,13 @@ grep -c "initialized successfully" r2r.log   # >0 means R2R images were really l
 grep -c "header not found"          r2r.log   # >0 is expected for assemblies you did not crossgen
 ```
 
-A live debugger tracepoint on an R2R'd method is the other reliable test.
+A live debugger tracepoint on an R2R'd method is equally conclusive.
 
-Note the inverse: a run that *fails* inside the R2R load path — for example an assert in
-`NativeImage::Open` — is self-proving, because the failure could only occur if the composite was
-being loaded. When bisecting a fix, an asserting arm carries more information than a passing one.
+The third option is the most useful when bisecting a fix: **run an arm that is known to fail inside
+the R2R load path** — for example, a build without the fix whose absence asserts in
+`NativeImage::Open` — and confirm it does fail. That assert can only fire if the composite was
+genuinely being loaded, so it proves activation for the sibling arms that share the layout. A failing
+arm carries more information than a passing one here, which inverts the usual intuition.
 
 ## Traps
 
