@@ -527,6 +527,30 @@ DateTime tests. And never conclude "not reproducible, must already be fixed" fro
 whose output happens to be correct.
 
 
+## In flight
+
+Open work that will change what this page says. Checked 2026-08-19 — re-check before relying on any
+gap described here.
+
+| PR | | What it changes |
+| --- | --- | --- |
+| [#132339](https://github.com/dotnet/runtime/pull/132339) | open | **Enable ReadyToRun for CoreCLR browser-wasm.** Productizes browser R2R: ships prebuilt framework R2R images in the runtime pack, adds `WasmEnableFrameworkR2R`, wires `PublishReadyToRun` through the SDK targets, and compiles CoreLib with `--inputbubble`. Non-composite (per-assembly) only; composite explicitly out of scope. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). This closes most of the [runtime-pack gap](#what-is-not-plumbed-the-runtime-packs-r2r-corelib) below. |
+| [#132528](https://github.com/dotnet/runtime/pull/132528) | open | Adds the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 carries. |
+| [#131877](https://github.com/dotnet/runtime/pull/131877) | draft | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
+| [#131402](https://github.com/dotnet/runtime/pull/131402) | draft | Narrower alternative to #131374 for the GC-locals-across-safepoint bug — same family as the shadow-stack spill work. |
+
+Related open issues:
+
+- [#130634](https://github.com/dotnet/runtime/issues/130634) — `function signature mismatch` on the
+  first (**cold**) R2R call to a method whose native code is not yet wired onto its portable entry
+  point. Order-dependent: succeeds if an earlier call already wired the target. Plausibly the same
+  root as the `Enum.ToObject` entry below, which is also a `call_indirect` type divergence through a
+  transition thunk — worth checking whether one repro subsumes the other.
+- [#132410](https://github.com/dotnet/runtime/issues/132410) — browser R2R EventPipe rundown traps
+  with `null function`.
+- [#129850](https://github.com/dotnet/runtime/issues/129850) — running wasm with an R2R'd
+  `System.Private.CoreLib`.
+
 ## Known-broken
 
 - ~~**`Int128`/`UInt128` comparison or equality is miscompiled under wasm R2R.**~~ **Fixed** by
