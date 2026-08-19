@@ -10,9 +10,15 @@
 > limitation. Several sessions have burned days re-deriving this.
 
 This page documents the hand-driven flow for building, compiling, and running a **composite R2R
-image on CoreCLR/WASI**. There is deliberately no `PublishReadyToRun` or WasmAppBuilder switch that
-does wasm R2R today: you invoke `crossgen2` directly, deploy into a flat directory, and run under
-`wasmtime`.
+image on CoreCLR/WASI**: you invoke `crossgen2` directly, deploy into a flat directory, and run under
+`wasmtime`. There is no app-level `PublishReadyToRun` switch for wasm, though `src/tests` does have
+composite plumbing — see
+[Building a composite through the runtime test infrastructure](#building-a-composite-through-the-runtime-test-infrastructure).
+
+> **Claims here were last verified against `origin/main` on 2026-08-19.** This area moves quickly and
+> several statements below were true when written and false within weeks. Anything asserting that
+> something is *impossible* or *not plumbed* deserves a fresh check before you rely on it — the
+> commands and diagnostics age far better than the gap analysis.
 
 The same `crossgen2` and codegen paths serve `browser` as well — wasm R2R codegen keys on the
 architecture (`IsWasm`), not on the target OS, so browser is a useful control when isolating a bug.
@@ -208,20 +214,31 @@ match the guest side of the `--dir` mapping either way.
 
 ### How the browser host finds R2R images
 
-The browser side has **two different** `BrowserHost_ExternalAssemblyProbe` implementations, and only
-one of them can activate R2R. This matters because it determines what a browser R2R rig can and
-cannot represent:
+The browser side has **two** `BrowserHost_ExternalAssemblyProbe` implementations. Both can activate
+R2R, but they discover the image differently:
 
 | | corerun ([`libCorerun.js`](../../../../src/coreclr/hosts/corerun/wasm/libCorerun.js)) | product ([`assets.ts`](../../../../src/native/libs/Common/JavaScript/host/assets.ts)) |
 | --- | --- | --- |
 | Lookup | `FS.readFile`, mapping `<name>.dll` → `<name>.wasm` | `Map` lookup, keyed by both virtual path and base name |
-| Instantiate imports | `memory`, `stackPointer`, `rtlRestoreContextTag`, `table`, `tableBase`, `imageBase`, `asyncContinuation` | `{ webcil: { memory } }` |
-| Table setup | `wasmTable.grow(tableSize)` then `fillWebcilTable()` | none |
+| Sizes | parses data segment 0 for `payloadSize`/`tableSize` | read from boot config |
+| R2R imports | always passed | passed when `tableSize > 0` |
+| Table setup | `wasmTable.grow(tableSize)` then `fillWebcilTable()` | same, gated on `tableSize > 0` |
 
-The product path extracts the webcil **metadata payload only** — no table growth, no `tableBase` or
-`imageBase`, no `fillWebcilTable()` — so R2R native code has nowhere to land. **Browser R2R runs
-under `corerun` and nowhere else today.** A flat directory driven by `corerun.js` is therefore the
-canonical browser R2R layout, not an approximation of one.
+Both supply the same host ABI — `stackPointer`, `rtlRestoreContextTag`, `asyncContinuation`, `table`,
+`tableBase`, `imageBase` — which is defined by crossgen's `WasmObjectWriter` and must be kept in sync
+across the two hosts. The product loader gained this in
+[dotnet/runtime#131658](https://github.com/dotnet/runtime/pull/131658) (merged 2026-08-07), which
+records `payloadSize` and `tableSize` in the boot config so assemblies can be stream-instantiated
+rather than buffered.
+
+> **Historical note.** Before #131658 the product loader instantiated with `{ webcil: { memory } }`
+> only — no table, no bases — so R2R native code had nowhere to land and browser R2R ran under
+> `corerun` exclusively. Material written before August 2026 (including earlier revisions of this
+> page) reflects that state. If you are reading a claim that the product path "cannot activate R2R",
+> check the date.
+
+A flat directory driven by `corerun.js` remains the layout used for hand-driven R2R work, and is what
+the runtime test infrastructure drives.
 
 Several related consequences:
 
@@ -293,10 +310,9 @@ Distinct from the test path above, the **product runtime pack** does not ship an
 under `artifacts/obj`; that is a PE/Mach-O-shaped assumption and does not hold when crossgen2 emits
 `.wasm` components to `BinDir`.
 
-Fixing that build glue would not be sufficient on its own either: per the section above, the *product
-browser boot path* cannot wire the table, so an R2R image shipped in the runtime pack still would not
-execute under a real browser app host. Composite R2R on browser runs under `corerun`, whether you get
-there through the test infrastructure or by hand.
+This is now the *remaining* gap rather than one of two: since #131658 the product browser loader can
+instantiate an R2R image, so wiring the build glue here would no longer be blocked behind boot-path
+work. Verified against `origin/main` as of 2026-08-19 — `NotReadyYet` still has no consumer.
 
 ## Proving R2R is actually active
 
@@ -513,17 +529,24 @@ whose output happens to be correct.
 
 ## Known-broken
 
-- **`Int128`/`UInt128` comparison or equality is miscompiled under wasm R2R.** Smoking gun:
-  `RoundtripValues<Int128>(-1)` fails with `Expected: -1  Actual: -1` — the values render identically
-  but compare unequal, which points at the halves being compared wrongly. The same root appears in
-  `PrimitiveTypes_EqualThemselves<Int128>`, the `GetConverter_*128_*` and `Number_As*_RoundTrip`
-  clusters, and in `TestEscapedValuesOnDeserialize` (whose dictionary keys are `UInt128.MaxValue`).
-  Accounts for 25 of the 39 residual `System.Text.Json` failures. Not yet root-caused.
+- ~~**`Int128`/`UInt128` comparison or equality is miscompiled under wasm R2R.**~~ **Fixed** by
+  [dotnet/runtime#131492](https://github.com/dotnet/runtime/pull/131492) (merged 2026-08-12). Kept
+  here because the root cause generalises: the `S<N>` signature encoding resolves through a
+  **size-keyed, first-wins struct cache**, so `Int128` and `Guid` both spell `S16` and shared a thunk
+  whose frame layout only fitted whichever type the cache saw first. The fix passes `Int128`,
+  `Decimal128` and wide vectors *by value* — matching clang for wasm32 — instead of as a single `i32`
+  pointer. **If you see two unrelated types of the same size disagreeing about layout, suspect that
+  cache.** The original symptom, `RoundtripValues<Int128>(-1)` failing with
+  `Expected: -1  Actual: -1` — values rendering identically but comparing unequal — accounted for 25
+  of the 39 residual `System.Text.Json` failures.
 - Browser only: `Enum.ToObject`'s virtual dispatch to `GetTypeCodeImpl()` traps on a `call_indirect`
   return-type mismatch (expected `void`, actual `i32`). WASI dispatches the identical call cleanly on
   the same codegen; the suspected cause is emscripten-side R2R/interpreter thunk resolution.
-- `src/tasks/WasmAppBuilder/coreclr/SignatureMapper.cs` has no `'V'` (v128) case in
-  `TokenToSlotCount`, which should be 2 slots. Latent, in the same v128-thunk family.
+- `src/tasks/WasmAppBuilder/coreclr/SignatureMapper.cs` — `TokenToSlotCount` returns 1 for any token
+  not starting with `S`/`A`, so a `V` (v128) token appears to count as one 8-byte slot rather than
+  two. Flagged as latent before #131492 reworked this encoding (which added the `l2`/`V2` alignment-
+  factor forms); **re-verify against the current encoding before acting on it**, since the slot
+  semantics may have changed underneath the original observation.
 
 ## Validating a fix at suite level
 
