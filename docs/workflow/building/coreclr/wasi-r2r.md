@@ -438,6 +438,27 @@ different quantities. Two consequences worth internalising before capturing anyt
   invariants — the runtime-function count, the `IsVirtualIP` predicate, or a behavioural check that
   the lookup resolves a known virtual IP to the expected module.
 
+## The coordinate-space trap
+
+Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
+16-byte-aligned position inside the wasm wrapper. On PE the two agree closely enough that a check
+written in the wrong coordinate space still passes. **So any reader logic expressed in file offsets
+rather than RVAs is latent on PE and breaks only on wasm** — and it breaks in the worst way, by
+rejecting or misreading an image that was always valid.
+
+Three independent instances turned up in a single investigation:
+
+| Site | File coordinate | Runtime coordinate | Why it hid |
+| --- | --- | --- | --- |
+| min function table index | module-relative, pre-relocation | absolute, post-relocation | both readings internally consistent |
+| `NativeCuckooFilter` alignment | file-offset alignment | RVA + size alignment | on PE the two agree mod 16 |
+| `RUNTIME_FUNCTION.BeginAddress` | image-relative virtual IP | `MinVirtualIP` + masked IP | looks exactly like an RVA |
+
+In every case the image was correct and the reader was checking the wrong space. So when reading or
+writing anything that inspects a wasm R2R image, make this an explicit question: **which coordinate
+space is this value in, and is it the same space the runtime uses?** A value that "looks like an RVA"
+on wasm usually is not one.
+
 ## Inspecting images
 
 ```bash
