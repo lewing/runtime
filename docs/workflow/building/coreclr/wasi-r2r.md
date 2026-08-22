@@ -473,15 +473,29 @@ wasm-tools print <image.wasm> | grep -c "(export"
 wasm-objdump -d <image.wasm> | less
 ```
 
-On a **composite** wasm image R2RDump fails with `The file is not a ReadyToRun image` until
-[#132650](https://github.com/dotnet/runtime/pull/132650) merges — it gates on a flag composites do not
-set, and its cuckoo-filter validation is written in file-offset space (see
+On a **composite** wasm image R2RDump fails with `The file is not a ReadyToRun image` — it gates on a
+flag composites do not set, and its cuckoo-filter validation is written in file-offset space (see
 [the coordinate-space trap](#the-coordinate-space-trap)). The error names the image, so it reads as a
-bad artifact rather than a reader limitation; do not conclude your composite is malformed from it.
+bad artifact rather than a reader limitation; **do not conclude your composite is malformed from it.**
+
+That diagnosis does not depend on how the reader is eventually fixed, and you can check it yourself
+against any composite without building anything — parse the CLI header and confirm:
+
+| Fact | Why it settles the question |
+| --- | --- |
+| `AttributePresence` RVA is 16-byte aligned | the alignment the runtime actually requires is satisfied |
+| its size is a power of two | passes the `nativeformatreader.h` check R2RDump does not implement |
+| `ManagedNativeHeader` points at a valid `RTR\0` header | the image really is ReadyToRun |
+| the webcil payload starts at a file offset ≢ 0 (mod 16) | the *only* reason a file-offset check fails on correctly-aligned RVAs |
+
+The runtime loads these images. [#132650](https://github.com/dotnet/runtime/pull/132650) makes R2RDump
+read them; until it merges, use the facts above rather than the tool's verdict.
 
 Pass `-r <dir>` a **directory**, never a glob. A glob expands to the first match and the rest are
 silently dropped with a `No files matching` line that is easy to miss; the damage surfaces much later
-as an unrelated-looking signature or token decode failure.
+as an unrelated-looking signature or token decode failure. Both of these are the same UX failure —
+**a message that points away from its cause** — which is worth recognising as a category, because the
+time is lost downstream of the message, investigating the thing it named.
 
 For live debugging of a trapping `call_indirect`, arm a pre-trap breakpoint at the known byte offset
 rather than relying on an exception pause — the host wrapper catches and rethrows, so the trap never
