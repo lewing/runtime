@@ -473,6 +473,16 @@ wasm-tools print <image.wasm> | grep -c "(export"
 wasm-objdump -d <image.wasm> | less
 ```
 
+On a **composite** wasm image R2RDump fails with `The file is not a ReadyToRun image` until
+[#132650](https://github.com/dotnet/runtime/pull/132650) merges — it gates on a flag composites do not
+set, and its cuckoo-filter validation is written in file-offset space (see
+[the coordinate-space trap](#the-coordinate-space-trap)). The error names the image, so it reads as a
+bad artifact rather than a reader limitation; do not conclude your composite is malformed from it.
+
+Pass `-r <dir>` a **directory**, never a glob. A glob expands to the first match and the rest are
+silently dropped with a `No files matching` line that is easy to miss; the damage surfaces much later
+as an unrelated-looking signature or token decode failure.
+
 For live debugging of a trapping `call_indirect`, arm a pre-trap breakpoint at the known byte offset
 rather than relying on an exception pause — the host wrapper catches and rethrows, so the trap never
 surfaces as uncaught. When handing a `.wasm` fixture to another session for debugging, tag it with
@@ -638,6 +648,7 @@ gap described here.
 | PR | | What it changes |
 | --- | --- | --- |
 | [#132339](https://github.com/dotnet/runtime/pull/132339) | open | **Enable ReadyToRun for CoreCLR browser-wasm.** Productizes browser R2R: ships prebuilt framework R2R images in the runtime pack, adds `WasmEnableFrameworkR2R`, wires `PublishReadyToRun` through the SDK targets, and compiles CoreLib with `--inputbubble`. Non-composite (per-assembly) only; composite explicitly out of scope. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). This closes most of the [runtime-pack gap](#what-is-not-plumbed-the-runtime-packs-r2r-corelib) below. |
+| [#132650](https://github.com/dotnet/runtime/pull/132650) | open | **Makes wasm composite images inspectable by R2RDump.** Until this merges, R2RDump rejects a wasm composite outright — see [Inspecting images](#inspecting-images). |
 | [#132528](https://github.com/dotnet/runtime/pull/132528) | open | Adds the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 carries. |
 | [#131877](https://github.com/dotnet/runtime/pull/131877) | draft | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
 | [#131402](https://github.com/dotnet/runtime/pull/131402) | draft | Narrower alternative to #131374 for the GC-locals-across-safepoint bug — same family as the shadow-stack spill work. |
@@ -674,6 +685,18 @@ Related open issues:
   two. Flagged as latent before #131492 reworked this encoding (which added the `l2`/`V2` alignment-
   factor forms); **re-verify against the current encoding before acting on it**, since the slot
   semantics may have changed underneath the original observation.
+- **Composite emission for wasm is not deterministic.** Two runs of the same crossgen2 binary, same
+  mode, over the same inputs produce images that differ — measured at 341 bytes in one window. The
+  repo already treats this as a bug on other targets: `src/tests/readytorun/determinism` byte-compares
+  crossgen2 output and fails on any difference, so wasm composite violates an invariant that is
+  explicitly tested elsewhere. Root cause not investigated; `ManifestAssemblyMvids` / `ManifestMetadata`
+  emission ordering is the suspicion, not a finding.
+
+  The practical consequence is the part to remember: **a composite artifact cannot be reproduced from
+  its recipe, only replaced.** So a composite you intend to reason about later must be *archived*, and
+  anything derived from it — offsets, indices, token-to-index bindings — is bound to that exact file
+  and not to the command that produced it. Record the `sha256sum` alongside any such value. Rebuilding
+  "the same" image and reusing an old derived constant is a silent way to be wrong.
 
 ## Validating a fix at suite level
 
