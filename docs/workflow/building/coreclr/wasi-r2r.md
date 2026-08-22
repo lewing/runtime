@@ -410,6 +410,34 @@ Dropping [#131167](https://github.com/dotnet/runtime/pull/131167)-family fixes r
 async/R2R thunk-signature bug and reintroduces `call_indirect` signature-mismatch traps. After any
 rebase, do one full rebuild before re-testing.
 
+**8. A value read out of the image file is not necessarily the value the runtime uses.**
+Wasm R2R images carry `IMAGE_REL_BASED_WASM32_TABLE` relocations that are applied at load, not at
+build. `getWebcilPayload` writes the live table base into the webcil header at offset 28
+(`WebcilEncoder.TableBaseOffset`, emitted by `WebCilObjectWriter`), and `ApplyBaseRelocations` then
+adds it to every table-index slot
+([`peimagelayout.cpp`](../../../../src/coreclr/vm/peimagelayout.cpp)):
+
+```cpp
+SSIZE_T tableBaseDelta = GetTableBaseOffset();
+...
+case IMAGE_REL_BASED_WASM32_TABLE:
+    *(uint32_t *)address += (uint32_t)tableBaseDelta;
+```
+
+So a static read of, say, the min-function-table-index trailer yields the **pre-relocation** value —
+`0` for a browser composite — while the runtime sees `0 + tableBase`. Both are correct; they are
+different quantities. Two consequences worth internalising before capturing anything from an image:
+
+- **Don't compare values across artifact classes.** On browser the base is supplied at instantiation,
+  so it is never written to a file. On WASI's splice pipeline offset 28 is patched pre-ship, so a
+  nonzero base *is* visible statically. The same field can legitimately read `0` in one and a large
+  number in the other.
+- **Relocated values are per-run and unsuitable as fixture constants.** The browser table base is
+  `wasmTable.length` at instantiation, which depends on what loaded earlier. Pinning an observed
+  value produces a test that passes on the run that produced it and silently fails later. Prefer
+  invariants — the runtime-function count, the `IsVirtualIP` predicate, or a behavioural check that
+  the lookup resolves a known virtual IP to the expected module.
+
 ## Inspecting images
 
 ```bash
