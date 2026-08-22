@@ -337,8 +337,19 @@ Use one of these instead:
 
 ```bash
 DOTNET_ReadyToRunLogFile=$PWD/r2r.log <run command>
-grep -c "initialized successfully" r2r.log   # >0 means R2R images were really loaded
-grep -c "header not found"          r2r.log   # >0 is expected for assemblies you did not crossgen
+# NOTE the glob: the runtime appends ".<pid>" to the name you supply, so the file is
+# r2r.log.<pid> and never r2r.log. Grepping the bare name finds nothing and reads
+# exactly like "R2R never activated".
+grep -c "initialized successfully" r2r.log.*   # >0 means R2R images were really loaded
+grep -c "header not found"          r2r.log.*   # >0 is expected for assemblies you did not crossgen
+```
+
+Expected output looks like this — one line per assembly, naming which images actually initialized:
+
+```
+Ready to Run initialized successfully: "System.Private.CoreLib".
+Ready to Run header not found: "Hello".
+Ready to Run initialized successfully: "System.Console".
 ```
 
 A live debugger tracepoint on an R2R'd method is equally conclusive.
