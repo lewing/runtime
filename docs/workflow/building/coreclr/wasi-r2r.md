@@ -459,6 +459,11 @@ writing anything that inspects a wasm R2R image, make this an explicit question:
 space is this value in, and is it the same space the runtime uses?** A value that "looks like an RVA"
 on wasm usually is not one.
 
+The first row was later settled against a live browser host: registration happens post-relocation and
+`MinFunctionTableIndex` is non-zero, so the image's pre-relocation value and the runtime's absolute
+one are both correct in their own space. See [Reading live runtime state](#reading-live-runtime-state)
+for how that was measured — and for why a static argument was not enough to close it.
+
 ## Inspecting images
 
 ```bash
@@ -472,6 +477,44 @@ For live debugging of a trapping `call_indirect`, arm a pre-trap breakpoint at t
 rather than relying on an exception pause — the host wrapper catches and rethrows, so the trap never
 surfaces as uncaught. When handing a `.wasm` fixture to another session for debugging, tag it with
 its `sha256sum`; ambiguity between similarly named rigs has cost real debugging time.
+
+### Reading live runtime state
+
+Some questions can only be answered against a running host — anything involving relocation, or any
+field the image never contains. `corerun.wasm` is fully stripped (no symbols, no DWARF), so this is
+raw memory reading, and it has three sharp edges.
+
+**Give yourself a pause point.** A probe that runs to completion gives you nothing, and one that
+spins gives you nothing either, because a running target has no stop to decode. Make the probe idle
+in a loop that throws periodically, then attach with pause-on-exceptions armed:
+
+```csharp
+System.Console.WriteLine("PROBE-READY");
+long n = 0;
+while (true) { if (++n % 5000000 == 0) { try { throw new System.Exception("tick"); } catch { } } }
+```
+
+Attaching with exception pauses *disabled* leaves you connected to a target you can never stop —
+the reads all fail with "session is running", which reads like a tooling problem and is not one.
+
+**Expect roughly one read per connection.** The inspector transport drops shortly after the first
+successful read. The process usually survives it: re-query `/json/list`, reconnect to the same
+endpoint, and continue to the next tick. Budget reads accordingly and treat each one as the only
+one you will get.
+
+**Read wide, and read something that can disagree with you.** The failure mode here is not a read
+that errors — it is a read at a *wrong address* that returns plausible, well-formed bytes. Landing
+precisely on a struct gives you no way to detect that; reading a window around it, and checking a
+field whose value you established beforehand, does. A composite's `NumRuntimeFunctions` is a good
+anchor: it is large, specific, and known from the image, so a correct read reproduces it exactly and
+an incorrect one cannot. Derive offsets offline from the captured window rather than issuing more
+reads.
+
+This is how the browser `MinFunctionTableIndex` question was settled. Registration is **not**
+0-based: a browser composite registers its range post-relocation, at `tableBase + n`, with
+`MinFunctionTableIndex` non-zero. The value itself is per-run — browser `tableBase` is
+`wasmTable.length` at instantiation — so it is a shape to assert on, never a constant to bake into
+a fixture.
 
 ### Getting diagnostics out of crossgen2
 
