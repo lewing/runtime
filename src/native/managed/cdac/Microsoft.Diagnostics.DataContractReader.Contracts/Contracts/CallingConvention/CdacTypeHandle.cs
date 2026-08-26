@@ -260,7 +260,7 @@ internal readonly struct CdacTypeHandle : Internal.CallingConvention.ITypeHandle
     // interpreter ArgIterator; the crossgen type system under-reports their field alignment as
     // 8, so the shared ArgIterator relies on this predicate instead of GetFieldAlignment.
     public bool RequiresAlign16OnWasm()
-        => _typeHandle is not null && Rts.GetVectorElementSize(_typeHandle) == 16;
+        => ExactTypeHandle is not null && Rts.GetVectorElementSize(ExactTypeHandle) == 16;
 
     /// <summary>
     /// Maps cDAC CorElementType (short names like I4) to the shared CorElementType
