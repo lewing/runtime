@@ -473,6 +473,24 @@ different quantities. Two consequences worth internalising before capturing anyt
   invariants — the runtime-function count, the `IsVirtualIP` predicate, or a behavioural check that
   the lookup resolves a known virtual IP to the expected module.
 
+**9. A search that returns only artifacts you wrote has tested your filter, not the repo.**
+A repo-wide `grep` for `WasmEnableFrameworkR2R` — restricted to `*.cs`, `*.csproj`, `*.targets`,
+`*.props`, `*.md` — returned exactly one hit: this page. The property is real and defaults `true`;
+it lives in
+[`Microsoft.NETCore.App.Runtime.CoreCLR.sfxproj`](../../../../src/installer/pkg/sfx/Microsoft.NETCore.App/Microsoft.NETCore.App.Runtime.CoreCLR.sfxproj),
+and `*.sfxproj` was not in the include list. The near-miss conclusion was "this property is
+fictional, the claim is wrong."
+
+The defect is structural, not careless: such a search **can confirm a symbol exists but cannot
+discover that its own filter excluded the file**, so it has only one reachable failure mode. That is
+the same defect as an unanchored memory read — see
+[Reading live runtime state](#reading-live-runtime-state). This repo has an unusually long tail of
+project extensions (`.sfxproj`, `.pkgproj`, `.ilproj`, `.builds`, `.proj`), so the filter is the
+likeliest thing to be wrong.
+
+When a search comes back matching only documentation you authored, re-run it unfiltered before
+concluding absence. Confirming absence needs a search that could have found the thing.
+
 ## The coordinate-space trap
 
 Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
