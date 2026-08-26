@@ -389,6 +389,26 @@ Ready to Run initialized successfully: "System.Console".
 
 A live debugger tracepoint on an R2R'd method is equally conclusive.
 
+**A useful control, cheaper than either:** run the same image twice with `DOTNET_ReadyToRun=1` and
+`=0`, both with `DOTNET_ReadyToRunLogFile` set. In the spliced-`corerun`-plus-external-stubs layout
+the variable *is* live — `=0` writes `Ready to Run not enabled.` and nothing else, while `=1` writes
+the per-assembly lines — even though program output is byte-identical across the pair. That pins the
+log to the R2R state rather than to the run. Note this does **not** contradict trap 2 below: the gate
+applies to the external per-assembly stubs, which this layout loads from `comp/` on disk.
+
+> **Corrupting the image does not transfer from browser to spliced WASI.** Damaging ~16 KB of a
+> *standalone* composite is a good check — the browser instantiates it as its own wasm module, so a
+> mangled body length fails module decode and the run flips (exit 42 → exit 1). After the WASI splice
+> the composite is no longer a module: `wasm-merge` puts its native code into `corerun`'s **code**
+> section and its webcil metadata into the **data** section. Random damage to the data section is then
+> only observable if the app happens to read those exact bytes, and a small program reads almost none
+> of a multi-megabyte composite. Two separate 16 KB corruptions of a spliced image — one at the file
+> midpoint, one inside the data section — both still printed the expected output and still logged four
+> `initialized successfully` lines. Worse, the file-midpoint attempt landed between the data section
+> and the trailing code section, in a custom section wasmtime ignores, so it could not have failed at
+> all. If you corrupt a spliced image, first locate the section you are hitting
+> (`wasm-tools objdump`) — and treat a null result as "I missed", not as evidence about R2R.
+
 The third option is the most useful when bisecting a fix: **run an arm that is known to fail inside
 the R2R load path** — for example, a build without the fix whose absence asserts in
 `NativeImage::Open` — and confirm it does fail. That assert can only fire if the composite was

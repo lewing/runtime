@@ -36,11 +36,40 @@ does not work. This README only covers the tools in this directory.
 
 ## Is the splice still needed?
 
-Maybe not. [#131016](https://github.com/dotnet/runtime/pull/131016) added VM-side loading of a flat
-webcil composite image, so deploying the `crossgen2` composite output directly — with no splice step
-— may already work. **Try the direct deployment first** and fall back to `pipeline-sym.sh` only if
-the VM refuses to load the image. The splice path is kept here because it is the recipe that is
-recorded end-to-end verified.
+**Yes, for WASI.** [#131016](https://github.com/dotnet/runtime/pull/131016) added VM-side loading of a
+flat webcil composite, and that code is present — `NativeImage::Open` has a `TARGET_WASM` branch that
+takes the R2R header from the decoder instead of the `RTR_HEADER` export. But it does not make direct
+deployment work here, because the **WASI host probe never serves the composite from disk**:
+`WasiStaticR2RProbe` ([`wasi_r2r_probe.hpp`](../../src/coreclr/hosts/corerun/wasi_r2r_probe.hpp))
+special-cases `composite-r2r.wasm` and returns the baked-in `g_wasi_r2r_image` buffer, which only the
+splice populates. Per-assembly stubs *are* read from `comp/<name>.wasm` on disk; the composite is not.
+
+Measured on a stock (unspliced) `corerun` with the composite deployed alongside — both in the run root
+and colocated in `comp/` — this is what happens:
+
+1. `g_wasi_r2r_image` is empty, so `WasiWebcilPayloadSize` returns `<= 0` and the probe returns `false`.
+2. `OpenR2RFromPE` falls through to `PEImageLayout::LoadNative`, which reads the raw file.
+3. The file begins `\0asm` — it is webcil *wrapped in wasm* — so `WebcilDecoder::DetectWebcilFormat`,
+   which tests for the ASCII bytes `WbIL`, returns false.
+4. `InitDecoders` therefore selects `FORMAT_PE` and runs `PEDecoder` over a wasm file.
+
+The result is **not** a graceful fallback. It is an out-of-bounds trap during EE startup:
+
+```
+0: corerun!PEDecoder::FindReadyToRunHeader() const
+1: corerun!NativeImage::Open(...)
+2: corerun!AssemblyBinder::LoadNativeImage(...)
+3: corerun!AcquireCompositeImage(...)
+4: corerun!ReadyToRunInfo::Initialize(...)
+...
+memory fault at wasm address 0x6541cc8b in linear memory of size 0x8000000
+wasm trap: out of bounds memory access
+```
+
+That backtrace is the signature of this deployment gap. It looks like a broken composite and reads
+like "R2R does not work on wasm"; it is neither. Gate it with `DOTNET_ReadyToRun=0` — if the app then
+runs clean, the composite was simply never delivered to the runtime, and you need the splice.
+
 
 ## Usage
 
