@@ -11,11 +11,17 @@
 
 This page documents the hand-driven flow for building, compiling, and running a **composite R2R
 image on CoreCLR/WASI**: you invoke `crossgen2` directly, deploy into a flat directory, and run under
-`wasmtime`. There is no app-level `PublishReadyToRun` switch for wasm, though `src/tests` does have
-composite plumbing — see
-[Building a composite through the runtime test infrastructure](#building-a-composite-through-the-runtime-test-infrastructure).
+`wasmtime`. There is no app-level `PublishReadyToRun` switch for WASI composite images — see
+[Building a composite through the runtime test infrastructure](#building-a-composite-through-the-runtime-test-infrastructure)
+for the test-infra path.
 
-> **Claims here were last verified against `origin/main` on 2026-08-19.** This area moves quickly and
+> **Browser R2R now has SDK support.** [#132339](https://github.com/dotnet/runtime/pull/132339)
+> (merged 2026-08-25) enabled `PublishReadyToRun` for browser-wasm, shipping prebuilt framework R2R
+> images in the runtime pack and wiring user assembly R2R through the SDK targets. This path
+> supports **non-composite (per-assembly) images only** — composite images are explicitly out of
+> scope and still require the hand-splice pipeline documented here.
+
+> **Claims here were last verified against `origin/main` on 2026-08-26.** This area moves quickly and
 > several statements below were true when written and false within weeks. Anything asserting that
 > something is *impossible* or *not plumbed* deserves a fresh check before you rely on it — the
 > commands and diagnostics age far better than the gap analysis.
@@ -656,16 +662,22 @@ whose output happens to be correct.
 
 ## In flight
 
-Open work that will change what this page says. Checked 2026-08-19 — re-check before relying on any
+Open work that will change what this page says. Checked 2026-08-26 — re-check before relying on any
 gap described here.
 
 | PR | | What it changes |
 | --- | --- | --- |
-| [#132339](https://github.com/dotnet/runtime/pull/132339) | open | **Enable ReadyToRun for CoreCLR browser-wasm.** Productizes browser R2R: ships prebuilt framework R2R images in the runtime pack, adds `WasmEnableFrameworkR2R`, wires `PublishReadyToRun` through the SDK targets, and compiles CoreLib with `--inputbubble`. Non-composite (per-assembly) only; composite explicitly out of scope. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). This closes most of the [runtime-pack gap](#what-is-not-plumbed-the-runtime-packs-r2r-corelib) below. |
 | [#132650](https://github.com/dotnet/runtime/pull/132650) | open | **Makes wasm composite images inspectable by R2RDump.** Until this merges, R2RDump rejects a wasm composite outright — see [Inspecting images](#inspecting-images). |
-| [#132528](https://github.com/dotnet/runtime/pull/132528) | open | Adds the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 carries. |
 | [#131877](https://github.com/dotnet/runtime/pull/131877) | draft | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
 | [#131402](https://github.com/dotnet/runtime/pull/131402) | draft | Narrower alternative to #131374 for the GC-locals-across-safepoint bug — same family as the shadow-stack spill work. |
+
+### Recently merged
+
+| PR | Merged | What it changed |
+| --- | --- | --- |
+| [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productized browser R2R: ships prebuilt framework R2R images in the runtime pack, adds `WasmEnableFrameworkR2R`, wires `PublishReadyToRun` through the SDK targets, and compiles CoreLib with `--inputbubble`. **Non-composite (per-assembly) only; composite explicitly out of scope** — the hand-splice pipeline (`eng/wasi-r2r/`) is still required for composite images. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
+| [#132528](https://github.com/dotnet/runtime/pull/132528) | 2026-08-25 | Added the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 needed. |
+| [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-18 | Fixed WASM R2R virtual IP initialization. |
 
 Related open issues:
 
