@@ -246,6 +246,35 @@ rather than buffered.
 A flat directory driven by `corerun.js` remains the layout used for hand-driven R2R work, and is what
 the runtime test infrastructure drives.
 
+### Browser R2R via the SDK
+
+[#132339](https://github.com/dotnet/runtime/pull/132339) (merged 2026-08-25) added a supported,
+non-composite browser R2R path. It introduced **two knobs that are easy to confuse** — they operate
+at different stages and only one is app-facing:
+
+| Knob | Where | Default | What it does |
+| --- | --- | --- | --- |
+| `WasmEnableFrameworkR2R` | [`Microsoft.NETCore.App.Runtime.CoreCLR.sfxproj`](../../../../src/installer/pkg/sfx/Microsoft.NETCore.App/Microsoft.NETCore.App.Runtime.CoreCLR.sfxproj) | **`true`** | *Runtime-build* knob. Crossgens each shared-framework assembly to a webcil-in-wasm image into the runtime pack's `native/r2r/`, **keeping the IL in `lib/`**. Not something an app sets. |
+| `PublishReadyToRun` | mainline SDK, routed by [`Microsoft.NET.Sdk.WebAssembly.Browser.CoreCLR.targets`](../../../../src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.CoreCLR.targets) | **off** | *App-facing* knob. The default-on block is present but **commented out** pending [#132466](https://github.com/dotnet/runtime/issues/132466), so browser R2R is opt-in: pass `-p:PublishReadyToRun=true`. |
+
+Consequences worth knowing before you build:
+
+- **Composite is hard-errored, not merely unimplemented.** `_WasmCoreClrSelectR2RDirectories` raises
+  *"PublishReadyToRunComposite is not supported for CoreCLR browser-wasm; only non-composite
+  (per-assembly) R2R images are supported."* The hand-splice pipeline in
+  [`eng/wasi-r2r/`](../../../../eng/wasi-r2r/README.md) remains the only route to a composite image.
+- **The container format must be `wasm`.** net11+ defaults `PublishReadyToRunContainerFormat` to `pe`,
+  which is unloadable on wasm; the targets silently rewrite an unset-or-`pe` value to `wasm` and
+  hard-error any other explicit value.
+- **Trimming changes which images ship.** Untrimmed apps stage the runtime pack's prebuilt
+  `native/r2r/` images; `PublishTrimmed=true` crossgens the *whole* closure including
+  `System.Private.CoreLib`, because every image pins the trimmed CoreLib/BCL MVID and mixing in the
+  untrimmed pack CoreLib trips the runtime's R2R MVID check.
+- **The cross-module flag is `--opt-cross-module:*`, not `--inputbubble`.** Both
+  [`crossgen-corelib.proj`](../../../../src/coreclr/crossgen-corelib.proj) and the browser targets use
+  the former. If you are matching a hand-driven crossgen2 invocation against what the product build
+  does, compare against that flag.
+
 Several related consequences:
 
 - **There is no bundle scenario to test on browser.** `AssemblyProbeExtension::Probe`
@@ -675,7 +704,7 @@ gap described here.
 
 | PR | Merged | What it changed |
 | --- | --- | --- |
-| [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productized browser R2R: ships prebuilt framework R2R images in the runtime pack, adds `WasmEnableFrameworkR2R`, wires `PublishReadyToRun` through the SDK targets, and compiles CoreLib with `--inputbubble`. **Non-composite (per-assembly) only; composite explicitly out of scope** — the hand-splice pipeline (`eng/wasi-r2r/`) is still required for composite images. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
+| [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productized browser R2R — see [Browser R2R via the SDK](#browser-r2r-via-the-sdk) for the two knobs it added and how they differ. **Non-composite (per-assembly) only; composite is hard-errored** — the hand-splice pipeline (`eng/wasi-r2r/`) is still required for composite images. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
 | [#132528](https://github.com/dotnet/runtime/pull/132528) | 2026-08-25 | Added the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 needed. |
 | [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-18 | Fixed WASM R2R virtual IP initialization. |
 
