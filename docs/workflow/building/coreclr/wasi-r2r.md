@@ -591,6 +591,29 @@ rather than a stale artifact, and it is reached only after a publish that report
 is not your project: build the in-tree `console-v8` sample with `/p:RuntimeFlavor=CoreCLR` — it fails
 identically.
 
+**12. An invalid wasm type can be present with no function referencing it — audit the type section,
+not the emitted functions.**
+Found while fixing [#132855](https://github.com/dotnet/runtime/issues/132855). Declining to compile
+a method removes its *code*, but the `WasmTypeNode` dependency is marked by
+`ObjectNode.GetStaticDependencies` for every method code node **unconditionally**. A declined method
+publishes empty code and is skipped at emission via
+`MethodWithGCInfo.ShouldSkipEmittingObjectNode => IsEmpty` — yet its functype has already been
+marked, so it still lands in the type section, now referenced by **nothing**. Engines validate the
+type section independently of use, so the module is still rejected and the assembly still falls back
+to interpreted.
+
+Two consequences:
+
+- **A scan that walks emitted functions cannot find this.** `WebcilImageReader.WasmFunctionInfo.ParamTypes`
+  and anything else function-oriented will report clean while the module is unloadable. The audit has
+  to decode the **type section** directly. This applies to every limit in the family — results (1000),
+  locals (50 000), `br_table` (65 520) — so write the checker against the type/code sections once.
+- **It is why a "should never happen" hard error earns its place.** In that fix, guards that declined
+  the method and its callers were *individually correct* and *collectively insufficient*; the build
+  still produced a bad image. The last-line-of-defense throw is what surfaced it, by breaking the
+  build instead of silently reproducing the original failure. Had it been a warning, the fix would
+  have verified as "no change" and looked like a wrong diagnosis rather than an incomplete one.
+
 ## The coordinate-space trap
 
 Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
