@@ -1,9 +1,16 @@
 # WASI composite-R2R splice tooling
 
 Tooling for building, splicing, and running a **composite ReadyToRun image on CoreCLR/WASI**.
-It exists because there is no `PublishReadyToRun` / WasmAppBuilder path for wasm R2R today —
-the working flow is entirely hand-driven: run `crossgen2` directly, then deploy (or splice) the
-result and run it under `wasmtime`.
+It exists because WASI has no productised R2R path: the working flow is hand-driven — run
+`crossgen2` directly, splice the result into `corerun`, and run it under `wasmtime`.
+
+Scope note, since this is easy to over-read: **the splice is a WASI requirement, not a composite
+requirement.** `WasiStaticR2RProbe` serves `composite-r2r.wasm` only from a baked-in buffer that the
+splice populates, so on WASI there is no way to hand the runtime a composite from disk. Browser has
+no such constraint — `crossgen2 --composite --targetos:browser` plus a flat directory driven by
+`corerun.js` works without any of this tooling. Browser also has a productised **non-composite** path
+since [#132339](https://github.com/dotnet/runtime/pull/132339) (`-p:PublishReadyToRun=true`); that
+path declines composite, but only as an SDK opt-out.
 
 **Read [`docs/workflow/building/coreclr/wasi-r2r.md`](../../docs/workflow/building/coreclr/wasi-r2r.md) first.**
 That is the full playbook: build commands, crossgen2 invocations, run commands, and — most

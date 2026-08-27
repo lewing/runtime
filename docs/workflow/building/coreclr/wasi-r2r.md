@@ -273,8 +273,19 @@ Consequences worth knowing before you build:
   and what the durable cDAC fixture is.
 
   So the accurate statement is narrow: **#132339 productised the non-composite path and declined to
-  productise composite.** Composite still requires driving `crossgen2` yourself — which is what
-  [`eng/wasi-r2r/`](../../../../eng/wasi-r2r/README.md) exists for — and continues to work.
+  productise composite.** Composite still requires driving `crossgen2` yourself, and continues to work.
+
+  Note this is **not** a reason to reach for [`eng/wasi-r2r/`](../../../../eng/wasi-r2r/README.md):
+  browser composite needs no splice. There are three distinct paths, and conflating them is what
+  produced the wrong claim above:
+
+  | path | composite? |
+  | --- | --- |
+  | Browser, SDK publish (`PublishReadyToRun=true`) | **refused** — the property guard above |
+  | Browser, direct `crossgen2 --composite --targetos:browser` | **works**, loaded by `corerun.js` from a flat directory — no splice |
+  | **WASI** | **splice genuinely required** — `WasiStaticR2RProbe` serves `composite-r2r.wasm` *only* from the baked-in buffer; disk is never consulted for it |
+
+  The splice is a WASI host-probe consequence, not a composite consequence.
 - **The container format must be `wasm`.** net11+ defaults `PublishReadyToRunContainerFormat` to `pe`,
   which is unloadable on wasm; the targets silently rewrite an unset-or-`pe` value to `wasm` and
   reject any other explicit value.
