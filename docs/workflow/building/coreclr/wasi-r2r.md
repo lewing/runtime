@@ -511,6 +511,49 @@ likeliest thing to be wrong.
 When a search comes back matching only documentation you authored, re-run it unfiltered before
 concluding absence. Confirming absence needs a search that could have found the thing.
 
+**10. A breakpoint that does not fire is only evidence if you can show it was watching.**
+This is the subtler sibling of trap 9: the check is well designed, and defeated by ambient state
+rather than by its own shape. Under CDP against a node/browser target the inspector connection drops
+readily — `Debugger ending` in stderr, and V8 discards breakpoints with the session — so a *miss* can
+mean "the method never ran" or "nothing was armed at the time", and the two are indistinguishable
+after the fact. One `wasm_cdp_wait_pause` in a measured run reported `exited` while the target was
+demonstrably still printing heartbeats.
+
+A **hit** does not have this problem: it is self-validating, because arriving at the breakpoint
+proves both that it was armed and that the code executed. So structure dispatch questions to be
+answered by a hit:
+
+- **Pair the target with a control.** Arm something the workload calls unconditionally (a
+  `Console.WriteLine` on a heartbeat is ideal, since stderr independently shows it happening). A hit
+  on the control plus a miss on the target is informative; a miss on both is unmeasured.
+- **Or remove the breakpoint from the loop entirely.** Throw a marker exception in the *same frame*
+  as the call under test and connect with `pause_on_exceptions='all'`. You either get a pause or you
+  do not — there is no silent arming state — and `wasm_cdp_stack` then names the frame that executed
+  the call site, with `r2r_managed_name` when it is R2R. This is the exception-driven form of the
+  frame-annotation proof in
+  [Proving R2R is actually active](#proving-r2r-is-actually-active), and it is the more robust one
+  when the transport is unreliable.
+
+Note also that a miss can have a mundane cause that is neither: an overload you did not arm (this
+page's own `Enum.ToObject` probe had **six** R2R overloads and only two were armed), or a callee
+inlined into its caller under `--opt-cross-module:*`, so the standalone function is never entered.
+
+**11. `artifacts/obj/mono/<sample>/` survives a project-local clean.**
+For browser samples, `rm -rf bin obj` in the project directory does **not** clear the intermediate.
+A stale one makes `GenerateWasmBootJson` skip regeneration — the signature line is:
+
+```
+Skipping artifact updated because artifact version '<hash>' has not changed.
+```
+
+— and ship an **empty** boot config (`coreAssembly: 0, assembly: 0`), so the app dies at startup with
+`Loader configuration error: 'mainAssemblyName' is required.` That reads as a broken project file
+rather than a stale artifact, and it is reached only after a publish that reports success.
+
+`binlog_task_details` on the `GenerateWasmBootJson` task is what surfaces it. The check that shows it
+is not your project: build the in-tree `console-v8` sample with `/p:RuntimeFlavor=CoreCLR` — it fails
+identically.
+
 ## The coordinate-space trap
 
 Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
