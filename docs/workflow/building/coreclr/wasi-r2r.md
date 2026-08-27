@@ -396,6 +396,20 @@ the per-assembly lines — even though program output is byte-identical across t
 log to the R2R state rather than to the run. Note this does **not** contradict trap 2 below: the gate
 applies to the external per-assembly stubs, which this layout loads from `comp/` on disk.
 
+> **A deployment mistake produces a green run, not a failure — measured.** A browser composite whose
+> per-assembly stubs were placed in `comp/` (the WASI layout) instead of flat beside the app (what
+> `libCorerun.js` probes for) ran to completion with **byte-identical output** to the correct
+> deployment — same lines, same `failures=0` — while `r2r.log.*` recorded
+> `Ready to Run header not found` for *every* assembly. The entire run was interpreted. Copying the
+> stubs alongside, with no other change, flipped the log to `initialized successfully` for each.
+>
+> Both layouts are documented on this page, each in its own host's section. That did not prevent the
+> mistake, because what gets copied from a page is the run recipe, not the prose two sections away.
+> So the durable form of the lesson is not the layout rule but its consequence: **a green result from
+> a deployment you have not proven active is worth nothing**, and layout is only one of several ways
+> to lose activation silently. Run the log check *especially* when the output already says what you
+> were hoping for — that is precisely when it is least likely to be run.
+
 > **Corrupting the image does not transfer from browser to spliced WASI.** Damaging ~16 KB of a
 > *standalone* composite is a good check — the browser instantiates it as its own wasm module, so a
 > mangled body length fails module decode and the run flips (exit 42 → exit 1). After the WASI splice
