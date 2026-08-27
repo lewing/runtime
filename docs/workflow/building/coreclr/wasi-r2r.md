@@ -850,9 +850,35 @@ Related open issues:
   cache.** The original symptom, `RoundtripValues<Int128>(-1)` failing with
   `Expected: -1  Actual: -1` — values rendering identically but comparing unequal — accounted for 25
   of the 39 residual `System.Text.Json` failures.
-- Browser only: `Enum.ToObject`'s virtual dispatch to `GetTypeCodeImpl()` traps on a `call_indirect`
-  return-type mismatch (expected `void`, actual `i32`). WASI dispatches the identical call cleanly on
-  the same codegen; the suspected cause is emscripten-side R2R/interpreter thunk resolution.
+- Browser: `System.Enum.ToObject` traps on a `call_indirect` type mismatch. Established at a live
+  pre-trap pause in the originating investigation (session `50ddfb2c`, 2026-07-25):
+
+  - the trapping frame is **`func 980 = System.Enum.ToObject`**, instruction
+    **`call_indirect (type 62)`** through an R2R import cell;
+  - it resolves through **`WasmR2RToInterpreterThunk`** — the same thunk as the startup mismatch
+    that [#131167](https://github.com/dotnet/runtime/pull/131167) fixed, and the same `type 62`;
+  - the call site is in the **composite** and the thunk is in the **host** module, so it is a
+    cross-module `call_indirect`;
+  - it fires during **execution**, in `System.Text.Json` type-info/property reflection, reached
+    under **reflection-invoke of an `async` method** (`MethodBaseInvoker.InterpretedInvoke`,
+    `AsyncTaskMethodBuilder.Start` were on the stack);
+  - the `br_table` following the `call_indirect` matches a `Type.GetTypeCode(...) switch { … }`
+    shape, i.e. a TypeCode dispatch;
+  - WASI ran the same suite and the same test area cleanly (12166/12166 discovered, 0 signature
+    mismatches).
+
+  **The expected-vs-actual signature decode was never obtained.** That session tried repeatedly and
+  the target raced to exit each time; it records the decode as still-open. An earlier revision of
+  this page stated the mismatch as *"expected `void`, actual `i32`"* — **that pairing appears
+  nowhere in the source material and should not be relied on.** Treat the expected type as
+  `type 62`, unresolved, and the actual callee as unknown.
+
+  Reproduction status is likewise open. A synthetic probe calling `Enum.ToObject` directly does
+  **not** reproduce it — that is a different dispatch shape from the reported one and its passing
+  proves nothing. The faithful instrument is the `System.Text.Json` suite over an R2R image, which
+  is currently blocked by
+  [#132855](https://github.com/dotnet/runtime/issues/132855) (a 1000-param functype in the test
+  assembly makes its R2R image unloadable). Fixing that unblocks this.
 - `src/tasks/WasmAppBuilder/coreclr/SignatureMapper.cs` — `TokenToSlotCount` returns 1 for any token
   not starting with `S`/`A`, so a `V` (v128) token appears to count as one 8-byte slot rather than
   two. Flagged as latent before #131492 reworked this encoding (which added the `l2`/`V2` alignment-
