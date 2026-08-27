@@ -259,13 +259,25 @@ at different stages and only one is app-facing:
 
 Consequences worth knowing before you build:
 
-- **Composite is hard-errored, not merely unimplemented.** `_WasmCoreClrSelectR2RDirectories` raises
-  *"PublishReadyToRunComposite is not supported for CoreCLR browser-wasm; only non-composite
-  (per-assembly) R2R images are supported."* The hand-splice pipeline in
-  [`eng/wasi-r2r/`](../../../../eng/wasi-r2r/README.md) remains the only route to a composite image.
+- **Composite is refused by the SDK path — but that is an SDK opt-out, not a platform limit.**
+  `_WasmCoreClrSelectR2RDirectories` raises *"PublishReadyToRunComposite is not supported for CoreCLR
+  browser-wasm; only non-composite (per-assembly) R2R images are supported."* Note the condition:
+  the check is gated on `PublishReadyToRun == true`, so it fires **only inside the SDK publish
+  pipeline**. It says nothing about crossgen2 or the runtime.
+
+  **Hand-driven browser composite works.** `crossgen2 --composite --targetos:browser` emits one, and
+  `corerun.js` loads and runs it with R2R active — measured, with per-assembly `initialized
+  successfully` lines, on a 5-input composite (`sha256 575bb6c5…`) built from this tree. Browser
+  composite is also what the `src/tests` `CompositeBuildMode` path has long produced (see
+  [Building a composite through the runtime test infrastructure](#building-a-composite-through-the-runtime-test-infrastructure)),
+  and what the durable cDAC fixture is.
+
+  So the accurate statement is narrow: **#132339 productised the non-composite path and declined to
+  productise composite.** Composite still requires driving `crossgen2` yourself — which is what
+  [`eng/wasi-r2r/`](../../../../eng/wasi-r2r/README.md) exists for — and continues to work.
 - **The container format must be `wasm`.** net11+ defaults `PublishReadyToRunContainerFormat` to `pe`,
   which is unloadable on wasm; the targets silently rewrite an unset-or-`pe` value to `wasm` and
-  hard-error any other explicit value.
+  reject any other explicit value.
 - **Trimming changes which images ship.** Untrimmed apps stage the runtime pack's prebuilt
   `native/r2r/` images; `PublishTrimmed=true` crossgens the *whole* closure including
   `System.Private.CoreLib`, because every image pins the trimmed CoreLib/BCL MVID and mixing in the
@@ -799,7 +811,7 @@ gap described here.
 
 | PR | Merged | What it changed |
 | --- | --- | --- |
-| [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productized browser R2R — see [Browser R2R via the SDK](#browser-r2r-via-the-sdk) for the two knobs it added and how they differ. **Non-composite (per-assembly) only; composite is hard-errored** — the hand-splice pipeline (`eng/wasi-r2r/`) is still required for composite images. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
+| [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productised the **non-composite** browser path — see [Browser R2R via the SDK](#browser-r2r-via-the-sdk) for the two knobs it added and how they differ. It declined to productise composite (the SDK path errors on `PublishReadyToRunComposite`), but that is an **SDK opt-out, not a platform limit**: hand-driven `crossgen2 --composite --targetos:browser` works and has for months. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
 | [#132528](https://github.com/dotnet/runtime/pull/132528) | 2026-08-25 | Added the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 needed. |
 | [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-18 | Fixed WASM R2R virtual IP initialization. |
 

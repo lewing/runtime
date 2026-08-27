@@ -24,11 +24,14 @@ The essentials, so they are never lost again:
   with [`eng/wasi-r2r/pipeline-sym.sh`](../../eng/wasi-r2r/README.md). The WASI host probe serves the
   composite from a baked-in buffer that only the splice populates, so deploying a composite next to a
   stock `corerun` does not work — it traps out of bounds inside `ReadyToRunInfo::Initialize`.
-- For **browser, non-composite only**, [#132339](https://github.com/dotnet/runtime/pull/132339)
-  (merged 2026-08-25) added a supported SDK path: build with `-p:PublishReadyToRun=true`. Composite is
-  hard-errored there. The runtime pack's prebuilt framework R2R images are governed by a separate
-  build-time knob, `WasmEnableFrameworkR2R` (defaults `true`, in the CoreCLR `sfxproj`) — do not
-  confuse the two.
+- For **browser**, [#132339](https://github.com/dotnet/runtime/pull/132339) (merged 2026-08-25) added
+  a supported SDK path for **non-composite** images: build with `-p:PublishReadyToRun=true`. That path
+  refuses composite (`PublishReadyToRunComposite` raises an error), but the check is gated on
+  `PublishReadyToRun`, so it is an **SDK opt-out, not a platform limit** — hand-driven
+  `crossgen2 --composite --targetos:browser` works, `corerun.js` loads it with R2R active, and that is
+  what the `src/tests` `CompositeBuildMode` path has long produced. The runtime pack's prebuilt
+  framework R2R images are governed by a separate build-time knob, `WasmEnableFrameworkR2R` (defaults
+  `true`, in the CoreCLR `sfxproj`) — do not confuse the two.
 - Take `System.Private.CoreLib.dll` from `artifacts/bin/coreclr/wasi.wasm.<config>/IL/`. The copy in
   the wasi-wasm runtime pack's `native/` directory is Mono's and silently breaks everything.
 - The run directory needs the **full** framework IL closure. A missing assembly manifests as an
