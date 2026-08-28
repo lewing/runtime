@@ -793,6 +793,55 @@ In the unmerged composite that same segment is active against an imported global
 (`init global.get <webcil.__table_base>`), so the offset is not a constant and any reader that
 demands one will break on the image that works today. A correct reader needs both cases.
 
+### `minFunctionTableIndex` is module-relative, and is not the table base
+
+The neighbouring hazard, because it is the other word a reader reaches for. After the RuntimeFunctions
+section data crossgen2 emits a `0xFFFFFFFF` sentinel followed by the min function table index
+(`RuntimeFunctionsTableNode.cs`), and the runtime reads it verbatim:
+
+```cpp
+DWORD* pSentinel = (DWORD*)&m_pRuntimeFunctions[m_nRuntimeFunctions];
+_ASSERTE(*pSentinel == 0xFFFFFFFF);
+m_minFunctionTableIndex = *(pSentinel + 1);      // readytoruninfo.cpp
+```
+
+It is emitted as a `WASM_TABLE_INDEX_I32` reloc to the *first compiled method*, so it answers "where
+does compiled code start **within this module's own range**" — not "where does the module's range
+start in the table". Nothing adds a base to it: registration passes it through unchanged and lookups
+do `functionIndex - minFunctionTableIndex`, so the whole computation stays module-relative.
+
+On a composite it is legitimately **0**, because the R2R functions occupy the segment from its start.
+Measured on a 181-assembly WASI composite, before and after the merge:
+
+| | pre-merge | merged |
+| --- | --- | --- |
+| sentinel | `0xFFFFFFFF` valid | `0xFFFFFFFF` valid |
+| `minFunctionTableIndex` | 0 | 0 |
+| webcil `TableBase` | 0 | 0 |
+| element segment offset | `global.get __table_base` | `i32.const 1` |
+
+So a reader can find **two** header words that both read zero and are both correct, while the only
+absolute quantity in the image is the element segment's offset. Validating the sentinel does not
+protect you here — the trailer is present and valid, and the zero is real. Do not treat a zero as
+evidence of a missing or defaulted value.
+
+**This is a regression boundary for external readers, and it is worth knowing about.** The retired
+nesm-based splicer patched the header itself, at splice time:
+
+```csharp
+// activate: convert the passive payload to ACTIVE at imageBase
+data[28] = (byte)(tableBase & 0xFF); ...      // "what getWebcilPayload does"
+m.Elements[elemIdx] = new Element{ TableIndex = 0, OffsetExpr = I32ConstExpr(tableBase), ... };
+```
+
+so images it produced carried a **non-zero** `TableBase` that agreed with the element segment offset,
+and a static reader could take either. The shim pipeline deliberately does not do this — offset 28 is
+now a runtime responsibility, patched by the host that maps the image. Both designs are correct, but
+they differ in what a static reader can rely on, and a tool written against the old artifacts will
+silently produce an off-by-`tableBase` mapping on the new ones without any structural change to warn
+it. If external tooling disagrees with the runtime about which function is which, check which
+generation of splice produced the image it was validated against.
+
 ## Inspecting images
 
 ```bash
