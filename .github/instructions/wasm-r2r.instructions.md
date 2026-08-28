@@ -42,6 +42,12 @@ The essentials, so they are never lost again:
   globbing `r2r.log.*` — the runtime appends `.<pid>`. The strongest proof is a breakpoint on the
   R2R function itself (find it with nesm's `wasm_debug_search_functions`, which reports
   `r2r_managed_name`): if it is hit, R2R native code ran, and total fallback would mean no hit.
+- **`Ready to Run initialized successfully` is bounded evidence.** It means a stub was found and its
+  owner composite loaded — not that the assembly's code is in that composite, and not that any R2R
+  code ran. Nothing validates membership, so a stub left over from an earlier composite logs success
+  against a composite that does not contain it, then dereferences a NULL core header that wasm reads
+  as stack rather than trapping. Measured, with byte-identical output either way; details and the
+  A/B/C/D control table are in the playbook. Rebuild stubs and composite together.
 - `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true` appears in most run commands and **silently disables
   the cold path in [#130634](https://github.com/dotnet/runtime/issues/130634)**, which reaches
   `Monitor.Exit` via `ResourceManager` → `CultureInfo.GetCultureInfo` → `CultureData.GetCultureData`.

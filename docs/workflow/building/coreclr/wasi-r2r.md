@@ -398,9 +398,13 @@ DOTNET_ReadyToRunLogFile=$PWD/r2r.log <run command>
 # NOTE the glob: the runtime appends ".<pid>" to the name you supply, so the file is
 # r2r.log.<pid> and never r2r.log. Grepping the bare name finds nothing and reads
 # exactly like "R2R never activated".
-grep -c "initialized successfully" r2r.log.*   # >0 means R2R images were really loaded
+grep -c "initialized successfully" r2r.log.*   # >0 means a stub was found and its composite loaded
 grep -c "header not found"          r2r.log.*   # >0 is expected for assemblies you did not crossgen
 ```
+
+Read that first line precisely: it means **a stub was found, its header parsed, and its owner composite
+loaded**. It does *not* mean the assembly's native code is in that composite, and it does not mean any
+R2R code was executed. See the bound below before treating it as a pass.
 
 Expected output looks like this — one line per assembly, naming which images actually initialized:
 
@@ -411,6 +415,48 @@ Ready to Run initialized successfully: "System.Console".
 ```
 
 A live debugger tracepoint on an R2R'd method is equally conclusive.
+
+> **What `initialized successfully` does *not* prove — measured, and it ends in a NULL dereference.**
+> The line is emitted at [`readytoruninfo.cpp:685`](../../../../src/coreclr/vm/readytoruninfo.cpp),
+> reached as soon as `AcquireCompositeImage` returns non-NULL — *before* any method entry point is
+> resolved. For a component assembly, acquisition only requires that a composite of the named file
+> exists. Nothing checks that the composite **contains** that component:
+> `AssemblyBinder::LoadNativeImage` opens it by name alone, and the MVID machinery validates only the
+> assemblies a composite *lists*, so one that is absent is never checked at all.
+>
+> Measured: a stub for `Hello` left over from an earlier composite, run against a merged composite that
+> does not contain `Hello` (confirmed absent; the five real components each appear exactly once),
+> logged `Ready to Run initialized successfully: "Hello"` and produced correct output. Deleting the
+> stale stub flipped the line to `Ready to Run header not found: "Hello"` — with **byte-identical
+> program output either way**.
+>
+> What happens next is worse than a false pass. `NativeImage::GetComponentAssemblyHeader` returns
+> `NULL` for a name not in the composite; the `ReadyToRunInfo` constructor stores that `NULL` and then
+> makes twelve unconditional `m_component.FindSection(...)` calls, and `FindSection` dereferences
+> `m_pCoreHeader->NumberOfSections` with no null check. On wasm this does not trap: `corerun` links
+> with `-Wl,-z,stack-size=8388608` and the first data segment begins at exactly `8388608`, so `[0, 8MB)`
+> is the **stack**, and the read at offset 4 returns zero only because the stack has never grown that
+> deep. Zero sections means every lookup misses, so R2R is silently unused and the run looks clean.
+>
+> These sites are original composite-R2R code (2020–2021), not wasm-specific; wasm only makes the
+> defect survivable and silent, where a native target would fault. **Consequence for anyone iterating
+> on emission: rebuild stubs and composite together.** A mixed-vintage pair is the single easiest way
+> to get a green run, a success log, and no R2R at all.
+
+**Controls, in increasing strength.** Name the expected difference *before* running, and treat "no
+difference" as a failed control rather than a pass:
+
+| | Setup | Expected |
+|---|---|---|
+| A | R2R on, composite present and correct | `initialized successfully` |
+| B | Composite renamed away | flips to `disabled - composite image not found` ([line 668](../../../../src/coreclr/vm/readytoruninfo.cpp)) |
+| C | `DOTNET_ReadyToRun=0` | `Ready to Run not enabled.` and nothing else |
+| D | Composite present but component **not a member of it** | `initialized successfully` — indistinguishable from A |
+
+B separates "composite consumed" from "composite absent". Only D exercises the gap above, and its
+expected result is *measured*, not predicted — so it is the right calibration point for any timing- or
+counter-based check: if your method cannot tell A from D, it is measuring composite presence rather
+than R2R execution.
 
 **A useful control, cheaper than either:** run the same image twice with `DOTNET_ReadyToRun=1` and
 `=0`, both with `DOTNET_ReadyToRunLogFile` set. In the spliced-`corerun`-plus-external-stubs layout
