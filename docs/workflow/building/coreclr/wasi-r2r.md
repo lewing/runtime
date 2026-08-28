@@ -1106,7 +1106,7 @@ Two host limits bind, and only one of them is ours:
   corerun by **2,329 bytes**, and the table stays fixed-size so it still validates statically.
 - **Staging buffer.** `WASI_R2R_IMAGE_CAP` is 16 MB and the framework payload is 15.2 MB — **5%
   headroom**. This will need raising before any larger closure, and the check belongs in
-  `pipeline-shim.sh`, not the host: the engine installs the segment before host code runs, so the
+  `pipeline_shim.py`, not the host: the engine installs the segment before host code runs, so the
   host's own cap test is a post-mortem.
 
 **The limit that is not ours** is the wasm `effective type size` cap of 1,000,000, which a composite
