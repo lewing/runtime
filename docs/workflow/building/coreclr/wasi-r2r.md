@@ -1112,10 +1112,11 @@ Two host limits bind, and only one of them is ours:
 **The limit that is not ours** is the wasm `effective type size` cap of 1,000,000, which a composite
 exporting every function reaches at roughly **160,000 exports** — both `wasm-tools` and `wasmtime`
 reject with the identical message, since both use `wasmparser`. Filed as
-[#132905](https://github.com/dotnet/runtime/issues/132905). **The fix — emitting a name section
-instead of exporting every function, which drops a framework composite from 228,626 exports
-(28.4 MB) to 4 — is not on `main` yet.** It lives on an unmerged branch, so a crossgen2 built from
-`main` still exports every function and still hits this. The symptom there is:
+[#132905](https://github.com/dotnet/runtime/issues/132905) and **fixed on `main` by
+[#132906](https://github.com/dotnet/runtime/pull/132906)** (`d2ea726dd3d`, merged 2026-08-28), which
+emits a wasm `name` custom section instead of exporting every function — dropping a framework
+composite from 228,626 exports (28.4 MB) to 4 while keeping every function name available to
+tooling. On a crossgen2 that predates it the symptom is:
 
 ```
 error: effective type size exceeds the limit of 1000000 (at offset 0x1371443)
@@ -1174,6 +1175,7 @@ gap described here.
 | --- | --- | --- |
 | [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productised the **non-composite** browser path — see [Browser R2R via the SDK](#browser-r2r-via-the-sdk) for the two knobs it added and how they differ. It declined to productise composite (the SDK path errors on `PublishReadyToRunComposite`), but that is an **SDK opt-out, not a platform limit**: hand-driven `crossgen2 --composite --targetos:browser` works and has for months. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
 | [#132528](https://github.com/dotnet/runtime/pull/132528) | 2026-08-25 | Added the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 needed. |
+| [#132906](https://github.com/dotnet/runtime/pull/132906) | 2026-08-28 | **Carries R2R function names in a wasm `name` section instead of the export table**, fixing [#132905](https://github.com/dotnet/runtime/issues/132905). A framework composite drops from 228,626 exports to 4. Note the consequence for tooling: names now live in a custom section, so `wasm-opt` **strips them unless you pass `-g`** — see [the splice](../../../../eng/wasi-r2r/README.md). |
 | [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-12 | Fixed WASM R2R virtual IP initialization. |
 | [#131383](https://github.com/dotnet/runtime/pull/131383) | 2026-07-29 | **Fixed JIT helper calls modeled with the wrong return arity** — including the `System.Enum.ToObject` cold-unbox trap in [Known-broken](#known-broken). Same class as [#129555](https://github.com/dotnet/runtime/pull/129555) (2026-06-22). |
 
