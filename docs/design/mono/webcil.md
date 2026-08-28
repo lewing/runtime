@@ -93,6 +93,13 @@ if each function is exported; the element segment, not the export table, is what
 reachable. Function names shall instead be carried in the `name` custom section, which is ignored by
 engines, counts towards no limit, and may be stripped when size matters.
 
+Because the `name` section is the only record of function names, any post-processing of a Webcil
+module has to preserve it deliberately. `wasm-opt` discards it unless passed `-g`, and `wasm-merge`
+needs `-g` to carry names into a merged module. Losing it is silent: the module still validates and
+still runs, and the only symptom is that every function becomes anonymous in a debugger or a stack
+trace. A pipeline that strips names on purpose should do so as its own step, so that the intent is
+visible.
+
 ``` wat
 (module
   (data "\0f\00\00\00\01\00\00\00") ;; data segment 0: two little-endian u32 values (payloadSize, tableSize). This specifies a Webcil payload of size 15 bytes with 1 required table entry
