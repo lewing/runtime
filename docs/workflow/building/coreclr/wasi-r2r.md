@@ -660,6 +660,35 @@ Two consequences:
   build instead of silently reproducing the original failure. Had it been a warning, the fix would
   have verified as "no change" and looked like a wrong diagnosis rather than an incomplete one.
 
+**13. A fact about the pipeline as it stands is not a fact about the pipeline you are designing.**
+The most common error in this area is not a wrong measurement — it is a *correct* statement about the
+current system, offered as guidance for a change that removes the thing making it true. Five
+corrections in a single session shared exactly this shape:
+
+| claim | why it expired |
+| --- | --- |
+| "`activate` already bakes the header's `tableBase`, so WASI needs no runtime patch" | `activate` is what the change deletes. Nothing then writes payload offset 28, and `GetTableBaseOffset` returns **0** rather than failing, silently shifting every R2R function index |
+| "crossgen2 can bake the bases as `i32.const`" | the bases are read out of the **linked** host; crossgen2 runs before the host is linked |
+| "`wasm-ld` supplies six of the composite's seven imports" | it supplies five — and the two it cannot are exactly the ones `surgery` exists to inject |
+| "delete the `wasi_r2r_image_base` lookup, the value never leaves the binary" | true only under the abandoned model where the host *exports* the globals; under the shim model that lookup feeds the shim |
+| "`--inputbubble` is the cross-module flag" | it is `--opt-cross-module:*` |
+
+This is worth a numbered entry because work here is mostly **pipeline surgery**: nearly every change
+deletes or replaces a stage, so "X already handles that" is both the most natural thing to say and the
+most likely to expire between the sentence and the design.
+
+The detection heuristic is cheap. Whenever you claim a step is unnecessary, **name the component that
+makes it unnecessary, then check whether that component survives the change.** In four of the five
+above, the component being relied on was the one being removed. Naming it is what makes the check
+possible; "that's already handled" cannot be checked at all.
+
+A related form, same root: when changing a *format*, enumerate its consumers rather than the consumers
+the current failure mode implicates. Auditing the three runtime readers of the webcil header missed
+`WebcilImageReader.TryFindWebcilInWasm`, which inspected only **passive** data segments and failed
+every self-installing image with `Unknown file format` — the managed twin of the
+`WasiExtractStubPayload` hazard found in the same change. Both were found by grepping where the last
+error had been rather than where the format is read.
+
 ## The coordinate-space trap
 
 Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
