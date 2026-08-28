@@ -1164,7 +1164,7 @@ gap described here.
 
 | PR | | What it changes |
 | --- | --- | --- |
-| [#132650](https://github.com/dotnet/runtime/pull/132650) | open | **Makes wasm composite images inspectable by R2RDump.** Until this merges, R2RDump rejects a wasm composite outright — see [Inspecting images](#inspecting-images). |
+| [#132650](https://github.com/dotnet/runtime/pull/132650) | draft | **Makes wasm composite images inspectable by R2RDump.** Until this merges, R2RDump rejects a wasm composite outright — see [Inspecting images](#inspecting-images). |
 | [#131877](https://github.com/dotnet/runtime/pull/131877) | open | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
 | [#131402](https://github.com/dotnet/runtime/pull/131402) | draft | Narrower alternative to #131374 for the GC-locals-across-safepoint bug — same family as the shadow-stack spill work. |
 
