@@ -413,7 +413,31 @@ Ready to Run header not found: "Hello".
 Ready to Run initialized successfully: "System.Console".
 ```
 
-A live debugger tracepoint on an R2R'd method is equally conclusive.
+**A breakpoint on an R2R method body is the strongest check, and it is deterministic.** Everything
+above is circumstantial; this is direct. The recipe, using the nesm wasm MCP against a spliced host:
+
+```
+wasm_terminal_start(path: <spliced host>, debug: true, break_on_start: true, args/env/preopens as usual)
+wasm_debug_search_functions(pattern: "Hello_Hello__Main")   -> index, from the name section
+wasm_debug_break(func_index: <index>)
+wasm_debug_continue()
+```
+
+If it halts, R2R native code ran — a fallback to the interpreter cannot hit a breakpoint inside the
+R2R body. The halt also gives you the transition chain for free. A real one, on a framework composite:
+
+```
+depth 0   Hello_Hello__Main                                ← R2R native, executing
+depth 3   ExecuteInterpretedMethodWithArgs_PortableEntryPoint_Complex
+depth 7   S_P_CoreLib_System_Environment__CallEntryPoint   ← CoreLib R2R native
+depth 9   RunMain → CorHost2::ExecuteAssembly → main → _start
+```
+
+Two prerequisites, both learned the hard way. The spliced host must retain its name section, which
+means `-g` on **`wasm-opt`** as well as `wasm-merge` — `wasm-opt` strips it by default, leaving every
+frame anonymous including the host's own. And function names come from the composite's name section
+(crossgen2 emits no other custom section); before that section existed, the export names were the only
+source, so an image with exports stripped debugs as `func_index=242774, name=null`.
 
 > **What `initialized successfully` does *not* prove — measured, and it ends in a NULL dereference.**
 > The line is emitted at [`readytoruninfo.cpp:685`](../../../../src/coreclr/vm/readytoruninfo.cpp),
@@ -688,6 +712,29 @@ every self-installing image with `Unknown file format` — the managed twin of t
 `WasiExtractStubPayload` hazard found in the same change. Both were found by grepping where the last
 error had been rather than where the format is read.
 
+**14. A positive detector's silence is not a second outcome.**
+Mis-setting the composite's table base and watching for `wasm trap: indirect call type mismatch` looks
+like a two-outcome control. It is not. A trap proves R2R dispatch happened; **no trap proves nothing**,
+because whether an off-by-one lands on a signature-*incompatible* function is incidental, and it
+changes when the merge renumbers functions. Two consecutive readings were misattributed on this basis
+in one afternoon — including a confident conclusion that stripping exports disabled dispatch, which a
+clean re-test (same host binary, exports the only variable) refuted outright.
+
+The general form is worth holding onto, because it is the same error as reading a green run as
+evidence of R2R, which is what this area manufactures: **a positive detector partitions into "fired →
+learned something" and "silent → learned nothing."** It never yields the second arm of a two-outcome
+check. Use it to confirm, never to refute.
+
+The deterministic replacement is the breakpoint described in
+[Proving R2R is actually active](#proving-r2r-is-actually-active).
+
+The same distinction has a checking corollary. An assertion built only from **relational** properties
+cannot detect a **uniform** error. A name-section check that verified count, ordering, uniqueness and
+a lower bound passed cleanly against a map shifted by exactly one entry, because a uniform shift
+preserves every relational property; only an absolute anchor (`entry i names function i`) excludes it.
+That is also why the A/B/C/D activation table needs D — every other control in it is defined relative
+to A.
+
 ## The coordinate-space trap
 
 Webcil-in-wasm shifts file offsets relative to RVAs, because the payload does not begin at a
@@ -903,6 +950,77 @@ does fail deterministically — `DateTime.ToString` under wasm R2R, as covered b
 DateTime tests. And never conclude "not reproducible, must already be fixed" from a minimal test
 whose output happens to be correct.
 
+
+## Framework-scale composites
+
+Measured on the full `wasi-wasm` framework closure — 181 assemblies (180 pack + CoreLib), compiled in
+one composite. These are the numbers that decide whether a WASI R2R test leg is feasible; nothing at
+4-assembly scale predicts them.
+
+| | 4 assemblies | full framework |
+| --- | --- | --- |
+| functions | 52,617 | **228,624** |
+| composite image | 22.8 MB | 127 MB |
+| webcil payload | 2.95 MB | **15.2 MB** |
+| table slots needed | 52,618 | **228,625** |
+
+Two host limits bind, and only one of them is ours:
+
+- **Table reservation.** The composite's element segment is ACTIVE, so the host table must already be
+  large enough at instantiation — growth does not help. Reserve by the composite's *function* count.
+  The cost is negligible and sublinear: raising `--table-base` from 65,537 to 262,145 grew the 36 MB
+  corerun by **2,329 bytes**, and the table stays fixed-size so it still validates statically.
+- **Staging buffer.** `WASI_R2R_IMAGE_CAP` is 16 MB and the framework payload is 15.2 MB — **5%
+  headroom**. This will need raising before any larger closure, and the check belongs in
+  `pipeline-shim.sh`, not the host: the engine installs the segment before host code runs, so the
+  host's own cap test is a post-mortem.
+
+**The limit that is not ours** is the wasm `effective type size` cap of 1,000,000, which a composite
+exporting every function reaches at roughly **160,000 exports** — both `wasm-tools` and `wasmtime`
+reject with the identical message, since both use `wasmparser`. Filed as
+[#132905](https://github.com/dotnet/runtime/issues/132905); fixed by emitting a name section instead
+of exporting every function, which drops a framework composite from 228,626 exports (28.4 MB) to 4.
+If you are on a crossgen2 that predates that fix, the symptom is:
+
+```
+error: effective type size exceeds the limit of 1000000 (at offset 0x1371443)
+```
+
+Note the offset lands in the **Export** section; the type section is not implicated (634 types,
+largest 67 parameters).
+
+### What R2R↔interpreter transitions actually look like
+
+Worth knowing before chasing a transition bug, because the shape is not what "R2R calls interpreter"
+suggests. On a JSON workload (reflection-based `System.Text.Json`, app assembly *outside* the
+composite so it is interpreted), tracepoints on all 40 `WasmR2RToInterpreterThunk` signature variants
+fired **twice in 400 iterations**. Transitions are a warm-up cost, not a per-call one — once the
+delay-load helper has wired a method's native code onto its entry point, subsequent calls go direct.
+A `Hello` run against a framework composite produces **zero** thunk hits, because everything it
+touches is either already wired or R2R→R2R.
+
+The cold path is where the interesting structure is. A single call chain crossed the boundary four
+times:
+
+```
+ 0  WasmR2RToInterpreterThunk(S12Tp)
+ 1  WasmDelayLoadHelper(Sig:S12Tp)                                  ← R2R import cell
+ 2  System.Text.Json…Utf8JsonWriterCache__RentWriterAndBuffer         R2R
+ 5  ExecuteInterpretedMethodWithArgs_PortableEntryPoint             ← interpreter
+ 9  WasmDelayLoadHelper(Sig:iiip)
+10  System.Text.Json…JsonSerializer__WriteString<__Canon>             R2R
+14  ExecuteInterpretedMethodWithArgs_PortableEntryPoint             ← interpreter
+17  WasmDelayLoadHelper(Sig:iiiip)
+18  System.Text.Json…JsonSerializer__Serialize_4<__Canon>             R2R
+21  InterpExecMethod                                                ← interpreter (the app)
+27  S_P_CoreLib_System_Environment__CallEntryPoint                    R2R
+```
+
+Both `Serialize_4` and `WriteString` are R2R, yet the call *between* them routes through the
+interpreter — that is the portable entry point doing its job on a first call. This is the mechanism
+[#130634](https://github.com/dotnet/runtime/issues/130634) reports failing; here it completes
+correctly four frames deep. Note also that the R2R'd generic bodies are the shared `__Canon`
+instantiations, so generic dispatch is where cold-path transitions concentrate.
 
 ## In flight
 
