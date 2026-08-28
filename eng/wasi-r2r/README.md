@@ -90,3 +90,56 @@ eng/wasi-r2r/pipeline-sym.sh
 
 Every input is overridable by environment variable — see the header comment in the script.
 It prints `VALID` and the output path (`r2rtest/ccsym/corerun-composite-sym.wasm`) on success.
+
+## Removing the nesm dependency
+
+`surgery` and `activate` exist because nothing supplied the composite's imports at link time and
+nothing emitted its segments in active form. Both are addressable, and the result is *more*
+declarative than the current pipeline rather than less. Measured on this branch:
+
+**The host half is done by the linker.** `wasm-ld` can supply six of the composite's seven imports
+directly. Adding to the WASI branch of
+[`corerun/CMakeLists.txt`](../../src/coreclr/hosts/corerun/CMakeLists.txt):
+
+```
+-Wl,--table-base=<N+1>          # reserve table slots 1..N for the composite
+-Wl,--export-table              # -> __indirect_function_table
+-Wl,--export=__stack_pointer
+-Wl,--export=__coreclr_wasm_rtlrestorecontext_tag
+-Wl,--export=__async_continuation   # already present
+```
+
+`--table-base` moves the host's *own* address-taken functions up, leaving the low slots free, and the
+table stays **fixed-size** (`min == max`) so the engine can still validate it statically. Measured on
+the real 36 MB corerun: table `6298/6298` → `71834/71834` with `--table-base=65537`, exports 6 → 9,
+and the run still passes with `DOTNET_ReadyToRun=0` (verified against a same-binary control, since the
+`StackTrace` frame count differs between R2R on and off for unrelated reasons).
+
+Cost of the reservation is small and mostly independent of its size — the extra bytes come from wider
+LEB encodings for the shifted function indices, not from the table itself:
+
+| `--table-base` | corerun bytes | table min/max |
+| --- | --- | --- |
+| default (1) | 36,284,003 | 6,298 |
+| 65,537 | 36,284,095 | 71,834 |
+| 500,001 | 36,336,407 | 506,298 |
+
+**Size it from the composite's function count, not its assembly count.** Every function in the
+composite consumes a table slot: a 4-assembly composite needs 52,637; the `System.Text.Json` test
+closure needs **283,573**. Reserve generously and fail loudly when a composite exceeds it — the same
+contract the 16 MB `g_wasi_r2r_image` buffer already uses on the memory side.
+
+**The composite half is crossgen2 work.** It would need to emit import names matching the linker's
+exports, emit the payload and element segments as **active** at the reserved bases rather than
+passive, and drop the `tableBase`/`imageBase` global imports since both become compile-time constants.
+`WasmDataSegmentType.Active` is already modelled; only `Passive` is currently ever emitted.
+
+That leaves the whole splice as `wasm-tools component unbundle` → `wasm-merge` → reassemble, all
+standard tooling.
+
+> **Do not solve this with a `start` function.** A composite that grows its own table and populates it
+> via `table.init`/`memory.init` at startup does work — verified end-to-end, including that
+> `wasm-merge` correctly combines two start functions. But it replaces declarative, engine-applied
+> installation with guest code mutating its own dispatch table at runtime, and it forfeits the
+> statically-known table size. It would level WASI down to the browser's runtime-linking posture,
+> which is the weaker of the two. The reservation approach above gets the same result declaratively.
