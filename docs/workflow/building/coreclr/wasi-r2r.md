@@ -39,8 +39,7 @@ Only the `--targetos` value and the host layer differ.
 | --- | --- |
 | wasi-sdk | Auto-provisioned by `./build.sh ... -os wasi`. Do **not** set `WASI_SDK_PATH` manually. |
 | `wasmtime` | Used directly, not vendored by the repo. |
-| `wasm-tools`, `wasm-merge`, `wasm-objdump` | Only needed for the splice pipeline and for inspecting images. |
-| `Nesm.dll` | Only needed for the splice pipeline. See [`eng/wasi-r2r/README.md`](../../../../eng/wasi-r2r/README.md). |
+| `wasm-tools`, `wasm-merge`, `wasm-opt`, `wasm-objdump`, `wat2wasm` | Only needed for the splice pipeline and for inspecting images. |
 | emscripten | Browser target only, also auto-provisioned. On macOS you may need `export EMSDK_PYTHON=/opt/homebrew/bin/python3.12` if the system Python is too old. |
 
 ## Build

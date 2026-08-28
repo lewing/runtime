@@ -21,25 +21,18 @@ does not work. This README only covers the tools in this directory.
 
 | Path | Purpose |
 | --- | --- |
-| `pipeline-sym.sh` | The splice pipeline: unbundle → surgery → `wasm-merge` → activate → module-swap. |
-| `surgery/` | Relocates the `corerun` core module's table/image base for the composite. |
-| `activate/` | Converts the merged webcil payload and R2R element segments from passive to active. |
+| `pipeline-shim.sh` | The splice pipeline: unbundle → extract image base → generate shim → `wasm-merge` → `wasm-opt` fold → module-swap. |
 | `comp.rsp.template` | `crossgen2` composite response file; replace `@ROOT@` with your worktree root. |
-| `Nesm.props` | Locates `Nesm.dll` for the two tools. |
 
 ## Prerequisites
 
-- `wasm-tools`, `wasm-merge` (Binaryen), and `wasm-objdump` (WABT) on `PATH`.
-  `pipeline-sym.sh` prepends `~/.cargo/bin` and `/opt/homebrew/bin` and fails fast if any are missing.
+- `wasm-tools`, `wasm-merge` and `wasm-opt` (Binaryen), and `wasm-objdump` / `wat2wasm` (WABT) on
+  `PATH`, plus `python3`. `pipeline-shim.sh` fails fast if any are missing.
 - `wasmtime` on `PATH` for running the result.
-- `Nesm.dll` — a wasm binary reader/writer from <https://github.com/Blazor-Playground/nesm>, which
-  lives outside this repo. `surgery/` and `activate/` reference it, so point at a built copy:
 
-  ```bash
-  export NESM_ASSEMBLY=/path/to/nesm/src/Nesm/bin/Release/net10.0/Nesm.dll
-  ```
-
-  Without it the tool builds fail with an explicit error rather than a missing-reference cascade.
+There is no longer an out-of-repo dependency. The pipeline previously required `Nesm.dll` (a wasm
+reader/writer from outside this repo) to drive two tools, `surgery` and `activate`, which rewrote the
+merged module after the fact. Both are gone — see [How the splice works](#how-the-splice-works).
 
 ## Is the splice still needed?
 
@@ -80,25 +73,28 @@ runs clean, the composite was simply never delivered to the runtime, and you nee
 
 ## Usage
 
-`pipeline-sym.sh` derives `TOOLS` from its own location and `ROOT` from the repo root above it, so
-from a worktree with a matching build already in `artifacts/` it is just:
+`pipeline-shim.sh` derives `ROOT` from the repo root above it, so from a worktree with a matching
+build already in `artifacts/` it is just:
 
 ```bash
-export NESM_ASSEMBLY=/path/to/Nesm.dll
-eng/wasi-r2r/pipeline-sym.sh
+eng/wasi-r2r/pipeline-shim.sh
 ```
 
 Every input is overridable by environment variable — see the header comment in the script.
-It prints `VALID` and the output path (`r2rtest/ccsym/corerun-composite-sym.wasm`) on success.
+It prints the resolved bases, then `VALID` and the output path on success.
 
-## Removing the nesm dependency
+Verify the result actually executes R2R code rather than falling back — see
+[Proving R2R is actually active](../../docs/workflow/building/coreclr/wasi-r2r.md#proving-r2r-is-actually-active).
+The activation log alone is not sufficient: it reports success as soon as the composite *loads*.
 
-`surgery` and `activate` exist because nothing supplied the composite's imports at link time and
-nothing emitted its segments in active form. Both are addressable, and the result is *more*
-declarative than the current pipeline rather than less. Measured on this branch:
+## How the splice works
 
-**The host half is *mostly* done by the linker — five of the composite's seven imports, not all.**
-Adding to the WASI branch of
+The composite `crossgen2` emits is **self-installing**: the webcil payload is an ACTIVE data segment
+at `(global.get __memory_base)` and the R2R function table is an ACTIVE element segment at
+`(global.get __table_base)`, so the engine installs both at instantiation. Nothing has to rewrite the
+module afterwards, which is what retired `activate`.
+
+`corerun` supplies five of the composite's seven imports directly, via link flags in
 [`corerun/CMakeLists.txt`](../../src/coreclr/hosts/corerun/CMakeLists.txt):
 
 ```
@@ -106,43 +102,80 @@ Adding to the WASI branch of
 -Wl,--export-table              # -> __indirect_function_table
 -Wl,--export=__stack_pointer
 -Wl,--export=__coreclr_wasm_rtlrestorecontext_tag
--Wl,--export=__async_continuation   # already present
+-Wl,--export=__async_continuation
 ```
 
-That satisfies `memory`, `__indirect_function_table`, `__stack_pointer`,
+That covers `memory`, `__indirect_function_table`, `__stack_pointer`,
 `__coreclr_wasm_rtlrestorecontext_tag` and `__async_continuation`.
 
-> **Correction.** An earlier revision of this section claimed **six** of seven, implying only one gap.
-> Enumerating the exports of the corerun actually built with these flags gives nine — `cabi_realloc`,
-> `GetDotNetRuntimeContractDescriptor`, `memory`, `wasi:cli/run@0.2.0#run`, `wasi_r2r_image_base`,
-> `__async_continuation`, `__coreclr_wasm_rtlrestorecontext_tag`, `__indirect_function_table`,
-> `__stack_pointer` — of which **five** match composite imports. `--table-base` shifts the table
-> layout but creates no exported `__table_base` global, and `wasi_r2r_image_base` is a *function*, so
-> it cannot satisfy a global import. Independently corroborated: merging the real composite into the
-> real browser `corerun.wasm` leaves exactly `__memory_base` and `__table_base` unresolved and nothing
-> else.
-
-**The two the linker cannot supply are `__memory_base` and `__table_base`, and that is why `surgery`
-exists.** `wasm-ld` creates those globals only in PIC mode, and a wasm global whose initializer is a
-data symbol's address is not expressible from C — so `surgery`'s
-`m.Globals.Add(new WasmGlobal{ InitExpr = I32Const(imageBase) })` is doing what the linker will not.
-Emitting active segments removes the need for `activate`; it does **not** remove the need for
+**The two it cannot supply are `__memory_base` and `__table_base`.** `wasm-ld` creates those globals
+only in PIC mode, and a wasm global whose initializer is a data symbol's address is not expressible
+from C — which is exactly what `surgery` used to inject post-link. `pipeline-shim.sh` generates a
+six-line shim module exporting them as constants and merges it as a third input, which retired
 `surgery`.
 
-The identified path — designed, not yet built — is to stop asking the linker and generate a shim
-instead, keeping the pipeline in wabt + Binaryen:
+Three things about this are easy to get wrong:
 
-1. Statically decode the base from the linked host: `wasi_r2r_image_base`'s body is
-   `i32.const <addr>` (it returns `&g_wasi_r2r_image[0]`), readable with `wasm-objdump -d`.
-2. Emit ~6 lines of WAT exporting `__memory_base` and `__table_base` as constant globals; assemble
-   with `wat2wasm`.
-3. Merge it alongside the host and composite.
+- **`--table-base`, not a growable table.** An ACTIVE element segment is installed by the engine at
+  instantiation, so the table must *already* be large enough; growth at runtime does not help.
+  Reserve by the composite's **function** count, not its assembly count. The reservation keeps the
+  table fixed-size (`min == max`) so it still validates statically, and costs little — the extra bytes
+  come from wider LEB encodings for the shifted indices, not from the table. Measured: `6298/6298` →
+  `71834/71834` at `--table-base=65537`, +51 KB (0.14%) at 500,001 slots.
+- **The fold is required, and is not free.** Merging internalizes the imported globals, and
+  `global.get` of a *defined* global is a constant expression only under the GC proposal — so the
+  merge needs `--enable-gc` and the result needs `wasm-opt --simplify-globals` to be portable
+  (wasmtime rejects the unfolded form under `exceptions` alone; V8 accepts it, so "it loaded in node"
+  proves nothing). The pass also propagates globals into function bodies, costing ~3.7% code size.
+  A host that supplies the bases at *instantiation* instead — as the browser does — keeps `global.get`
+  of an **imported** global, which is valid MVP, and pays neither cost.
+- **Payload offset 28 is now a runtime responsibility.** `activate` used to bake
+  `WebcilHeader_1.TableBase` offline. With the segment installed by the engine, nothing writes it, and
+  its absence is silent: `GetTableBaseOffset` returns 0 rather than failing, and that 0 becomes
+  `tableBaseDelta`, shifting every R2R function index. The WASI host patches it in
+  [`wasi_r2r_probe.hpp`](../../src/coreclr/hosts/corerun/wasi_r2r_probe.hpp) (`WASI_R2R_TABLE_BASE`,
+  which must match the shim); browser calls the composite's exported `patchWebcilHeader`.
 
-`--table-base` moves the host's *own* address-taken functions up, leaving the low slots free, and the
-table stays **fixed-size** (`min == max`) so the engine can still validate it statically. Measured on
-the real 36 MB corerun: table `6298/6298` → `71834/71834` with `--table-base=65537`, exports 6 → 9,
-and the run still passes with `DOTNET_ReadyToRun=0` (verified against a same-binary control, since the
-`StackTrace` frame count differs between R2R on and off for unrelated reasons).
+  This is measured, not argued. Setting the host's table base to 2 while the shim installs at 1 makes
+  the run fail with `wasm trap: indirect call type mismatch` — a symptom nowhere near its cause. Note
+  the corollary for the open `call_indirect` bugs: **table-index misalignment is a producer of that
+  symptom, so a signature mismatch is not by itself evidence of a signature-encoding fault.**
+
+## Historical note: the removed nesm dependency
+
+`surgery` and `activate` existed because nothing supplied the composite's imports at link time and
+nothing emitted its segments in active form. Both were addressable, and the result is *more*
+declarative than the pipeline they replaced rather than less. Kept here because the measurement that
+sized the reservation is still the one to reuse, and because the import accounting is easy to get
+wrong in the same way twice.
+
+**The host half is *mostly* done by the linker — five of the composite's seven imports, not all.**
+
+> **Correction, recorded because the wrong number was load-bearing.** An earlier revision claimed
+> **six** of seven, implying only one gap. Enumerating the exports of the corerun actually built with
+> these flags gives nine — `cabi_realloc`, `GetDotNetRuntimeContractDescriptor`, `memory`,
+> `wasi:cli/run@0.2.0#run`, `wasi_r2r_image_base`, `__async_continuation`,
+> `__coreclr_wasm_rtlrestorecontext_tag`, `__indirect_function_table`, `__stack_pointer` — of which
+> **five** match composite imports. `--table-base` shifts the table layout but creates no exported
+> `__table_base` global, and `wasi_r2r_image_base` is a *function*, so it cannot satisfy a global
+> import. Independently corroborated: merging the real composite into the real browser `corerun.wasm`
+> leaves exactly `__memory_base` and `__table_base` unresolved and nothing else. Two hosts, two
+> toolchains, same two globals — which is what identified the shim as the remaining work.
+
+The extraction step the shim depends on is *not* new: reading the image base out of the linked host
+was already how `surgery` got its argument. `wasi_r2r_image_base`'s body is a single
+`i32.const <addr>` (it returns `&g_wasi_r2r_image[0]`), so it decodes statically with no
+instantiation. Two things to carry forward:
+
+- `wasm-tools component unbundle` is **mandatory** first — `corerun` is a WASI component and
+  `wasm-objdump` rejects components outright.
+- Extract with `sed`, not `awk`. The `awk` form the old pipeline used silently yields an **empty
+  string** under BSD `awk` (the macOS default), which would feed an empty base downstream rather than
+  failing. `pipeline-shim.sh` validates that the result is numeric.
+
+Measured on the real 36 MB corerun: table `6298/6298` → `71834/71834` with `--table-base=65537`,
+exports 6 → 9, and the run still passes with `DOTNET_ReadyToRun=0` (verified against a same-binary
+control, since the `StackTrace` frame count differs between R2R on and off for unrelated reasons).
 
 Cost of the reservation is small and mostly independent of its size — the extra bytes come from wider
 LEB encodings for the shifted function indices, not from the table itself:
