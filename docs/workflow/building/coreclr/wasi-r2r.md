@@ -1149,10 +1149,9 @@ Related open issues:
 - Browser: `System.Enum.ToObject` traps on a `call_indirect` type mismatch. Established at a live
   pre-trap pause in the originating investigation (session `50ddfb2c`, 2026-07-25):
 
-  - the trapping frame is **`func 980 = System.Enum.ToObject`**, instruction
-    **`call_indirect (type 62)`** through an R2R import cell;
+  - the trapping frame is **`func 980 = System.Enum.ToObject`**;
   - it resolves through **`WasmR2RToInterpreterThunk`** — the same thunk as the startup mismatch
-    that [#131167](https://github.com/dotnet/runtime/pull/131167) fixed, and the same `type 62`;
+    that [#131167](https://github.com/dotnet/runtime/pull/131167) fixed;
   - the call site is in the **composite** and the thunk is in the **host** module, so it is a
     cross-module `call_indirect`;
   - it fires during **execution**, in `System.Text.Json` type-info/property reflection, reached
@@ -1163,13 +1162,36 @@ Related open issues:
   - WASI ran the same suite and the same test area cleanly (12166/12166 discovered, 0 signature
     mismatches).
 
-  **The expected-vs-actual signature decode was never obtained.** That session tried repeatedly and
-  the target raced to exit each time; it records the decode as still-open. An earlier revision of
-  this page stated the mismatch as *"expected `void`, actual `i32`"* — **that pairing appears
-  nowhere in the source material and should not be relied on.** Treat the expected type as
-  `type 62`, unresolved, and the actual callee as unknown.
+  **The decode was obtained**, at a live pre-trap pause, in a later session
+  (`38c1de9e`, relayed in `217bbcde` / `951c0698`) after the first attempt raced the target to exit.
+  The unblock was calling `wasm_cdp_diagnose_pause` **instead of** `wasm_cdp_trap` at the
+  `break_on_module` pause — only `diagnose_pause` records its result into nesm's retention
+  mechanism, so it survives the target dying immediately afterwards:
 
-  Reproduction status is likewise open. A synthetic probe calling `Enum.ToObject` directly does
+  ```
+  IndirectCallTypeMismatch in func[980] (Enum.ToObject) at pc 855
+    EXPECTED  type 63   (i32,i32,i32,i32) -> ()        void return
+    ACTUAL    type 156  (i32,i32,i32,i32) -> (i32)     i32 return   [table[21219] = func[14871]]
+    table_resolved_live: true
+  ```
+
+  The four `i32` arguments are identical; **the divergence is the return type alone** — expected
+  `void`, actual `i32`. That is far more specific than "signature mismatch": it points at the
+  return-type component of the R2R↔interp thunk signature key (the `v` vs `i` in thunk names like
+  `WasmR2RToInterpreterThunk(vTp)` versus `(iTiip)`), places the bug in the **#131167 family** on
+  the return-type axis, and locates it in **emscripten thunk resolution rather than crossgen** —
+  WASI dispatches the identical call cleanly on the same codegen.
+
+  > **Do not cite `type 62` for this trap.** An earlier revision of this page did. It was an
+  > eyeballed static read of the disassembly, and `Enum.ToObject` contains several `call_indirect`
+  > sites — the live decode identified the trapping one as `type 63`. A prior audit of this page
+  > then searched only session `50ddfb2c`, found the failed first attempt, and concluded the decode
+  > "was never obtained" and that the `void`/`i32` pairing "appears nowhere in the source material".
+  > Both statements were wrong: the decode lives in a *different* session than the one that
+  > originated the bug. **Absence within one session's scope is not evidence of absence** — see
+  > [trap 14](#traps) on positive detectors.
+
+  Reproduction status is separately open. A synthetic probe calling `Enum.ToObject` directly does
   **not** reproduce it — that is a different dispatch shape from the reported one and its passing
   proves nothing. The faithful instrument is the `System.Text.Json` suite over an R2R image, which
   is currently blocked by
