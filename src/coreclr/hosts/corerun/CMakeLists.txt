@@ -168,7 +168,17 @@ else()
                 # helpers.cpp) so the offline R2R merge can wire each composite's webcil.asyncContinuation
                 # import to this same global (the interp<->R2R accessors use it), and so --gc-sections
                 # doesn't drop it.
-                -Wl,--export=__async_continuation)
+                -Wl,--export=__async_continuation
+                # [wasi] Supply the R2R composite's imports at link time. --table-base reserves the
+                # low table slots 1..N-1 for a merged composite's element segment (which crossgen2 now
+                # emits ACTIVE, so the engine installs it at instantiation and the table must already
+                # be large enough), moving corerun's own address-taken functions above it. The table
+                # stays fixed-size so the engine can still validate it statically.
+                # Reserve by the composite's FUNCTION count, not its assembly count.
+                -Wl,--table-base=65537
+                -Wl,--export-table
+                -Wl,--export=__stack_pointer
+                -Wl,--export=__coreclr_wasm_rtlrestorecontext_tag)
         endif()
 
         if (CORERUN_IN_BROWSER)

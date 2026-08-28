@@ -37,6 +37,15 @@ namespace wasi_r2r
 #ifndef WASI_R2R_IMAGE_CAP
 #define WASI_R2R_IMAGE_CAP (16u * 1024u * 1024u)
 #endif
+
+// The table index at which the composite's functions are installed. Under the reservation model the
+// host is linked with `-Wl,--table-base=<N+1>`, which moves corerun's own address-taken functions up
+// to start at N+1 and leaves slots 1..N free, so the composite always sits at base 1 regardless of
+// its size. This MUST match the `__table_base` global supplied to the merge (see eng/wasi-r2r/README.md);
+// the two are a coupled constant and a mismatch is silent -- see the patch in WasiStaticR2RProbe.
+#ifndef WASI_R2R_TABLE_BASE
+#define WASI_R2R_TABLE_BASE (1u)
+#endif
 alignas(16) static uint8_t g_wasi_r2r_image[WASI_R2R_IMAGE_CAP];
 
 // The composite native image's bundle-relative file name (the ownerCompositeExecutable named by each
@@ -158,6 +167,20 @@ static bool WasiStaticR2RProbe(const char* name, const char* const* dirs, size_t
         int64_t payloadSize = WasiWebcilPayloadSize(&g_wasi_r2r_image[0]);
         if (payloadSize <= 0 || (size_t)payloadSize > sizeof(g_wasi_r2r_image))
             return false; // buffer not populated, or composite payload exceeds the cap
+
+        // Self-installing images: crossgen2 emits the payload as an ACTIVE data segment that the engine
+        // installs at instantiation, so the offline `activate` step that used to bake WebcilHeader_1.TableBase
+        // (payload offset 28) no longer runs and nothing has written it. That field is not optional --
+        // WebcilDecoder::GetTableBaseOffset returns 0 rather than failing, and that 0 becomes tableBaseDelta
+        // in PEImageLayout, shifting every R2R function index by the table base. The symptom is call_indirect
+        // landing on the wrong function, nowhere near the cause. Patch it before the runtime parses the header.
+        uint8_t* hdr = &g_wasi_r2r_image[0];
+        if (payloadSize >= 32 && hdr[28] == 0 && hdr[29] == 0 && hdr[30] == 0 && hdr[31] == 0)
+        {
+            uint32_t tableBase = WASI_R2R_TABLE_BASE;
+            memcpy(hdr + 28, &tableBase, sizeof(tableBase));
+        }
+
         *data_start = &g_wasi_r2r_image[0];
         *size = payloadSize;
         return true;
