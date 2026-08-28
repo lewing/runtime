@@ -761,6 +761,38 @@ The first row was later settled against a live browser host: registration happen
 one are both correct in their own space. See [Reading live runtime state](#reading-live-runtime-state)
 for how that was measured — and for why a static argument was not enough to close it.
 
+### `TableBase` is zero on disk by contract
+
+A related but distinct hazard, because here the field is not in the wrong space — it is deliberately
+**not filled in at all** in the image. The webcil header's `TableBase` (offset 28) is always written
+as `0` by crossgen2; `WebcilEncoder` says so outright, *"TableBase is always written as 0 in the file,
+as the spec requires it to be filled"*. It is patched at **load time** by whichever host maps the
+image: the JS loader's `getWebcilPayload` on browser, and the corerun probe on WASI
+(`WASI_R2R_TABLE_BASE`, see [How the WASI host finds R2R images](#how-the-wasi-host-finds-r2r-images)).
+
+So a tool that reads `TableBase` from a static image gets `0`, which is a plausible, well-formed,
+entirely wrong answer — the shape of failure this whole area keeps producing. The ground truth after
+a splice is the **active element segment's offset**, not the header:
+
+```bash
+# the R2R element segment's real base, post-merge
+wasm-objdump -x final.wasm | grep -A2 '^Elem\[' | grep 'init i32'
+```
+
+```
+segment[0] ACTIVE table=0 count=6297   init i32=262145   ← host's own address-taken functions
+segment[1] ACTIVE table=0 count=228626 init i32=1        ← the composite's R2R function refs
+```
+
+with `TableBase` still reading `0` in the same image. An off-by-one between a name resolved from
+metadata and the function actually at that slot is the signature of exactly this: reading the header
+where you should have read the segment.
+
+**But do not simply switch to reading the segment offset either.** It is only resolved *post-merge*.
+In the unmerged composite that same segment is active against an imported global
+(`init global.get <webcil.__table_base>`), so the offset is not a constant and any reader that
+demands one will break on the image that works today. A correct reader needs both cases.
+
 ## Inspecting images
 
 ```bash
