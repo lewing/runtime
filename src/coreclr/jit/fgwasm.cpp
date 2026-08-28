@@ -2468,16 +2468,21 @@ PhaseStatus Compiler::fgWasmSpillRefs()
                 continue;
             }
 
-            // NOTE: We must NOT skip GT_LCL_VAR here. Even a non-address-exposed local's value, once
-            //  loaded onto the wasm operand stack, is a COPY that a moving/compacting GC cannot update:
-            //  the GC updates the local's (reported) shadow-stack slot, but the already-pushed operand-stack
-            //  copy retains the stale pre-move address. If such a value is held across a nested call
-            //  (a GC safepoint) before its use, the consumer sees a stale pointer. So a GT_LCL_VAR ref
-            //  that is live across a call must be spilled to a pinned slot just like any other ref; the
-            //  defs/spill-at-call machinery below already limits this to refs actually held across a call.
+            // If a value is just a GT_LCL_VAR that isn't address-exposed, by construction we ensure that
+            //  it won't be mutated between its def (here) and its use (the call that would produce a spill)
+            //  and we won't need to spill it.
+            if (tree->OperIs(GT_LCL_VAR))
+            {
+                GenTreeLclVarCommon* lclVar = tree->AsLclVarCommon();
+                LclVarDsc*           dsc    = lvaGetDesc(lclVar);
+                if (!dsc->IsAddressExposed())
+                {
+                    continue;
+                }
+            }
 
-            // We have a ref (call result, indirection, or a local value loaded onto the operand stack) that
-            //  hasn't been spilled yet, so record it for potential spilling at the next call.
+            // We have a ref sourced from something like a call result or an indirection that hasn't been
+            //  spilled yet, so record it for potential spilling at the next call.
             defs.push_back(tree);
         }
 
