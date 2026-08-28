@@ -97,8 +97,8 @@ It prints `VALID` and the output path (`r2rtest/ccsym/corerun-composite-sym.wasm
 nothing emitted its segments in active form. Both are addressable, and the result is *more*
 declarative than the current pipeline rather than less. Measured on this branch:
 
-**The host half is done by the linker.** `wasm-ld` can supply six of the composite's seven imports
-directly. Adding to the WASI branch of
+**The host half is *mostly* done by the linker — five of the composite's seven imports, not all.**
+Adding to the WASI branch of
 [`corerun/CMakeLists.txt`](../../src/coreclr/hosts/corerun/CMakeLists.txt):
 
 ```
@@ -108,6 +108,35 @@ directly. Adding to the WASI branch of
 -Wl,--export=__coreclr_wasm_rtlrestorecontext_tag
 -Wl,--export=__async_continuation   # already present
 ```
+
+That satisfies `memory`, `__indirect_function_table`, `__stack_pointer`,
+`__coreclr_wasm_rtlrestorecontext_tag` and `__async_continuation`.
+
+> **Correction.** An earlier revision of this section claimed **six** of seven, implying only one gap.
+> Enumerating the exports of the corerun actually built with these flags gives nine — `cabi_realloc`,
+> `GetDotNetRuntimeContractDescriptor`, `memory`, `wasi:cli/run@0.2.0#run`, `wasi_r2r_image_base`,
+> `__async_continuation`, `__coreclr_wasm_rtlrestorecontext_tag`, `__indirect_function_table`,
+> `__stack_pointer` — of which **five** match composite imports. `--table-base` shifts the table
+> layout but creates no exported `__table_base` global, and `wasi_r2r_image_base` is a *function*, so
+> it cannot satisfy a global import. Independently corroborated: merging the real composite into the
+> real browser `corerun.wasm` leaves exactly `__memory_base` and `__table_base` unresolved and nothing
+> else.
+
+**The two the linker cannot supply are `__memory_base` and `__table_base`, and that is why `surgery`
+exists.** `wasm-ld` creates those globals only in PIC mode, and a wasm global whose initializer is a
+data symbol's address is not expressible from C — so `surgery`'s
+`m.Globals.Add(new WasmGlobal{ InitExpr = I32Const(imageBase) })` is doing what the linker will not.
+Emitting active segments removes the need for `activate`; it does **not** remove the need for
+`surgery`.
+
+The identified path — designed, not yet built — is to stop asking the linker and generate a shim
+instead, keeping the pipeline in wabt + Binaryen:
+
+1. Statically decode the base from the linked host: `wasi_r2r_image_base`'s body is
+   `i32.const <addr>` (it returns `&g_wasi_r2r_image[0]`), readable with `wasm-objdump -d`.
+2. Emit ~6 lines of WAT exporting `__memory_base` and `__table_base` as constant globals; assemble
+   with `wat2wasm`.
+3. Merge it alongside the host and composite.
 
 `--table-base` moves the host's *own* address-taken functions up, leaving the low slots free, and the
 table stays **fixed-size** (`min == max`) so the engine can still validate it statically. Measured on
