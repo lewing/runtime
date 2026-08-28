@@ -1111,7 +1111,7 @@ gap described here.
 | PR | | What it changes |
 | --- | --- | --- |
 | [#132650](https://github.com/dotnet/runtime/pull/132650) | open | **Makes wasm composite images inspectable by R2RDump.** Until this merges, R2RDump rejects a wasm composite outright — see [Inspecting images](#inspecting-images). |
-| [#131877](https://github.com/dotnet/runtime/pull/131877) | draft | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
+| [#131877](https://github.com/dotnet/runtime/pull/131877) | open | Replaces the hardcoded struct-size table in the CoreCLR wasm P/Invoke generator with crossgen2's field-layout engine. **Rewrites `SignatureMapper.cs`**, so the `V` slot-count item below may be resolved or relocated by it. |
 | [#131402](https://github.com/dotnet/runtime/pull/131402) | draft | Narrower alternative to #131374 for the GC-locals-across-safepoint bug — same family as the shadow-stack spill work. |
 
 ### Recently merged
@@ -1120,15 +1120,17 @@ gap described here.
 | --- | --- | --- |
 | [#132339](https://github.com/dotnet/runtime/pull/132339) | 2026-08-25 | **Enabled ReadyToRun for CoreCLR browser-wasm.** Productised the **non-composite** browser path — see [Browser R2R via the SDK](#browser-r2r-via-the-sdk) for the two knobs it added and how they differ. It declined to productise composite (the SDK path errors on `PublishReadyToRunComposite`), but that is an **SDK opt-out, not a platform limit**: hand-driven `crossgen2 --composite --targetos:browser` works and has for months. Paired with [dotnet/sdk#55785](https://github.com/dotnet/sdk/pull/55785). |
 | [#132528](https://github.com/dotnet/runtime/pull/132528) | 2026-08-25 | Added the R2R 26.2 `DeclaringTypeHandle` fixup re-encoding that #132339 needed. |
-| [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-18 | Fixed WASM R2R virtual IP initialization. |
+| [#132172](https://github.com/dotnet/runtime/pull/132172) | 2026-08-12 | Fixed WASM R2R virtual IP initialization. |
+| [#131383](https://github.com/dotnet/runtime/pull/131383) | 2026-07-29 | **Fixed JIT helper calls modeled with the wrong return arity** — including the `System.Enum.ToObject` cold-unbox trap in [Known-broken](#known-broken). Same class as [#129555](https://github.com/dotnet/runtime/pull/129555) (2026-06-22). |
 
 Related open issues:
 
 - [#130634](https://github.com/dotnet/runtime/issues/130634) — `function signature mismatch` on the
   first (**cold**) R2R call to a method whose native code is not yet wired onto its portable entry
-  point. Order-dependent: succeeds if an earlier call already wired the target. Plausibly the same
-  root as the `Enum.ToObject` entry below, which is also a `call_indirect` type divergence through a
-  transition thunk — worth checking whether one repro subsumes the other.
+  point. Order-dependent: succeeds if an earlier call already wired the target. **Not** the same root
+  as the `Enum.ToObject` entry below, despite both being `call_indirect` type divergences: that one
+  was an inline-unbox helper return-arity bug fixed by #131383, whereas this is cold *external
+  method* dispatch. They were conflated here previously on shape alone.
 - [#132410](https://github.com/dotnet/runtime/issues/132410) — browser R2R EventPipe rundown traps
   with `null function`.
 - [#129850](https://github.com/dotnet/runtime/issues/129850) — running wasm with an R2R'd
@@ -1146,27 +1148,13 @@ Related open issues:
   cache.** The original symptom, `RoundtripValues<Int128>(-1)` failing with
   `Expected: -1  Actual: -1` — values rendering identically but comparing unequal — accounted for 25
   of the 39 residual `System.Text.Json` failures.
-- Browser: `System.Enum.ToObject` traps on a `call_indirect` type mismatch. Established at a live
-  pre-trap pause in the originating investigation (session `50ddfb2c`, 2026-07-25):
+- Browser: `System.Enum.ToObject` traps on a `call_indirect` type mismatch. **Fixed on `main` by
+  [#131383](https://github.com/dotnet/runtime/pull/131383)** (`950fea3bc4e`, merged 2026-07-29) —
+  three days after it was observed. Retained here because the diagnosis is instructive and because
+  two later write-ups of it were wrong in opposite directions.
 
-  - the trapping frame is **`func 980 = System.Enum.ToObject`**;
-  - it resolves through **`WasmR2RToInterpreterThunk`** — the same thunk as the startup mismatch
-    that [#131167](https://github.com/dotnet/runtime/pull/131167) fixed;
-  - the call site is in the **composite** and the thunk is in the **host** module, so it is a
-    cross-module `call_indirect`;
-  - it fires during **execution**, in `System.Text.Json` type-info/property reflection, reached
-    under **reflection-invoke of an `async` method** (`MethodBaseInvoker.InterpretedInvoke`,
-    `AsyncTaskMethodBuilder.Start` were on the stack);
-  - the `br_table` following the `call_indirect` matches a `Type.GetTypeCode(...) switch { … }`
-    shape, i.e. a TypeCode dispatch;
-  - WASI ran the same suite and the same test area cleanly (12166/12166 discovered, 0 signature
-    mismatches).
-
-  **The decode was obtained**, at a live pre-trap pause, in a later session
-  (`38c1de9e`, relayed in `217bbcde` / `951c0698`) after the first attempt raced the target to exit.
-  The unblock was calling `wasm_cdp_diagnose_pause` **instead of** `wasm_cdp_trap` at the
-  `break_on_module` pause — only `diagnose_pause` records its result into nesm's retention
-  mechanism, so it survives the target dying immediately afterwards:
+  The live decode, taken at a pre-trap pause in session `38c1de9e` (relayed in `217bbcde` /
+  `951c0698`) after the first attempt raced the target to exit:
 
   ```
   IndirectCallTypeMismatch in func[980] (Enum.ToObject) at pc 855
@@ -1175,28 +1163,40 @@ Related open issues:
     table_resolved_live: true
   ```
 
-  The four `i32` arguments are identical; **the divergence is the return type alone** — expected
-  `void`, actual `i32`. That is far more specific than "signature mismatch": it points at the
-  return-type component of the R2R↔interp thunk signature key (the `v` vs `i` in thunk names like
-  `WasmR2RToInterpreterThunk(vTp)` versus `(iTiip)`), places the bug in the **#131167 family** on
-  the return-type axis, and locates it in **emscripten thunk resolution rather than crossgen** —
-  WASI dispatches the identical call cleanly on the same codegen.
+  The unblock was calling `wasm_cdp_diagnose_pause` **instead of** `wasm_cdp_trap` at the
+  `break_on_module` pause — only `diagnose_pause` records into the retention mechanism that
+  survives the target exiting immediately afterwards.
 
-  > **Do not cite `type 62` for this trap.** An earlier revision of this page did. It was an
-  > eyeballed static read of the disassembly, and `Enum.ToObject` contains several `call_indirect`
-  > sites — the live decode identified the trapping one as `type 63`. A prior audit of this page
-  > then searched only session `50ddfb2c`, found the failed first attempt, and concluded the decode
-  > "was never obtained" and that the `void`/`i32` pairing "appears nowhere in the source material".
-  > Both statements were wrong: the decode lives in a *different* session than the one that
-  > originated the bug. **Absence within one session's scope is not evidence of absence** — see
-  > [trap 14](#traps) on positive detectors.
+  **Root cause, in the JIT.** `func[14871]` is `CORINFO_HELP_UNBOX`, confirmed independently by a
+  checked-JIT JitDump showing 621 `CORINFO_HELP_UNBOX` calls and zero class-init helpers.
+  #131383's own commit message names the symptom:
 
-  Reproduction status is separately open. A synthetic probe calling `Enum.ToObject` directly does
-  **not** reproduce it — that is a different dispatch shape from the reported one and its passing
-  proves nothing. The faithful instrument is the `System.Text.Json` suite over an R2R image, which
-  is currently blocked by
-  [#132855](https://github.com/dotnet/runtime/issues/132855) (a 1000-param functype in the test
-  assembly makes its R2R image unloadable). Fixing that unblocks this.
+  > **The inline `unbox` slow path.** The importer lowers `unbox` to
+  > `(*clone == typeToken) ? nop : CORINFO_HELP_UNBOX(clone, typeToken)` and created the helper call
+  > as `TYP_VOID`, since the unboxed byref is formed separately from `clone + TARGET_POINTER_SIZE`.
+  > But `CastHelpers.Unbox` returns `ref byte`. Symptom: a trap on the first cold unbox in
+  > `System.Enum.ToObject` during reflection-heavy startup.
+
+  `ref byte` is a pointer, so `i32` on wasm32 — exactly the decoded actual. This is the same class
+  as the return-arity fixes in [#129555](https://github.com/dotnet/runtime/pull/129555)
+  (2026-06-22), whose own summary reads *"Use the return type for wasm fast tail calls (gtType is
+  overwritten to TYP_VOID)"*. **When a wasm R2R `call_indirect` expects `void` and gets a value,
+  suspect a helper or call node modeled as `TYP_VOID`, in the JIT — not the host.**
+
+  **Three corrections worth keeping, because each was confidently stated and wrong:**
+
+  - *"`type 62`."* An eyeballed static read of the disassembly. `Enum.ToObject` has several
+    `call_indirect` sites; the live decode names `type 63`. A static decode would have described
+    the wrong site plausibly and confidently.
+  - *"The decode was never obtained; `void`/`i32` appears nowhere in the source material."* An audit
+    of this page searched only the session that *originated* the bug, where the first attempt
+    failed, and did not find the later session where it succeeded. **Absence within one session's
+    scope is not absence** — see [trap 14](#traps).
+  - *"Decisively emscripten thunk resolution, not crossgen."* Inferred from WASI dispatching the
+    same call cleanly on the same codegen. The fix landed in `importer.cpp`. Identical codegen on
+    two hosts bounds where a *divergence* can live, but says nothing about where the *defect* is
+    when both hosts are fed the same wrong type and only one happens to resolve a callee that
+    trips on it.
 - `src/tasks/WasmAppBuilder/coreclr/SignatureMapper.cs` — `TokenToSlotCount` returns 1 for any token
   not starting with `S`/`A`, so a `V` (v128) token appears to count as one 8-byte slot rather than
   two. Flagged as latent before #131492 reworked this encoding (which added the `l2`/`V2` alignment-
