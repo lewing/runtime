@@ -18,8 +18,12 @@ for the test-infra path.
 > **Browser R2R now has SDK support.** [#132339](https://github.com/dotnet/runtime/pull/132339)
 > (merged 2026-08-25) enabled `PublishReadyToRun` for browser-wasm, shipping prebuilt framework R2R
 > images in the runtime pack and wiring user assembly R2R through the SDK targets. This path
-> supports **non-composite (per-assembly) images only** — composite images are explicitly out of
-> scope and still require the hand-splice pipeline documented here.
+> supports **non-composite (per-assembly) images only** — composite is explicitly out of scope for
+> the SDK. That is an SDK opt-out, not a platform limit, and it does **not** mean composite needs the
+> splice: hand-driven `crossgen2 --composite --targetos:browser` works and `corerun.js` loads it from
+> a flat directory with no splice at all. The splice is a **WASI** requirement, because WASI has no
+> loader to do the equivalent job. See
+> [the three-path table](#browser-r2r-via-the-sdk) before reaching for `eng/wasi-r2r/`.
 
 > **Claims here were last verified against `origin/main` on 2026-08-26.** This area moves quickly and
 > several statements below were true when written and false within weeks. Anything asserting that
@@ -125,9 +129,12 @@ Notes:
 - `JitWasmSimdNyiToR2RUnsupported` has been verified to produce byte-identical output for `0` and
   `1` on current inputs, so either value is fine.
 - The output extension is `.wasm`, but the file is a webcil-wrapped R2R PE image.
-- Sanity check every composite before you try to run it:
+- Sanity check a **component** image before you try to run it:
   `dotnet artifacts/bin/coreclr/wasi.wasm.Release/R2RDump/R2RDump.dll <image.wasm>`. Machine type
-  `65534` is the wasm placeholder and is expected.
+  `65534` is the wasm placeholder and is expected. This does **not** work on a composite — current
+  R2RDump rejects a valid composite outright, so use the structural checks in
+  [Inspecting images](#inspecting-images) instead until
+  [#132650](https://github.com/dotnet/runtime/pull/132650) lands.
 - To debug codegen for one method, set `DOTNET_JitDisasm=<Type:Method>`, `DOTNET_JitGCDump=...`, or
   `DOTNET_JitDisasmSummary=1` on the **crossgen2** invocation — these are compile-time, not run-time.
 - A `Debug`-configuration crossgen2 (`./build.sh clr.aot -os wasi -c Debug`) has assertions live and
@@ -358,18 +365,32 @@ verification enabled. Earlier browser work reported an ~8 MB ceiling on *synchro
 in V8/Node, but the `corerun` path evidently does not hit it at that size — treat the ceiling as a
 property of how a module is compiled rather than a hard limit on composite size.
 
-### What is *not* plumbed: the runtime pack's R2R CoreLib
+### The runtime pack's R2R CoreLib — now plumbed for browser
 
-Distinct from the test path above, the **product runtime pack** does not ship an R2R CoreLib for wasm.
-`crossgen-corelib.proj` routes the wasm R2R CoreLib to `System.Private.CoreLib.NotReadyYet.wasm`, and
-`NotReadyYet` appears exactly once in the tree — its own definition, with no consumer. Enabling
-`UseComposite` there also runs into `CopyR2RComponentCoreLib`, which expects a rewritten managed `.dll`
-under `artifacts/obj`; that is a PE/Mach-O-shaped assumption and does not hold when crossgen2 emits
-`.wasm` components to `BinDir`.
+This section previously said the product runtime pack ships no R2R CoreLib for wasm, routing it to a
+consumerless `System.Private.CoreLib.NotReadyYet.wasm`. **That is no longer true.**
+`NotReadyYet` does not appear anywhere on `origin/main`; `crossgen-corelib.proj` now writes
+`$(BinDir)/System.Private.CoreLib.wasm` directly, and
+`Microsoft.NETCore.App.Runtime.CoreCLR.sfxproj` packages it:
 
-This is now the *remaining* gap rather than one of two: since #131658 the product browser loader can
-instantiate an R2R image, so wiring the build glue here would no longer be blocked behind boot-path
-work. Verified against `origin/main` as of 2026-08-19 — `NotReadyYet` still has no consumer.
+```xml
+<WasmEnableFrameworkR2R Condition="'$(WasmEnableFrameworkR2R)' == ''">true</WasmEnableFrameworkR2R>
+...
+<_WasmFrameworkR2ROutput Include="$(CoreCLRArtifactsPath)System.Private.CoreLib.wasm"
+                         Condition="Exists('$(CoreCLRArtifactsPath)System.Private.CoreLib.wasm')" />
+<LibrariesRuntimeFiles Include="@(_WasmFrameworkR2ROutput)" IsNative="true" NativeSubDirectory="r2r" />
+```
+
+so the shared-framework assemblies **and** CoreLib land in the pack's `native/r2r/`, defaulted on.
+The shared-framework inputs are `$(LibrariesSharedFrameworkBinArtifactsPath)*.dll`, compiled with
+CoreLib IL as a reference and `--opt-cross-module:*`; `WasmFrameworkR2RSubset` narrows the set for
+bring-up.
+
+What remains is **non-composite and browser-shaped**. The pack builds per-assembly images; composite
+productisation is still absent, and `UseComposite` in `crossgen-corelib.proj` still runs into
+`CopyR2RComponentCoreLib` expecting a rewritten managed `.dll` under `artifacts/obj` — a PE/Mach-O
+assumption that does not hold when crossgen2 emits `.wasm` components to `BinDir`. WASI has no
+equivalent packaging at all.
 
 ## Proving R2R is actually active
 
@@ -533,11 +554,22 @@ set, a spliced host (a stock `corerun` has an empty composite buffer), the compo
 `composite-r2r.wasm`, and the per-assembly stubs under `comp/`.
 
 **2. `DOTNET_ReadyToRun=0` and `=1` producing identical output does not mean R2R is inactive.**
-When the composite is baked into `corerun*.wasm` rather than loaded externally, the environment
-variable is a **no-op** — it only gates external R2R image loading, and R2R is unconditionally
-active in that binary. Identical output is the *expected* result. Use `DOTNET_ReadyToRunLogFile` or
-a debugger tracepoint instead. A prior investigation reached and later had to reverse exactly this
-conclusion.
+The reason is that a correct program produces the same answer either way — with R2R off it simply
+runs from IL. It is **not** because the variable is inert. `ReadyToRunInfo::Initialize` tests
+`g_pConfig->ReadyToRun()` before anything else, so the gate applies regardless of whether the
+composite is baked into `corerun*.wasm` or loaded externally. Measured on the spliced WASI host,
+same binary and same baked composite, varying only the variable:
+
+| | `r2r.log.*` | stdout |
+| --- | --- | --- |
+| `DOTNET_ReadyToRun=1` | 6 × `Ready to Run initialized successfully` | `Hello from wasi R2R` |
+| `DOTNET_ReadyToRun=0` | 1 × `Ready to Run not enabled.` | `Hello from wasi R2R` |
+
+So use `DOTNET_ReadyToRunLogFile` (glob `r2r.log.*`) or a debugger tracepoint — the log separates the
+two cases cleanly and stdout does not. An earlier revision of this page claimed the variable was a
+**no-op** on a baked composite and that R2R was "unconditionally active in that binary". That is
+false, and it is the more damaging error, because it tells you to discard your best available
+control.
 
 **3. A missing framework assembly manifests as an infinite loop, not an error.**
 The run directory needs the full framework IL closure; `Console.WriteLine` transitively pulls in
@@ -668,8 +700,15 @@ a method removes its *code*, but the `WasmTypeNode` dependency is marked by
 publishes empty code and is skipped at emission via
 `MethodWithGCInfo.ShouldSkipEmittingObjectNode => IsEmpty` — yet its functype has already been
 marked, so it still lands in the type section, now referenced by **nothing**. Engines validate the
-type section independently of use, so the module is still rejected and the assembly still falls back
-to interpreted.
+type section independently of use, so the module is still rejected.
+
+What happens next changed on 2026-08-28:
+[#132870](https://github.com/dotnet/runtime/pull/132870) replaced `libCorerun.js`'s `return false` on
+a failed `WebAssembly.Module` construction with a thrown
+`Failed to construct WebAssembly module for Webcil image '<path>'`. So under `corerun.js` an
+engine-*rejected* image is now a hard failure rather than a silent fall back to interpreted. A
+*missing* image, a naming mismatch, or an ordinary probe miss still falls back silently — the
+distinction is "present but unloadable" versus "not found".
 
 Two consequences:
 
@@ -869,11 +908,25 @@ against any composite without building anything — parse the CLI header and con
 The runtime loads these images. [#132650](https://github.com/dotnet/runtime/pull/132650) makes R2RDump
 read them; until it merges, use the facts above rather than the tool's verdict.
 
-Pass `-r <dir>` a **directory**, never a glob. A glob expands to the first match and the rest are
-silently dropped with a `No files matching` line that is easy to miss; the damage surfaces much later
-as an unrelated-looking signature or token decode failure. Both of these are the same UX failure —
-**a message that points away from its cause** — which is worth recognising as a category, because the
-time is lost downstream of the message, investigating the thing it named.
+`-r` and `--rp` are different options and the distinction bites. `--reference`/`-r` takes explicit
+reference **files** and glob-expands each token itself; `--referencePath`/`--rp` takes **directories**
+to search. So `-r` wants a *quoted* glob:
+
+```bash
+R2RDump ... -r '/path/to/refs/*.dll'      # correct: the tool expands it
+R2RDump ... -r /path/to/refs              # wrong: silently matches nothing
+```
+
+A bare directory fails because `AppendExpandedPaths` splits the argument with
+`Path.GetDirectoryName` / `Path.GetFileName` and calls `Directory.EnumerateFiles(dir, pattern)` — so
+`/path/to/refs` becomes "a file literally named `refs` inside `/path/to`", which does not exist.
+Leaving the glob unquoted is the other way to lose: the shell expands it first and only the first
+match binds to `-r`. Both failures emit a `No files matching` line that is easy to miss, and the
+damage surfaces much later as an unrelated-looking signature or token decode failure.
+
+That and the composite rejection above are the same UX failure — **a message that points away from
+its cause** — which is worth recognising as a category, because the time is lost downstream of the
+message, investigating the thing it named.
 
 For live debugging of a trapping `call_indirect`, arm a pre-trap breakpoint at the known byte offset
 rather than relying on an exception pause — the host wrapper catches and rethrows, so the trap never
@@ -1059,9 +1112,10 @@ Two host limits bind, and only one of them is ours:
 **The limit that is not ours** is the wasm `effective type size` cap of 1,000,000, which a composite
 exporting every function reaches at roughly **160,000 exports** — both `wasm-tools` and `wasmtime`
 reject with the identical message, since both use `wasmparser`. Filed as
-[#132905](https://github.com/dotnet/runtime/issues/132905); fixed by emitting a name section instead
-of exporting every function, which drops a framework composite from 228,626 exports (28.4 MB) to 4.
-If you are on a crossgen2 that predates that fix, the symptom is:
+[#132905](https://github.com/dotnet/runtime/issues/132905). **The fix — emitting a name section
+instead of exporting every function, which drops a framework composite from 228,626 exports
+(28.4 MB) to 4 — is not on `main` yet.** It lives on an unmerged branch, so a crossgen2 built from
+`main` still exports every function and still hits this. The symptom there is:
 
 ```
 error: effective type size exceeds the limit of 1000000 (at offset 0x1371443)
