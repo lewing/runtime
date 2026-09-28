@@ -228,7 +228,8 @@ the embedded buffer and maps raw per-assembly WebCIL forwarding stubs from `comp
 The composer extracts those payloads from their self-installing Wasm wrappers at build time.
 Placing a composite on disk without composing it into the host does not satisfy this contract.
 
-Publishing sizes the host reservations from the generated app/framework composite.
+Publishing sizes the host reservations from the generated app/framework composite. Runtime tests
+instead use the shared corerun's fixed reservations and compose only their test assemblies.
 See [the WASI R2R workflow](../../workflow/building/coreclr/wasi-r2r.md) for usage and diagnostics.
 
 ### Webcil payload
