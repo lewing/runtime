@@ -16,10 +16,22 @@
       <EventPipeName>libeventpipe-disabled</EventPipeName>
       <EventPipeName Condition="'$(EventSourceSupport)' == 'true'">libeventpipe-enabled</EventPipeName>
       <LinkStandardCPlusPlusLibrary Condition="'$(LinkStandardCPlusPlusLibrary)' == '' and '$(InvariantGlobalization)' != 'true'">true</LinkStandardCPlusPlusLibrary>
+
+      <!-- Experimental: link the core module with the managed wasm-ld replacement (src/tools/WebAssembly/wasm-link)
+           instead of wasm-ld. clang and wasm-component-ld still drive the link and build the component; only the
+           wasm-ld step they invoke is replaced. -->
+      <IlcUseManagedWasmLinker Condition="'$(IlcUseManagedWasmLinker)' == ''">false</IlcUseManagedWasmLinker>
+      <IlcManagedWasmLinkerPath Condition="'$(IlcManagedWasmLinkerPath)' == ''">$(IlcToolsPath)wasm-link.dll</IlcManagedWasmLinkerPath>
+      <_IlcManagedWasmLinkerShim Condition="'$(IlcUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(NativeIntermediateOutputPath)wasm-link.sh</_IlcManagedWasmLinkerShim>
+      <_IlcManagedWasmLinkerShim Condition="'$(IlcUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(NativeIntermediateOutputPath)wasm-link.cmd</_IlcManagedWasmLinkerShim>
+      <_IlcDotNetHostPath>$(DOTNET_HOST_PATH)</_IlcDotNetHostPath>
+      <_IlcDotNetHostPath Condition="'$(_IlcDotNetHostPath)' == ''">dotnet</_IlcDotNetHostPath>
     </PropertyGroup>
 
     <Error Condition="!Exists('$(CppLinker)')" Text="The WASI compiler was not found at '$(CppLinker)'." />
     <Error Condition="!Exists('$(CppLibCreator)')" Text="The WASI archive tool was not found at '$(CppLibCreator)'." />
+    <Error Condition="'$(IlcUseManagedWasmLinker)' == 'true' and !Exists('$(IlcManagedWasmLinkerPath)')"
+           Text="IlcUseManagedWasmLinker=true requires the managed linker; set IlcManagedWasmLinkerPath to wasm-link.dll (not found at '$(IlcManagedWasmLinkerPath)')." />
 
     <ItemGroup>
       <NetCoreAppNativeLibrary Include="System.Native" />
@@ -57,7 +69,27 @@
       <LinkerArg Include="-g" Condition="'$(NativeDebugSymbols)' == 'true'" />
       <LinkerArg Include="-Wl,-s" Condition="'$(WasmNativeStrip)' == 'true'" />
       <LinkerArg Include="-Wl,--compress-relocations" Condition="'$(WasmNativeStrip)' == 'true'" />
+      <LinkerArg Include="-Wl,--wasm-ld-path,&quot;$(_IlcManagedWasmLinkerShim)&quot;" Condition="'$(IlcUseManagedWasmLinker)' == 'true'" />
     </ItemGroup>
+  </Target>
+
+  <!-- wasm-component-ld runs wasm-ld through an executable path, so give it a launcher for the managed linker. -->
+  <Target Name="_CreateManagedWasmLinkerShim"
+          BeforeTargets="LinkNative"
+          DependsOnTargets="SetupOSSpecificProps"
+          Condition="'$(IlcUseManagedWasmLinker)' == 'true'">
+    <MakeDir Directories="$(NativeIntermediateOutputPath)" />
+    <WriteLinesToFile Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
+                      File="$(_IlcManagedWasmLinkerShim)"
+                      Lines="#!/bin/sh;exec &quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; &quot;%24@&quot;"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
+    <Exec Condition="!$([MSBuild]::IsOSPlatform('Windows'))" Command="chmod +x &quot;$(_IlcManagedWasmLinkerShim)&quot;" />
+    <WriteLinesToFile Condition="$([MSBuild]::IsOSPlatform('Windows'))"
+                      File="$(_IlcManagedWasmLinkerShim)"
+                      Lines="@&quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; %25*"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
   </Target>
 
   <Target Name="CreateShimExes">
