@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
+    <RollForward>Major</RollForward>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.XUnitExtensions" Version="$(MicrosoftDotNetXUnitExtensionsVersion)" />
+    <ProjectReference Include="..\..\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="TestAssets\**\*.wat;TestAssets\**\*.wasm" CopyToOutputDirectory="PreserveNewest" />
+    <EmbeddedResource Include="TestAssets\hello.wasm" LogicalName="hello.wasm" />
+    <EmbeddedResource Include="TestAssets\calculator.wasm" LogicalName="calculator.wasm" />
+    <EmbeddedResource Include="TestAssets\sorting.wasm" LogicalName="sorting.wasm" />
+    <EmbeddedResource Include="TestAssets\dwarf\add_probe_O0.wasm" LogicalName="dwarf/add_probe_O0.wasm" />
+    <EmbeddedResource Include="TestAssets\dwarf\add_probe_O1.wasm" LogicalName="dwarf/add_probe_O1.wasm" />
+  </ItemGroup>
+
+</Project>
