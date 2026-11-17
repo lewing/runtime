@@ -68,11 +68,9 @@ tests (`WasmLdParityTests`) record any future divergence in `s_knownGaps` with i
 * TLS (`__tls_base`, TLS segments and relocations) is not supported.
 * Shared memory and atomics (`--shared-memory`, `0xFE` instructions) are not supported. Threaded builds can't be linked
   (Blazor-Playground/nesm#572).
-* `.debug_str` is not merged across inputs.
 * No built-in WASI preview1 adapters: modules that import `wasi_snapshot_preview1` need `--adapt`. NativeAOT and CoreCLR
   `wasm32-wasip2` builds don't need one.
 * `--component-type` takes binary payloads only, not WIT text (Blazor-Playground/nesm#576).
-* `__heap_end` is -1 with `--max-memory=4294967296`, which crashes the WASI CoreCLR host (Blazor-Playground/nesm#577).
 
 ## Native tools in CoreCLR and NativeAOT WebAssembly app builds
 
@@ -81,7 +79,7 @@ Mono is out of scope. It is being removed.
 | Tool | Where | Status |
 |------|-------|--------|
 | `wasm-component-ld` (wasm-ld plus component wrapping), driven by `clang` | NativeAOT WASI (`src/coreclr/nativeaot/BuildIntegration/Microsoft.NETCore.Native.Wasm.targets`) | Opt in with `IlcUseManagedWasmLinker=true` (set `IlcManagedWasmLinkerPath` to `wasm-link.dll`). clang runs the managed linker through `-fuse-ld=<launcher>`, which links the core module and builds the component (`wasm-link --component`). All 14 NativeAOT WASI smoke tests pass. On the same objects the core module is identical to wasm-ld's; the component is valid, has an equivalent WIT world, and is about 5 KB smaller than wasm-component-ld's. `llvm-ar` (`NativeLib=Static`) still needs an archive writer (Blazor-Playground/nesm#570). |
-| `wasm-component-ld`, driven by `clang++` | WASI CoreCLR per-app host relink (`src/mono/wasi/build/WasiApp.CoreCLR.targets`) | Opt in with `WasiUseManagedWasmLinker=true` and `WasiManagedWasmLinkerPath`. The link succeeds and validates, but the host traps at startup because `__heap_end` is wrong (Blazor-Playground/nesm#577). The `wasi:http` WIT world is pre-encoded with wasm-tools because WIT text isn't parsed yet (Blazor-Playground/nesm#576). |
+| `wasm-component-ld`, driven by `clang++` | WASI CoreCLR per-app host relink (`src/mono/wasi/build/WasiApp.CoreCLR.targets`) | Opt in with `WasiUseManagedWasmLinker=true` and `WasiManagedWasmLinkerPath`. The console sample runs under wasmtime. Its core module is identical to wasm-ld's apart from the `name` and `producers` sections, the component has an equivalent WIT world, and the host is 214 KB (0.6%) smaller than the default build, mostly from the shorter, non-demangled `name` section. The `wasi:http` WIT world is pre-encoded with wasm-tools because WIT text isn't parsed yet (Blazor-Playground/nesm#576). |
 | `wasm-tools parse`/`validate`, `wasm-merge`, `wasm-tools component unbundle`, optional `wasm-opt --simplify-globals` | WASI ReadyToRun composition (`src/tasks/WasmAppBuilder/ComposeWasiReadyToRun.cs`) | WAT parsing and validation exist here. A C# fallback already replaces `--simplify-globals`. Module merge and component unbundle are still needed (Blazor-Playground/nesm#570). |
 | `emcc` link | Browser CoreCLR relink (`src/mono/browser/build/BrowserWasmApp.CoreCLR.targets`) | Also generates the JS glue, so wasm-ld can't be swapped out here. |
 | `wasm-opt -Oz`/`-O2` (opt-in) | Browser CoreCLR relink and ReadyToRun images | Optimizer; not a replacement target. |

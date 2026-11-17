@@ -1511,7 +1511,8 @@ internal sealed class ObjectFileLinker
         {
             "__data_end" => DataEnd,
             "__heap_base" => HeapBase,
-            "__heap_end" => checked((uint)Math.Min((MaxPages ?? InitialPages) * PageSize, uint.MaxValue)),
+            // wasm-ld: the end of the initial memory, regardless of --max-memory (#577).
+            "__heap_end" => unchecked((uint)((ulong)InitialPages * PageSize)),
             "__global_base" => GlobalBase,
             "__stack_low" => StackLow,
             "__stack_high" => StackHigh,
@@ -1670,21 +1671,39 @@ internal sealed class ObjectFileLinker
     /// </summary>
     private static void MergeStrings(MergedChunk merged)
     {
-        var distinct = new Dictionary<string, uint>(StringComparer.Ordinal);
+        var datas = new List<(byte[] Data, string Owner)>();
         foreach ((ObjFile file, int s) in merged.Members)
+            datas.Add((file.Module.DataSegments[s].InitData, $"{file.Name}: mergeable segment {s}"));
+        var pieces = MergeStringPieces(datas, out merged.Bytes);
+        for (int i = 0; i < merged.Members.Count; i++)
         {
-            byte[] data = file.Module.DataSegments[s].InitData;
-            var inputs = new List<uint>();
+            (ObjFile file, int s) = merged.Members[i];
+            file.PieceInput[s] = pieces[i].Inputs;
+            file.PieceOutput[s] = pieces[i].Outputs;
+        }
+    }
+
+    /// <summary>
+    /// The core of wasm-ld's string merging (<c>SyntheticMergedChunk</c>): returns the merged bytes and, for each
+    /// input, the start of every piece and where that piece now lives.
+    /// </summary>
+    private static List<(uint[] Inputs, uint[] Outputs)> MergeStringPieces(List<(byte[] Data, string Owner)> inputs, out byte[] bytes)
+    {
+        var distinct = new Dictionary<string, uint>(StringComparer.Ordinal);
+        var starts = new List<uint[]>(inputs.Count);
+        foreach ((byte[] data, string owner) in inputs)
+        {
+            var pieceStarts = new List<uint>();
             for (int start = 0; start < data.Length;)
             {
                 int end = Array.IndexOf(data, (byte)0, start);
                 if (end < 0)
-                    throw new LinkerException($"{file.Name}: string in mergeable segment {s} is not null terminated.");
-                inputs.Add((uint)start);
+                    throw new LinkerException($"{owner}: string is not null terminated.");
+                pieceStarts.Add((uint)start);
                 distinct.TryAdd(Latin1(data.AsSpan(start, end + 1 - start)), 0);
                 start = end + 1;
             }
-            file.PieceInput[s] = [.. inputs];
+            starts.Add([.. pieceStarts]);
         }
 
         // Latin-1 maps bytes to chars one-to-one, so ordinal string comparison is byte comparison.
@@ -1715,23 +1734,37 @@ internal sealed class ObjectFileLinker
             content.Append(str);
             previous = str;
         }
-        merged.Bytes = System.Text.Encoding.Latin1.GetBytes(content.ToString());
+        bytes = System.Text.Encoding.Latin1.GetBytes(content.ToString());
 
-        foreach ((ObjFile file, int s) in merged.Members)
+        var result = new List<(uint[] Inputs, uint[] Outputs)>(inputs.Count);
+        for (int i = 0; i < inputs.Count; i++)
         {
-            byte[] data = file.Module.DataSegments[s].InitData;
-            uint[] inputs = file.PieceInput[s];
-            var outputs = new uint[inputs.Length];
-            for (int i = 0; i < inputs.Length; i++)
+            byte[] data = inputs[i].Data;
+            uint[] pieceStarts = starts[i];
+            var outputs = new uint[pieceStarts.Length];
+            for (int p = 0; p < pieceStarts.Length; p++)
             {
-                int start = (int)inputs[i];
+                int start = (int)pieceStarts[p];
                 int end = Array.IndexOf(data, (byte)0, start);
-                outputs[i] = distinct[Latin1(data.AsSpan(start, end + 1 - start))];
+                outputs[p] = distinct[Latin1(data.AsSpan(start, end + 1 - start))];
             }
-            file.PieceOutput[s] = outputs;
+            result.Add((pieceStarts, outputs));
         }
 
+        return result;
+
         static string Latin1(ReadOnlySpan<byte> bytes) => System.Text.Encoding.Latin1.GetString(bytes);
+    }
+
+    /// <summary>The output offset of <paramref name="offset"/> within a merged input, through its piece map.</summary>
+    private static uint MergedOffset((uint[] Inputs, uint[] Outputs) pieces, uint offset)
+    {
+        int index = Array.BinarySearch(pieces.Inputs, offset);
+        if (index < 0)
+            index = ~index - 1;
+        if (index < 0)
+            throw new LinkerException($"offset {offset} is outside a merged string section.");
+        return pieces.Outputs[index] + (offset - pieces.Inputs[index]);
     }
 
     /// <summary>Linear-memory address of <paramref name="offset"/> within input data segment <paramref name="segment"/>.</summary>
@@ -1871,19 +1904,34 @@ internal sealed class ObjectFileLinker
             offset += LebLength(length) + length;
         }
 
-        // Each file's contribution offset within each combined section.
+        // Each file's contribution offset within each combined section. String sections are merged instead (as
+        // wasm-ld's SyntheticMergedChunk), and offsets into them go through each file's piece map.
         var contributions = new Dictionary<(ObjFile File, string Section), uint>();
+        var merged = new Dictionary<(ObjFile File, string Section), (uint[] Inputs, uint[] Outputs)>();
         var result = new List<CustomSection>();
         foreach (string name in names)
         {
-            using var combined = new MemoryStream();
-            foreach (ObjFile file in _files)
+            var members = _files
+                .Select(file => (File: file, Section: file.Module.CustomSections.FirstOrDefault(c => c.Name == name)))
+                .Where(m => m.Section is not null)
+                .ToList();
+            if (IsMergedStringSection(name))
             {
-                CustomSection? section = file.Module.CustomSections.FirstOrDefault(c => c.Name == name);
-                if (section is null)
-                    continue;
+                var pieces = MergeStringPieces(members.Select(m => (m.Section!.Content, $"{m.File.Name}: section {name}")).ToList(), out byte[] mergedBytes);
+                for (int i = 0; i < members.Count; i++)
+                {
+                    contributions[(members[i].File, name)] = 0;
+                    merged[(members[i].File, name)] = pieces[i];
+                }
+                result.Add(new CustomSection(name, mergedBytes));
+                continue;
+            }
+
+            using var combined = new MemoryStream();
+            foreach (var (file, section) in members)
+            {
                 contributions[(file, name)] = (uint)combined.Length;
-                combined.Write(section.Content);
+                combined.Write(section!.Content);
             }
             result.Add(new CustomSection(name, combined.ToArray()));
         }
@@ -1902,7 +1950,7 @@ internal sealed class ObjectFileLinker
                 foreach (Relocation reloc in relocs)
                 {
                     int at = checked((int)(start + reloc.Offset));
-                    ulong? value = DebugValue(file, reloc, codeOffsets, funcImportCount, contributions);
+                    ulong? value = DebugValue(file, reloc, codeOffsets, funcImportCount, contributions, merged);
                     Patch(bytes, at, reloc.Type, value ?? Tombstone(name, reloc.Type));
                 }
             }
@@ -1916,7 +1964,8 @@ internal sealed class ObjectFileLinker
         Relocation reloc,
         uint[] codeOffsets,
         uint funcImportCount,
-        Dictionary<(ObjFile File, string Section), uint> contributions)
+        Dictionary<(ObjFile File, string Section), uint> contributions,
+        Dictionary<(ObjFile File, string Section), (uint[] Inputs, uint[] Outputs)> merged)
     {
         Sym sym = file.Symbols[reloc.Index];
         switch (reloc.Type)
@@ -1933,6 +1982,8 @@ internal sealed class ObjectFileLinker
                 string? sectionName = FindSectionName(file, sectionIndex);
                 if (sectionName is null || !contributions.TryGetValue((file, sectionName), out uint start))
                     return null;
+                if (merged.TryGetValue((file, sectionName), out var pieces))
+                    return MergedOffset(pieces, checked((uint)reloc.Addend));
                 return (ulong)((long)start + reloc.Addend);
             case RelocationType.R_WASM_MEMORY_ADDR_I32:
             case RelocationType.R_WASM_MEMORY_ADDR_I64:
@@ -1946,6 +1997,9 @@ internal sealed class ObjectFileLinker
                 return null;
         }
     }
+
+    // wasm-ld merges these by name (lld/wasm/InputFiles.cpp shouldMerge), as long as -O is not 0.
+    private static bool IsMergedStringSection(string name) => name is ".debug_str" or ".debug_str.dwo" or ".debug_line_str";
 
     private static string? FindSectionName(ObjFile file, uint sectionIndex) =>
         file.Module.CustomSections.FirstOrDefault(c => c.SectionIndex == (int)sectionIndex)?.Name;
