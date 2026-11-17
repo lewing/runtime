@@ -25,6 +25,7 @@
     <ProjectReference Include="..\ILCompiler.Diagnostics\ILCompiler.Diagnostics.csproj" />
     <ProjectReference Include="..\ILCompiler.MetadataTransform\ILCompiler.MetadataTransform.csproj" />
     <ProjectReference Include="..\ILCompiler.TypeSystem\ILCompiler.TypeSystem.csproj" />
+    <ProjectReference Include="$(ToolsProjectRoot)WebAssembly\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
 
     <PackageReference Condition="'$(DotNetBuildSourceOnly)' != 'true'" Include="StaticCs" Version="$(StaticCsVersion)">
       <PrivateAssets>all</PrivateAssets>

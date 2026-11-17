@@ -12,6 +12,9 @@ using Internal.Text;
 using Internal.TypeSystem.TypesDebugInfo;
 using ILCompiler.DependencyAnalysis.Wasm;
 using System.Linq;
+using RelocationType = Microsoft.NET.WebAssembly.Binary.Linking.RelocationType;
+using SymbolFlags = Microsoft.NET.WebAssembly.Binary.Linking.SymbolFlags;
+using SymbolType = Microsoft.NET.WebAssembly.Binary.Linking.SymbolType;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -26,43 +29,9 @@ namespace ILCompiler.ObjectWriter
         private static readonly Utf8String RestoreContextTagName = new("__nativeaot_wasm_restore_context_tag");
         private static readonly ObjectNodeSection HydrationTargetSection = new(".bss.hydrated", SectionType.Uninitialized);
 
-        // https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
-        private enum SymbolKind : byte
-        {
-            Function = 0, // SYMTAB_FUNCTION
-            Data = 1, // SYMTAB_DATA
-            Global = 2, // SYMTAB_GLOBAL
-            Section = 3, // SYMTAB_SECTION
-            Tag = 4, // SYMTAB_EVENT
-            Table = 5, // SYMTAB_TABLE
-        }
-
-        private const uint UndefinedSymbol = 0x10; // WASM_SYM_UNDEFINED
-        private const uint LocalSymbol = 0x2; // WASM_SYM_BINDING_LOCAL
-        private const uint ExportedSymbol = 0x20; // WASM_SYM_EXPORTED
-        private const uint ExplicitNameSymbol = 0x40; // WASM_SYM_EXPLICIT_NAME
         private const byte SegmentInfoSubsection = 5; // WASM_SEGMENT_INFO
         private const byte SymbolTableSubsection = 8; // WASM_SYMBOL_TABLE
         private const uint LinkingVersion = 2;
-
-        private enum WasmRelocationType : byte
-        {
-            FunctionIndexLeb = 0, // R_WASM_FUNCTION_INDEX_LEB
-            TableIndexSleb = 1, // R_WASM_TABLE_INDEX_SLEB
-            TableIndexI32 = 2, // R_WASM_TABLE_INDEX_I32
-            MemoryAddrLeb = 3, // R_WASM_MEMORY_ADDR_LEB
-            MemoryAddrSleb = 4, // R_WASM_MEMORY_ADDR_SLEB
-            MemoryAddrI32 = 5, // R_WASM_MEMORY_ADDR_I32
-            TypeIndexLeb = 6, // R_WASM_TYPE_INDEX_LEB
-            GlobalIndexLeb = 7, // R_WASM_GLOBAL_INDEX_LEB
-            FunctionOffsetI32 = 8, // R_WASM_FUNCTION_OFFSET_I32
-            SectionOffsetI32 = 9, // R_WASM_SECTION_OFFSET_I32
-            TagIndexLeb = 10, // R_WASM_TAG_INDEX_LEB
-            MemoryAddrRelSleb = 11, // R_WASM_MEMORY_ADDR_REL_SLEB
-            MemoryAddrI64 = 16, // R_WASM_MEMORY_ADDR_I64
-            TableIndexI64 = 19, // R_WASM_TABLE_INDEX_I64
-            MemoryAddrLocrelI32 = 23, // R_WASM_MEMORY_ADDR_LOCREL_I32
-        }
 
         private readonly Dictionary<Utf8String, int> _linkingSymbolIndices = new();
         private readonly Dictionary<int, List<SymbolicRelocation>> _relocations = new();
@@ -252,7 +221,7 @@ namespace ILCompiler.ObjectWriter
                 }
 
                 AddSymbolIndex(name);
-                entries.WriteByte((byte)SymbolKind.Data); // kind: the symbol type (SYMTAB_DATA).
+                entries.WriteByte((byte)SymbolType.Data); // kind: the symbol type (SYMTAB_DATA).
                 WriteULEB128(entries, 0); // flags: a bitfield containing flags for this symbol.
                 WriteName(entries, name); // name_len/name_data: the UTF-8 symbol name.
                 WriteULEB128(entries, (ulong)_dataSection.GetSegmentIndex(segment)); // index: the index of the data segment.
@@ -268,8 +237,8 @@ namespace ILCompiler.ObjectWriter
                 }
 
                 AddSymbolIndex(name);
-                entries.WriteByte((byte)SymbolKind.Data); // kind: the symbol type (SYMTAB_DATA).
-                WriteULEB128(entries, UndefinedSymbol); // flags: a bitfield containing flags for this symbol.
+                entries.WriteByte((byte)SymbolType.Data); // kind: the symbol type (SYMTAB_DATA).
+                WriteULEB128(entries, (uint)SymbolFlags.Undefined); // flags: a bitfield containing flags for this symbol.
                 WriteName(entries, name); // name_len/name_data: the UTF-8 symbol name.
             }
 
@@ -278,8 +247,8 @@ namespace ILCompiler.ObjectWriter
                 if (section is WasmCustomSection)
                 {
                     AddSymbolIndex(section.SectionName);
-                    entries.WriteByte((byte)SymbolKind.Section);
-                    WriteULEB128(entries, LocalSymbol);
+                    entries.WriteByte((byte)SymbolType.Section);
+                    WriteULEB128(entries, (uint)SymbolFlags.BindingLocal);
                     WriteULEB128(entries, (ulong)fileSectionIndices[section.SectionIndex]);
                 }
             }
@@ -311,25 +280,25 @@ namespace ILCompiler.ObjectWriter
         private void WriteIndexedSymbol(Stream entries, WasmSymbol symbol)
         {
             AddSymbolIndex(symbol.Name);
-            SymbolKind kind = symbol.IndexSpace switch
+            SymbolType kind = symbol.IndexSpace switch
             {
-                WasmIndexSpace.Function => SymbolKind.Function,
-                WasmIndexSpace.Global => SymbolKind.Global,
-                WasmIndexSpace.Table => SymbolKind.Table,
-                WasmIndexSpace.Tag => SymbolKind.Tag,
+                WasmIndexSpace.Function => SymbolType.Function,
+                WasmIndexSpace.Global => SymbolType.Global,
+                WasmIndexSpace.Table => SymbolType.Table,
+                WasmIndexSpace.Tag => SymbolType.Tag,
                 _ => throw new UnreachableException(),
             };
-            uint flags = symbol.IsImport ? UndefinedSymbol : 0;
+            SymbolFlags flags = symbol.IsImport ? SymbolFlags.Undefined : SymbolFlags.None;
             if (symbol.HasExplicitName)
             {
-                flags |= ExplicitNameSymbol;
+                flags |= SymbolFlags.ExplicitName;
             }
             if (!symbol.IsImport && _definedSymbols.TryGetValue(symbol.Name, out SymbolDefinition definition) && definition.Global)
             {
-                flags |= ExportedSymbol;
+                flags |= SymbolFlags.Exported;
             }
             entries.WriteByte((byte)kind); // kind: the symbol type.
-            WriteULEB128(entries, flags); // flags: a bitfield containing flags for this symbol.
+            WriteULEB128(entries, (uint)flags); // flags: a bitfield containing flags for this symbol.
             WriteULEB128(entries, (ulong)symbol.Index); // index: the index of the Wasm object corresponding to the symbol.
             if (!symbol.IsImport || symbol.HasExplicitName)
             {
@@ -415,26 +384,26 @@ namespace ILCompiler.ObjectWriter
                         symbol.IndexSpace == WasmIndexSpace.Function;
                     bool isSection = _definedSymbols.TryGetValue(reloc.SymbolName, out SymbolDefinition definition) &&
                         _sections[definition.SectionIndex] is WasmCustomSection;
-                    WasmRelocationType type = reloc.Type switch
+                    RelocationType type = reloc.Type switch
                     {
-                        RelocType.WASM_FUNCTION_INDEX_LEB => WasmRelocationType.FunctionIndexLeb,
-                        RelocType.WASM_TYPE_INDEX_LEB => WasmRelocationType.TypeIndexLeb,
-                        RelocType.WASM_GLOBAL_INDEX_LEB => WasmRelocationType.GlobalIndexLeb,
-                        RelocType.WASM_CLR_RESTORE_CONTEXT_EXCEPTION_TAG_LEB => WasmRelocationType.TagIndexLeb,
-                        RelocType.WASM_TABLE_INDEX_SLEB => WasmRelocationType.TableIndexSleb,
-                        RelocType.WASM_TABLE_INDEX_I32 => WasmRelocationType.TableIndexI32,
-                        RelocType.WASM_TABLE_INDEX_I64 => WasmRelocationType.TableIndexI64,
-                        RelocType.WASM_MEMORY_ADDR_LEB => WasmRelocationType.MemoryAddrLeb,
-                        RelocType.WASM_MEMORY_ADDR_SLEB when isFunction => WasmRelocationType.TableIndexSleb,
-                        RelocType.WASM_MEMORY_ADDR_SLEB => WasmRelocationType.MemoryAddrSleb,
-                        RelocType.WASM_MEMORY_ADDR_REL_SLEB when isFunction => WasmRelocationType.TableIndexSleb,
-                        RelocType.WASM_MEMORY_ADDR_REL_SLEB => WasmRelocationType.MemoryAddrRelSleb,
-                        RelocType.IMAGE_REL_BASED_HIGHLOW when isFunction && section is WasmCustomSection => WasmRelocationType.FunctionOffsetI32,
-                        RelocType.IMAGE_REL_BASED_HIGHLOW when isSection => WasmRelocationType.SectionOffsetI32,
-                        RelocType.IMAGE_REL_BASED_HIGHLOW when isFunction => WasmRelocationType.TableIndexI32,
-                        RelocType.IMAGE_REL_BASED_HIGHLOW => WasmRelocationType.MemoryAddrI32,
-                        RelocType.IMAGE_REL_BASED_DIR64 => WasmRelocationType.MemoryAddrI64,
-                        RelocType.IMAGE_REL_BASED_RELPTR32 => WasmRelocationType.MemoryAddrLocrelI32,
+                        RelocType.WASM_FUNCTION_INDEX_LEB => RelocationType.R_WASM_FUNCTION_INDEX_LEB,
+                        RelocType.WASM_TYPE_INDEX_LEB => RelocationType.R_WASM_TYPE_INDEX_LEB,
+                        RelocType.WASM_GLOBAL_INDEX_LEB => RelocationType.R_WASM_GLOBAL_INDEX_LEB,
+                        RelocType.WASM_CLR_RESTORE_CONTEXT_EXCEPTION_TAG_LEB => RelocationType.R_WASM_TAG_INDEX_LEB,
+                        RelocType.WASM_TABLE_INDEX_SLEB => RelocationType.R_WASM_TABLE_INDEX_SLEB,
+                        RelocType.WASM_TABLE_INDEX_I32 => RelocationType.R_WASM_TABLE_INDEX_I32,
+                        RelocType.WASM_TABLE_INDEX_I64 => RelocationType.R_WASM_TABLE_INDEX_I64,
+                        RelocType.WASM_MEMORY_ADDR_LEB => RelocationType.R_WASM_MEMORY_ADDR_LEB,
+                        RelocType.WASM_MEMORY_ADDR_SLEB when isFunction => RelocationType.R_WASM_TABLE_INDEX_SLEB,
+                        RelocType.WASM_MEMORY_ADDR_SLEB => RelocationType.R_WASM_MEMORY_ADDR_SLEB,
+                        RelocType.WASM_MEMORY_ADDR_REL_SLEB when isFunction => RelocationType.R_WASM_TABLE_INDEX_SLEB,
+                        RelocType.WASM_MEMORY_ADDR_REL_SLEB => RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB,
+                        RelocType.IMAGE_REL_BASED_HIGHLOW when isFunction && section is WasmCustomSection => RelocationType.R_WASM_FUNCTION_OFFSET_I32,
+                        RelocType.IMAGE_REL_BASED_HIGHLOW when isSection => RelocationType.R_WASM_SECTION_OFFSET_I32,
+                        RelocType.IMAGE_REL_BASED_HIGHLOW when isFunction => RelocationType.R_WASM_TABLE_INDEX_I32,
+                        RelocType.IMAGE_REL_BASED_HIGHLOW => RelocationType.R_WASM_MEMORY_ADDR_I32,
+                        RelocType.IMAGE_REL_BASED_DIR64 => RelocationType.R_WASM_MEMORY_ADDR_I64,
+                        RelocType.IMAGE_REL_BASED_RELPTR32 => RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32,
                         _ => throw new NotSupportedException($"Relocation type {reloc.Type} for symbol '{reloc.SymbolName}' in section {section.SectionName} not yet implemented"),
                     };
                     Utf8String symbolName = reloc.SymbolName;
@@ -443,7 +412,7 @@ namespace ILCompiler.ObjectWriter
                         symbolName = RestoreContextTagName;
                         symbol = _wasmSymbolManager.GetSymbol(symbolName);
                     }
-                    if (isFunction && type != WasmRelocationType.FunctionOffsetI32 && addend != 0)
+                    if (isFunction && type != RelocationType.R_WASM_FUNCTION_OFFSET_I32 && addend != 0)
                     {
                         // The JIT encodes funclet references as parent + ordinal, but the linker can reorder table entries.
                         Utf8String funcletName = GetFuncletName(symbolName, checked((int)addend - 1));
@@ -452,10 +421,10 @@ namespace ILCompiler.ObjectWriter
                         symbolName = funcletName;
                         addend = 0;
                     }
-                    bool hasAddend = type is WasmRelocationType.MemoryAddrLeb or WasmRelocationType.MemoryAddrSleb or
-                        WasmRelocationType.MemoryAddrI32 or WasmRelocationType.MemoryAddrI64 or
-                        WasmRelocationType.FunctionOffsetI32 or WasmRelocationType.SectionOffsetI32 or
-                        WasmRelocationType.MemoryAddrRelSleb or WasmRelocationType.MemoryAddrLocrelI32;
+                    bool hasAddend = type is RelocationType.R_WASM_MEMORY_ADDR_LEB or RelocationType.R_WASM_MEMORY_ADDR_SLEB or
+                        RelocationType.R_WASM_MEMORY_ADDR_I32 or RelocationType.R_WASM_MEMORY_ADDR_I64 or
+                        RelocationType.R_WASM_FUNCTION_OFFSET_I32 or RelocationType.R_WASM_SECTION_OFFSET_I32 or
+                        RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32;
                     if (!hasAddend && addend != 0)
                     {
                         throw new NotSupportedException($"Nonzero addend for {reloc.Type} relocation to '{reloc.SymbolName}'");
@@ -465,7 +434,7 @@ namespace ILCompiler.ObjectWriter
                     payload.WriteByte((byte)type); // type: the relocation type.
                     WriteULEB128(payload, checked((ulong)(contentOffset + reloc.Offset))); // offset: offset of the value to rewrite, relative to the section's contents.
                     // index: the symbol index, or the type index for R_WASM_TYPE_INDEX_LEB.
-                    WriteULEB128(payload, (ulong)(type == WasmRelocationType.TypeIndexLeb
+                    WriteULEB128(payload, (ulong)(type == RelocationType.R_WASM_TYPE_INDEX_LEB
                         ? symbol.Index : _linkingSymbolIndices[symbolName]));
                     if (hasAddend)
                     {
@@ -474,9 +443,9 @@ namespace ILCompiler.ObjectWriter
 
                     long value = type switch
                     {
-                        WasmRelocationType.FunctionIndexLeb or WasmRelocationType.TypeIndexLeb or WasmRelocationType.GlobalIndexLeb or WasmRelocationType.TagIndexLeb => symbol.Index,
-                        WasmRelocationType.FunctionOffsetI32 => codeSectionPrefixSize + _functionOffsets[symbol.Index] + addend,
-                        WasmRelocationType.SectionOffsetI32 => addend,
+                        RelocationType.R_WASM_FUNCTION_INDEX_LEB or RelocationType.R_WASM_TYPE_INDEX_LEB or RelocationType.R_WASM_GLOBAL_INDEX_LEB or RelocationType.R_WASM_TAG_INDEX_LEB => symbol.Index,
+                        RelocationType.R_WASM_FUNCTION_OFFSET_I32 => codeSectionPrefixSize + _functionOffsets[symbol.Index] + addend,
+                        RelocationType.R_WASM_SECTION_OFFSET_I32 => addend,
                         _ => 0,
                     };
                     Relocation.WriteValue(reloc.Type, pData, value);

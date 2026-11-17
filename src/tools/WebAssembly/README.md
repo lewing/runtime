@@ -89,7 +89,18 @@ Mono is out of scope. It is being removed.
 `src/coreclr/tools/Common/Compiler/ObjectWriter/Wasm*` partly duplicates this library: section and LEB encoding,
 the `linking` and `reloc.*` sections, and the name section. The ILCompiler front end, which maps nodes to symbols and
 relocations, and the Webcil layout are not redundant. This library's instruction encoder works from the WAT AST and
-has no programmatic instruction builder. A low-risk first step is to validate `WasmObjectWriter` output with
-`ModuleReader`/`WasmModuleValidator` in ILCompiler tests. Replacing serialization would then mean building a
-`WasmModule` and emitting it with `SectionMerger`, after checking memory use for large objects and deterministic
-output.
+has no programmatic instruction builder.
+
+Current state:
+
+- `ILCompiler.ReadyToRun.Tests` validates every crossgen2 wasm output with `ModuleReader.ReadModuleAndValidate`.
+- `ILCompiler.Compiler` has a `ProjectReference` to this library, not linked source. The library's types are public,
+  so linking its source into shipping assemblies would collide in tests that reference both. ilc is published with
+  NativeAOT, so only the used parts are kept: the reference grew ilc by about 9 KB, with no trim or AOT warnings.
+  crossgen2 doesn't reference the library yet, because its Webcil writer doesn't use these types.
+- `WasmRelocatableObjectWriter` uses this library's linking model (`SymbolType`, `SymbolFlags`, `RelocationType`)
+  instead of its own copies. Its output is byte-identical before and after.
+- The section, `linking`/`reloc.*` and name-section encoding stays in ObjectWriter. This library has no
+  producer-side API that can reproduce that output byte for byte while streaming large objects
+  ([nesm#581](https://github.com/Blazor-Playground/nesm/issues/581); instruction builder:
+  [nesm#570](https://github.com/Blazor-Playground/nesm/issues/570)).
