@@ -205,6 +205,7 @@
     <SubsetName Include="Tools.CdacStressTests" OnDemand="true" Description="Stress integration tests for the diagnostic data contract reader." />
     <SubsetName Include="Tools.ILAsm" OnDemand="true" Description="Build and package the ilasm tool." />
     <SubsetName Include="Tools.ILDAsm" OnDemand="true" Description="Build and package the managed ildasm tool." />
+    <SubsetName Include="Tools.WasmToolchain" OnDemand="true" Description="Managed WebAssembly toolchain library, wasm-link tool and their tests." />
 
     <!-- Host -->
     <SubsetName Include="Host" Description="The .NET hosts, packages, hosting libraries, and tests. Equivalent to: $(DefaultHostSubsets)" />
@@ -553,6 +554,15 @@
                     Category="tools" />
     <ProjectToBuild Include="$(CoreClrProjectRoot).nuget\Microsoft.NETCore.ILAsm\Microsoft.NETCore.ILAsm.Package.csproj"
                     Category="tools" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(_subset.Contains('+tools.wasmtoolchain+'))">
+    <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" Category="tools" />
+    <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\wasm-link\wasm-link.csproj" Category="tools" />
+    <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\tests\Microsoft.NET.WebAssembly.Toolchain.Tests\Microsoft.NET.WebAssembly.Toolchain.Tests.csproj"
+                    Condition="'$(DotNetBuildSourceOnly)' != 'true'"
+                    Category="tools"
+                    Test="true" />
   </ItemGroup>
 
   <ItemGroup Condition="$(_subset.Contains('+clr.packages+')) and !$(_subset.Contains('+tools.ilasm+')) and ('$(RuntimeFlavor)' != 'CoreCLR' or '$(SdkToolsSupported)' != 'true')">
