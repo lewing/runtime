@@ -149,6 +149,39 @@ public class WasmLdCommandLineTests
     }
 
     [Fact]
+    public void ResponseFile_QuotingStyleMayBeASeparateArgumentAndFilesNest()
+    {
+        string dir = CreateTempDirectory();
+        string inner = Path.Combine(dir, "inner.rsp");
+        File.WriteAllText(inner, "\"C:\\x y\\a.o\"");
+        string outer = Path.Combine(dir, "outer.rsp");
+        File.WriteAllText(outer, $"b.o @{inner}");
+
+        Assert.Equal(["b.o", "C:\\x y\\a.o"], WasmLdCommandLine.Parse(["--rsp-quoting", "windows", $"@{outer}"]).InputFiles);
+        Assert.Throws<WasmLdArgumentException>(() => WasmLdCommandLine.Parse(["--rsp-quoting=cmd", $"@{outer}"]));
+    }
+
+    /// <summary>A response file that includes itself is an error (as LLVM's "recursive expansion"), not a stack overflow.</summary>
+    [Fact]
+    public void ResponseFile_RecursionIsAnErrorButRepetitionIsNot()
+    {
+        string dir = CreateTempDirectory();
+        string self = Path.Combine(dir, "self.rsp");
+        File.WriteAllText(self, $"a.o @{self}");
+        string first = Path.Combine(dir, "first.rsp"), second = Path.Combine(dir, "second.rsp");
+        File.WriteAllText(first, $"b.o @{second}");
+        File.WriteAllText(second, $"c.o @{first}");
+        string leaf = Path.Combine(dir, "leaf.rsp");
+        File.WriteAllText(leaf, "d.o");
+        string twice = Path.Combine(dir, "twice.rsp");
+        File.WriteAllText(twice, $"@{leaf} @{leaf}");
+
+        Assert.Contains("recursive", Assert.Throws<WasmLdArgumentException>(() => WasmLdCommandLine.Parse([$"@{self}"])).Message);
+        Assert.Contains("recursive", Assert.Throws<WasmLdArgumentException>(() => WasmLdCommandLine.Parse([$"@{first}"])).Message);
+        Assert.Equal(["d.o", "d.o"], WasmLdCommandLine.Parse([$"@{twice}"]).InputFiles);
+    }
+
+    [Fact]
     public void ResponseFile_WindowsQuotingKeepsBackslashes()
     {
         string dir = CreateTempDirectory();

@@ -32,6 +32,11 @@ Debugging/Symbols/ManagedSymbolProviders.cs
 Debugging/Symbols/SymbolModel.cs
 Debugging/Symbols/SymbolProviders.cs
 Debugging/Symbols/SymbolResolver.cs
+Linker/Components/AdapterModule.cs
+Linker/Components/CanonicalAbi.cs
+Linker/Components/ComponentEncoder.cs
+Linker/Components/ComponentTypes.cs
+Linker/Components/WitWorld.cs
 Linker/ConstExprScanner.cs
 Linker/DceLiveSet.cs
 Linker/DeadCodeEliminator.cs
@@ -42,6 +47,8 @@ Linker/RelocationEngine.cs
 Linker/SectionMerger.cs
 Linker/SingleObjectRelocator.cs
 Linker/SymbolTable.cs
+Linker/WasmLdCommandLine.cs
+Linker/WasmLdDriver.cs
 Linker/WasmLinker.cs
 Module/BranchHint.cs
 Module/CustomSection.cs

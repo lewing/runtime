@@ -12,6 +12,7 @@ Linker/ImportMergingTests.cs
 Linker/RelocationEngineTests.cs
 Linker/SectionMergerTests.cs
 Linker/SingleObjectRelocatorTests.cs
+Linker/WasmLdCommandLineTests.cs
 Linker/WasmLinkerTests.cs
 Linker/WasmModuleStartFunctionTests.cs
 Linker/WatIntegrationTests.cs

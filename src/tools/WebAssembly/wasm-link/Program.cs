@@ -15,21 +15,28 @@ if (args.Length == 0 || args is ["-h" or "--help"])
         e.g. --export=, --export-if-defined=, --allow-undefined, --no-entry, --entry=, --gc-sections,
         --import-memory, --export-memory, --shared-memory, --initial-memory=, --max-memory=,
         --global-base=, --stack-first, -z stack-size=, --table-base=, --export-table,
-        --growable-table, --strip-debug, --strip-all, -L<dir>, -l<lib>.
+        --growable-table, --strip-debug, --strip-all, --compress-relocations, -L<dir>, -l<lib>.
+
+        Component output (wasm-component-ld compatible):
+          --component                 wrap the linked core module into a component
+          --component-type <file>     extra component-type (WIT world) payload
+          --adapt [NAME=]<file>       adapter module for core imports from NAME
+          --wasi-adapter <kind>       command|reactor|proxy|none (no built-in adapters; use --adapt)
+          --skip-wit-component        emit the core module
+          --wasm-ld-path <path>       accepted and ignored
         """);
     return args.Length == 0 ? 1 : 0;
 }
 
 try
 {
-    WasmLdCommandLine commandLine = WasmLdCommandLine.Parse(args);
-    WasmLdDriver.Run(
-        commandLine,
-        log: commandLine.Verbose ? Console.WriteLine : null,
+    WasmComponentLdCommandLine commandLine = WasmComponentLdCommandLine.Parse(args);
+    commandLine.Run(
+        log: commandLine.WasmLd.Verbose ? Console.WriteLine : null,
         warn: static message => Console.Error.WriteLine($"wasm-link: warning: {message}"));
     return 0;
 }
-catch (Exception ex) when (ex is WasmLdArgumentException or LinkerException or WasmFormatException or WasmValidationException or IOException or InvalidDataException)
+catch (Exception ex) when (ex is WasmLdArgumentException or LinkerException or WasmFormatException or WasmValidationException or IOException or InvalidDataException or NotSupportedException or FormatException)
 {
     Console.Error.WriteLine($"wasm-link: error: {ex.Message}");
     return 1;

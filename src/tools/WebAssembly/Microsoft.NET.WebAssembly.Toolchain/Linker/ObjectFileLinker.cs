@@ -24,7 +24,7 @@ using Microsoft.NET.WebAssembly.Wat;
 /// nothing defines it and <see cref="LinkerOptions.AllowUndefined"/> is set.
 /// </para>
 /// <para>
-/// Not yet implemented: shared memory, thread-local storage and position-independent code. Each is rejected with
+/// Not yet implemented: shared memory (and with it multithreaded TLS) and position-independent output. Each is rejected with
 /// a <see cref="LinkerException"/> rather than producing a module that would run incorrectly.
 /// </para>
 /// </remarks>
@@ -366,12 +366,6 @@ internal sealed class ObjectFileLinker
             }
         }
 
-        foreach (SegmentInfo info in linking.SegmentInfos)
-        {
-            if ((info.Flags & SegmentFlags.Tls) != 0)
-                throw new LinkerException($"{file.Name}: thread-local data segment '{info.Name}' is not supported yet.");
-        }
-
         bool tableSymbolSeen = false;
         file.Symbols = new Sym[linking.Symbols.Count];
         for (int i = 0; i < linking.Symbols.Count; i++)
@@ -532,8 +526,8 @@ internal sealed class ObjectFileLinker
                 sym.Synthetic = sym.Kind == SymbolType.Data ? Synthetic.DataAddress : kind;
         }
 
-        // Thread-local accesses (wasi-libc's errno) read __tls_base. Without shared memory wasm-ld defines it as
-        // an immutable global; TLS segments are rejected, so it is 0.
+        // Thread-local accesses read __tls_base. Without shared memory wasm-ld lowers TLS to ordinary data and
+        // defines __tls_base as an immutable global holding the address of .tdata (LLD 23; see MemoryLayout.TlsBase).
         if (_globals.TryGetValue(TlsBaseName, out Sym? tlsBase) && !tlsBase.IsDefined && tlsBase.Kind == SymbolType.Global)
             tlsBase.Synthetic = Synthetic.TlsBase;
     }
@@ -930,7 +924,12 @@ internal sealed class ObjectFileLinker
             {
                 sym.OutIndex = nextGlobal++;
                 sym.HasOutIndex = true;
-                uint value = sym.Synthetic == Synthetic.TableBase ? _options.TableBase ?? 1 : 0;
+                uint value = sym.Synthetic switch
+                {
+                    Synthetic.TableBase => _options.TableBase ?? 1,
+                    Synthetic.TlsBase => layout.TlsBase,
+                    _ => 0,
+                };
                 globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
                 globalNames.Add(sym.Name);
             }
@@ -1020,6 +1019,9 @@ internal sealed class ObjectFileLinker
                         break;
                     case SymbolType.Data when file.SegOut[index] is not null:
                         sym.Address = AddressIn(file, (int)index, sym.Def!.Offset ?? 0);
+                        // As wasm-ld's getVA: a TLS symbol's address is its offset from __tls_base (the .tdata start).
+                        if ((sym.Def.Flags & SymbolFlags.Tls) != 0)
+                            sym.Address -= file.SegOut[index]!.Address;
                         sym.HasOutIndex = true;
                         break;
                 }
@@ -1404,6 +1406,10 @@ internal sealed class ObjectFileLinker
                 or RelocationType.R_WASM_MEMORY_ADDR_SLEB64 or RelocationType.R_WASM_MEMORY_ADDR_I64
                 or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB64
                 => DataAddress(sym!, reloc),
+            RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB or RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB64
+                => sym!.HasOutIndex && sym.Kind == SymbolType.Data
+                    ? DataAddress(sym, reloc)
+                    : throw new LinkerException($"{file.Name}: relocation {reloc.Type} cannot be used against an undefined symbol '{sym.Name}'."),
             RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32
                 => unchecked(DataAddress(sym!, reloc) - (site ?? throw new LinkerException($"{file.Name}: R_WASM_MEMORY_ADDR_LOCREL_I32 outside a data segment."))) & 0xFFFF_FFFF,
             RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I64
@@ -1444,6 +1450,7 @@ internal sealed class ObjectFileLinker
             case RelocationType.R_WASM_TABLE_INDEX_SLEB:
             case RelocationType.R_WASM_TABLE_INDEX_REL_SLEB:
             case RelocationType.R_WASM_MEMORY_ADDR_SLEB:
+            case RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB:
             case RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB:
                 RelocationEngine.WritePaddedLeb128S32(buffer, at, unchecked((int)(uint)value));
                 break;
@@ -1453,6 +1460,7 @@ internal sealed class ObjectFileLinker
             case RelocationType.R_WASM_TABLE_INDEX_SLEB64:
             case RelocationType.R_WASM_TABLE_INDEX_REL_SLEB64:
             case RelocationType.R_WASM_MEMORY_ADDR_SLEB64:
+            case RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB64:
             case RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB64:
                 WritePaddedLeb(buffer, at, value, signed: true);
                 break;
@@ -1492,6 +1500,11 @@ internal sealed class ObjectFileLinker
     private sealed class MemoryLayout
     {
         public uint StackPointer, StackLow, StackHigh, GlobalBase, DataEnd, HeapBase, InitialPages, TableBase;
+
+        /// <summary>
+        /// The address of .tdata, or the start of data when there is no TLS data (LLD 23; LLD 22 and earlier used 0).
+        /// </summary>
+        public uint TlsBase;
         public ulong? MaxPages;
 
         public uint AddressOf(string name) => name switch
@@ -1612,11 +1625,13 @@ internal sealed class ObjectFileLinker
             ptr = _options.GlobalBase ?? 1024;
         }
 
-        layout.GlobalBase = ptr;
+        layout.GlobalBase = layout.TlsBase = ptr;
         foreach (OutSegment segment in segments)
         {
             ptr = AlignUp(ptr, segment.Alignment);
             segment.Address = ptr;
+            if (segment.Name == ".tdata")
+                layout.TlsBase = ptr;
             ptr = checked(ptr + segment.Size);
             foreach ((ObjFile file, int s) in segment.Members)
                 file.SegAddress[s] = segment.Address + file.SegOffsetInOut[s];
@@ -1742,12 +1757,13 @@ internal sealed class ObjectFileLinker
         return name;
     }
 
+    // wasm-ld (LLD 23) orders output segments .rodata, .data, others, .tdata, .bss; LLD 22 and earlier put .tdata first.
     private static int SegmentRank(string name) =>
-        name.StartsWith(".tdata", StringComparison.Ordinal) ? 0
-        : name.StartsWith(".rodata", StringComparison.Ordinal) ? 1
-        : name.StartsWith(".data", StringComparison.Ordinal) ? 2
+        name.StartsWith(".rodata", StringComparison.Ordinal) ? 0
+        : name.StartsWith(".data", StringComparison.Ordinal) ? 1
+        : name.StartsWith(".tdata", StringComparison.Ordinal) ? 3
         : name.StartsWith(".bss", StringComparison.Ordinal) ? 4
-        : 3;
+        : 2;
 
     private static uint AlignUp(uint value, uint alignment) => checked((value + alignment - 1) & ~(alignment - 1));
 
