@@ -52,13 +52,18 @@ public static class RelocationEngine
     /// Maps a section offset to the linear-memory address of those bytes. Required only for
     /// <c>R_WASM_MEMORY_ADDR_LOCREL_I32</c>, which is relative to its own location.
     /// </param>
+    /// <param name="memoryBase">
+    /// The value of <c>__memory_base</c>, which <c>R_WASM_MEMORY_ADDR_REL_SLEB</c> (PIC) values are added to at run
+    /// time: 0 in a static link; where the data was placed when <c>__memory_base</c> stays an import.
+    /// </param>
     public static void ApplyRelocations(
         byte[] sectionBytes,
         IReadOnlyList<Relocation> relocations,
         IndexMap indexMap,
         RelocSymbolTable symbols,
         IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
-        Func<uint, uint>? siteAddress = null)
+        Func<uint, uint>? siteAddress = null,
+        uint memoryBase = 0)
     {
         ArgumentNullException.ThrowIfNull(sectionBytes);
         ArgumentNullException.ThrowIfNull(relocations);
@@ -70,7 +75,7 @@ public static class RelocationEngine
 
         foreach (var reloc in relocations)
         {
-            ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress);
+            ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress, memoryBase);
             PatchAt(buffer, checked((int)reloc.Offset), reloc.Type, resolvedValue);
         }
     }
@@ -86,9 +91,10 @@ public static class RelocationEngine
         IndexMap indexMap,
         RelocSymbolTable symbols,
         IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
-        Func<uint, uint>? siteAddress = null)
+        Func<uint, uint>? siteAddress = null,
+        uint memoryBase = 0)
     {
-        ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress);
+        ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress, memoryBase);
         PatchAt(sectionBytes, checked((int)reloc.Offset), reloc.Type, resolvedValue);
     }
 
@@ -150,7 +156,8 @@ public static class RelocationEngine
         IndexMap indexMap,
         RelocSymbolTable symbols,
         IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
-        Func<uint, uint>? siteAddress) => reloc.Type switch
+        Func<uint, uint>? siteAddress,
+        uint memoryBase) => reloc.Type switch
         {
             RelocationType.R_WASM_FUNCTION_INDEX_LEB or RelocationType.R_WASM_FUNCTION_INDEX_I32
                 => ResolveMappedSymbolIndex(reloc.Index, indexMap.Functions, symbols, SymbolType.Function, "function"),
@@ -158,10 +165,12 @@ public static class RelocationEngine
             RelocationType.R_WASM_TABLE_INDEX_SLEB or RelocationType.R_WASM_TABLE_INDEX_I32 or RelocationType.R_WASM_TABLE_INDEX_I64
                 => ResolveTableIndex(reloc.Index, indexMap.Tables, symbols),
 
-            // In a non-PIC link __memory_base is 0, so the base-relative form is the absolute address.
             RelocationType.R_WASM_MEMORY_ADDR_LEB or RelocationType.R_WASM_MEMORY_ADDR_SLEB or RelocationType.R_WASM_MEMORY_ADDR_I32
-                or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or RelocationType.R_WASM_MEMORY_ADDR_I64
+                or RelocationType.R_WASM_MEMORY_ADDR_I64
                 => ResolveMemoryAddress(reloc, symbols, segmentBaseAddresses),
+
+            RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB
+                => unchecked(ResolveMemoryAddress(reloc, symbols, segmentBaseAddresses) - memoryBase),
 
             RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32
                 => unchecked(ResolveMemoryAddress(reloc, symbols, segmentBaseAddresses) - (siteAddress ?? throw new InvalidOperationException(

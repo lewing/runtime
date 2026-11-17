@@ -25,7 +25,10 @@ public static class SingleObjectRelocator
     /// </summary>
     /// <param name="inputBytes">Raw bytes of the relocatable <c>.wasm</c> / <c>.wasm.o</c> object.</param>
     /// <param name="module">Parsed module (must include linking and relocation sections).</param>
-    /// <param name="globalBase">Byte address where data placement begins (typically 0 or 1024).</param>
+    /// <param name="globalBase">
+    /// Byte address where data placement begins (typically 0 or 1024). Position-independent code reads data
+    /// relative to the imported <c>__memory_base</c>, which the host must set to this value (the dylink convention).
+    /// </param>
     /// <param name="tableBase">Starting index for the indirect function table (typically 0 or 1).</param>
     /// <param name="verboseLog">Optional callback invoked once per applied relocation.</param>
     /// <returns>Byte-identical copy of <paramref name="inputBytes"/> with relocation slots patched.</returns>
@@ -80,7 +83,8 @@ public static class SingleObjectRelocator
             foreach (var reloc in relocSection.Entries)
             {
                 verboseLog?.Invoke(FormatRelocLog(reloc, symbols));
-                RelocationEngine.ApplyRelocation(span, reloc, indexMap, symbols, segmentBases, siteAddress);
+                // PIC accesses add REL values to the imported __memory_base, which the host sets to globalBase.
+                RelocationEngine.ApplyRelocation(span, reloc, indexMap, symbols, segmentBases, siteAddress, memoryBase: globalBase);
             }
         }
 
