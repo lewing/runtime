@@ -9,6 +9,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsTrimmable>true</IsTrimmable>
     <IsAotCompatible>true</IsAotCompatible>
+    <!-- Most sources are vendored from nesm and re-synced with sync-nesm.sh. Suppress style and
+         performance-suggestion rules nesm doesn't enforce yet (Blazor-Playground/nesm#571) rather than
+         carrying the fixes in runtime-local.patch, which would conflict on every sync. -->
+    <NoWarn>$(NoWarn);CA1512;CA1822;CA1830;CA1859;IDE0059;IDE0074;SA1136</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

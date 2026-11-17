@@ -71,33 +71,19 @@ public class WasmLdParityTests
             """)),
     };
 
-    private const string PlaceholderImportsGap =
-        "the relocatable-object placeholder imports env.__linear_memory and env.__indirect_function_table are kept " +
-        "instead of being replaced by a defined memory and table (or env.memory with --import-memory)";
-
-    private const string MemoryExportGap = "wasm-ld exports the defined memory as 'memory' by default; " + PlaceholderImportsGap;
+    private const string UnreferencedStackPointerGap =
+        "__stack_pointer is always defined, even when nothing references it; wasm-ld omits the unreferenced global";
 
     // Divergences from wasm-ld that the managed linker does not handle yet. Each entry is skipped with its reason
     // rather than asserted, so the table doubles as the list of gaps to close before it can replace wasm-ld.
     private static readonly Dictionary<(string Scenario, Facet Facet), string> s_knownGaps = new()
     {
-        [("cross-unit", Facet.Exports)] = MemoryExportGap,
-        [("cross-unit", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("archive", Facet.Exports)] = MemoryExportGap,
-        [("archive", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("export-flags", Facet.Exports)] = "--export of a defined function without WASM_SYM_EXPORTED has no effect, and --export-memory exports the placeholder import",
-        [("export-flags", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("import-memory", Facet.MemoryAndTable)] = "--import-memory adds env.memory next to the env.__linear_memory placeholder, producing two memories",
-        [("constructor", Facet.Exports)] = "__wasm_call_ctors is not synthesized from the WASM_INIT_FUNCS linking subsection",
-        [("constructor", Facet.FunctionImports)] = "an undefined function allowed by --allow-undefined is dropped instead of becoming an import",
-        [("constructor", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("constructor", Facet.ValidatesWithWasmTools)] = "the call to the dropped undefined function leaves an invalid body",
-        [("default-entry", Facet.Exports)] = "the entry symbol (default _start) becomes the start section instead of being exported and rooted, so it is removed; " + MemoryExportGap,
-        [("default-entry", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("stack", Facet.Exports)] = MemoryExportGap,
-        [("stack", Facet.MemoryAndTable)] = PlaceholderImportsGap,
-        [("stack", Facet.StackPointer)] = "__stack_pointer is left as an import instead of being defined and initialized to the top of an allocated stack",
-        [("stack", Facet.ValidatesWithWasmTools)] = "relocated code for a stack-using function fails validation; the toolchain-only validator does not type-check bodies, so the linker does not detect it",
+        [("cross-unit", Facet.StackPointer)] = UnreferencedStackPointerGap,
+        [("archive", Facet.StackPointer)] = UnreferencedStackPointerGap,
+        [("export-flags", Facet.StackPointer)] = UnreferencedStackPointerGap,
+        [("import-memory", Facet.StackPointer)] = UnreferencedStackPointerGap,
+        [("constructor", Facet.StackPointer)] = UnreferencedStackPointerGap,
+        [("default-entry", Facet.StackPointer)] = UnreferencedStackPointerGap,
     };
 
     public static IEnumerable<object[]> Cases() =>

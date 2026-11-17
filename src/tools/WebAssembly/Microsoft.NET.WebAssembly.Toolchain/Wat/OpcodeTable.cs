@@ -292,6 +292,8 @@ public static class OpcodeTable
         Add("call_indirect",        0x11, ImmediateKind.CallIndirect);
         Add("return_call",          0x12, ImmediateKind.FuncIdx);
         Add("return_call_indirect", 0x13, ImmediateKind.CallIndirect);
+        Add("call_ref",             0x14, ImmediateKind.TypeIdx);
+        Add("return_call_ref",      0x15, ImmediateKind.TypeIdx);
 
         // Table get/set
         Add("table.get", 0x25, ImmediateKind.TableIdx);
@@ -301,6 +303,10 @@ public static class OpcodeTable
         Add("ref.null",    0xD0, ImmediateKind.RefType);
         Add("ref.is_null", 0xD1);
         Add("ref.func",    0xD2, ImmediateKind.FuncIdx);
+        Add("ref.eq",      0xD3);
+        Add("ref.as_non_null", 0xD4);
+        Add("br_on_null",  0xD5, ImmediateKind.LabelIdx);
+        Add("br_on_non_null", 0xD6, ImmediateKind.LabelIdx);
 
         // ── 0xE0 prefix: stack-switching ────────────────────────────────────
 
@@ -341,6 +347,12 @@ public static class OpcodeTable
         AddFC("table.grow", 15, ImmediateKind.TableIdx);
         AddFC("table.size", 16, ImmediateKind.TableIdx);
         AddFC("table.fill", 17, ImmediateKind.TableIdx);
+
+        // Wide arithmetic operations (sub 19-22)
+        AddFC("i64.add128", 19);
+        AddFC("i64.sub128", 20);
+        AddFC("i64.mul_wide_s", 21);
+        AddFC("i64.mul_wide_u", 22);
 
         // ── 0xFD prefix: SIMD (128-bit vector) operations ───────────────────
 
@@ -704,23 +716,85 @@ public static class OpcodeTable
     /// <summary>Return the natural alignment (log2) for a memory instruction mnemonic.</summary>
     public static uint NaturalAlignment(string mnemonic)
     {
-        if (mnemonic.StartsWith("v128."))
+        var dot = mnemonic.IndexOf('.');
+        if (dot < 0)
+            return 0;
+
+        var valueType = mnemonic[..dot];
+        var operation = mnemonic[(dot + 1)..];
+
+        if (valueType == "v128")
+            return VectorMemoryNaturalAlignment(operation);
+
+        if (TryOperationWidth(operation, out var packedWidthBits, out _))
+            return Log2ByteWidth(packedWidthBits);
+
+        return valueType switch
         {
-            // v128.load / v128.store (full 128-bit) → 16 bytes → log2 = 4
-            if (mnemonic is "v128.load" or "v128.store") return 4;
-            // loadNNxM patterns (e.g. load8x8, load16x4, load32x2) → all load 8 bytes
-            if (mnemonic.Contains("x8") || mnemonic.Contains("x4") || mnemonic.Contains("x2")) return 3;
-            // lane/splat/zero: data size from the number in the name
-            if (mnemonic.Contains("64")) return 3; // 8 bytes
-            if (mnemonic.Contains("32")) return 2; // 4 bytes
-            if (mnemonic.Contains("16")) return 1; // 2 bytes
-            if (mnemonic.Contains('8'))  return 0; // 1 byte
-            return 4; // default for v128
+            "i32" or "f32" => 2,
+            "i64" or "f64" => 3,
+            _ => 0,
+        };
+    }
+
+    private static uint VectorMemoryNaturalAlignment(string operation)
+    {
+        if (operation is "load" or "store")
+            return 4;
+
+        if (!TryOperationWidth(operation, out var widthBits, out var suffix))
+            return 4;
+
+        if (suffix.StartsWith('x'))
+        {
+            var laneCountEnd = 1;
+            while (laneCountEnd < suffix.Length && char.IsAsciiDigit(suffix[laneCountEnd]))
+                laneCountEnd++;
+
+            var laneCount = int.Parse(suffix[1..laneCountEnd]);
+            return Log2ByteWidth(widthBits * laneCount);
         }
-        if (mnemonic.Contains('8'))  return 0; // 1 byte
-        if (mnemonic.Contains("16")) return 1; // 2 bytes
-        if (mnemonic.StartsWith("i32") || mnemonic.StartsWith("f32")) return 2; // 4 bytes
-        if (mnemonic.StartsWith("i64") || mnemonic.StartsWith("f64")) return 3; // 8 bytes
-        return 0;
+
+        return Log2ByteWidth(widthBits);
+    }
+
+    private static bool TryOperationWidth(string operation, out int widthBits, out string suffix)
+    {
+        const string Load = "load";
+        const string Store = "store";
+
+        var prefixLength = operation.StartsWith(Load, StringComparison.Ordinal)
+            ? Load.Length
+            : operation.StartsWith(Store, StringComparison.Ordinal)
+                ? Store.Length
+                : -1;
+
+        if (prefixLength < 0 || prefixLength == operation.Length || !char.IsAsciiDigit(operation[prefixLength]))
+        {
+            widthBits = 0;
+            suffix = "";
+            return false;
+        }
+
+        var end = prefixLength;
+        while (end < operation.Length && char.IsAsciiDigit(operation[end]))
+            end++;
+
+        widthBits = int.Parse(operation[prefixLength..end]);
+        suffix = operation[end..];
+        return true;
+    }
+
+    private static uint Log2ByteWidth(int widthBits)
+    {
+        return widthBits switch
+        {
+            8 => 0,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            128 => 4,
+            _ => throw new InvalidOperationException($"Unsupported memory access width: {widthBits} bits"),
+        };
     }
 }

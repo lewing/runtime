@@ -209,6 +209,17 @@ public class WasmBinaryReaderTests
         Assert.Equal("caf\u00e9", reader.ReadName());
     }
 
+    [Theory]
+    [InlineData(new byte[] { 0x01, 0x80 })]
+    [InlineData(new byte[] { 0x02, 0xC0, 0x80 })]
+    [InlineData(new byte[] { 0x03, 0xED, 0xA0, 0x80 })]
+    public void ReadName_MalformedUtf8_ThrowsWasmFormatException(byte[] data)
+    {
+        var reader = ReaderFrom(data);
+
+        Assert.Throws<WasmFormatException>(() => reader.ReadName());
+    }
+
     [Fact]
     public void ReadName_UnexpectedEof_ThrowsWasmFormatException()
     {

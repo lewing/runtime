@@ -27,16 +27,17 @@ compare the managed linker's output with wasm-ld's. They are skipped when the wa
 
 ## Provenance and differences from nesm
 
-* Source: nesm `src/Nesm/{Types,Module,Validation,Binary,Linker,Wat}` (the `Nesm.Toolchain` package subset, excluding
-  `WastRunner`) at the commit in `nesm-commit.txt`, with namespaces renamed from `Nesm.*` to
-  `Microsoft.NET.WebAssembly.*`.
-* `runtime-local.patch` holds the edits made here: fixes for the repo's analyzer rules (removed unused parameters,
-  members made static, and so on), the tool name recorded in the producers section, and a fix to memarg skipping in the body validator so memory64 offsets and
-  multi-memory SIMD memargs parse.
-* `Linker/WasmLdCommandLine.cs` and `Linker/WasmLdDriver.cs` exist only here.
-* Tests that executed modules through nesm's interpreter now assert structure instead: exports and signatures,
-  identical function bodies after a round trip, and output validation. Tests that need the interpreter, the
-  WebAssembly spec-testsuite submodule, or nesm build artifacts were not ported.
+* Source: nesm `src/Nesm/{Types,Module,Validation,Binary,Linker,Wat,Debugging/Symbols}` (the `Nesm.Toolchain` package
+  subset) at the commit in `nesm-commit.txt`, with namespaces renamed from `Nesm.*` to `Microsoft.NET.WebAssembly.*`.
+* The project suppresses a few style and performance-suggestion analyzer rules that nesm doesn't enforce yet
+  (Blazor-Playground/nesm#571), so re-syncs don't need local fixes.
+* `runtime-local.patch` holds the remaining library edits. Today that is only the tool name recorded in the producers
+  section.
+* `Binary/WasmSections.cs`, `Linker/WasmLdCommandLine.cs` and `Linker/WasmLdDriver.cs` exist only here.
+* The tests in `nesm-test-files.txt` come from nesm's `tests/Nesm.Tests`. `runtime-local-tests.patch` adapts them to
+  run without nesm's interpreter: tests that executed modules assert structure instead (exports and signatures,
+  identical function bodies after a round trip, validation), and tests that need the interpreter, the spec
+  testsuite, or nesm build artifacts are removed.
 
 ## Re-syncing from nesm
 
@@ -45,33 +46,26 @@ src/tools/WebAssembly/sync-nesm.sh <nesm-checkout> [<commit>]       # import, re
 src/tools/WebAssembly/sync-nesm.sh --update-patch <nesm-checkout>   # after editing imported files here
 ```
 
-The import replaces the files listed in `nesm-files.txt`, renames namespaces, adds license headers, and then applies
-`runtime-local.patch`. Files that exist only in this repo are left alone. Upstream the local edits to nesm when you
-can so the patch shrinks. Tests are not synchronized. After a sync that fixes a gap, remove its entry from
-`s_knownGaps` in `WasmLdParityTests`.
+The import replaces the library files listed in `nesm-files.txt` and the tests listed in `nesm-test-files.txt`, renames
+namespaces, adds license headers, and then applies `runtime-local.patch` and `runtime-local-tests.patch`. Files that
+exist only in this repo are left alone. Resolve any rejected hunks, then run `--update-patch`. Upstream local edits to
+nesm when you can so the patches shrink. After a sync that fixes a gap, remove its entry from `s_knownGaps` in
+`WasmLdParityTests`.
 
 ## Known gaps before the linker can replace wasm-ld
 
-The parity tests (`WasmLdParityTests`) skip each known divergence with its reason. Summary:
+Linking clang objects now matches wasm-ld on the parity scenarios: memory, table and stack definition, data layout,
+constructors, `--allow-undefined`, `--export`, the entry point, lazy archive members, COMDAT, and the relocation types
+ILCompiler's `WasmObjectWriter` emits. The parity tests (`WasmLdParityTests`) skip the remaining divergence with its
+reason. Remaining gaps:
 
-* The `env.__linear_memory` and `env.__indirect_function_table` placeholder imports in relocatable objects are passed
-  through instead of being replaced by a defined memory and table, and the memory is not exported as `memory`.
-  `--import-memory` produces a second memory.
-* `__stack_pointer` is not defined, and no stack is allocated.
-* Data is laid out from address 0, and zero-initialized (`.bss`) data overlaps `.data`. A C function that updates a
-  global array returns wrong results.
-* `__wasm_call_ctors` is not synthesized from `WASM_INIT_FUNCS`.
-* The entry symbol (`--entry`, default `_start`) becomes the wasm start section instead of being exported and kept
-  alive, so a WASI command loses `_start`. A missing entry symbol is not reported as an error.
-* `--allow-undefined` drops undefined functions instead of importing them.
-* `--export` has no effect on defined functions that are not marked exported.
-* The relocated code for a stack-using function fails validation.
-* The toolchain-only body validator does not type-check instructions, so it does not catch invalid output. It also
-  rejects all atomics (`0xFE`), which threaded builds need.
-* Archives are always loaded whole (`--whole-archive` semantics) instead of being extracted lazily. COMDAT, TLS, and
-  component wrapping (`--component-type`, wasm-component-ld) are not implemented.
-* Relocation types that ILCompiler's `WasmObjectWriter` can emit but `RelocationEngine` does not patch:
-  `R_WASM_MEMORY_ADDR_REL_SLEB`, `R_WASM_MEMORY_ADDR_I64`, `R_WASM_TABLE_INDEX_I64`, `R_WASM_MEMORY_ADDR_LOCREL_I32`.
+* `__stack_pointer` is always defined, even when nothing references it. wasm-ld omits it, so the output has one extra
+  global.
+* TLS (`__tls_base`, TLS segments and relocations) is not supported.
+* Shared memory and atomics (`--shared-memory`, `0xFE` instructions) are not supported. Threaded builds can't be linked
+  (Blazor-Playground/nesm#572).
+* `.debug_str` is not merged across inputs.
+* Component output (`--component-type`, wasm-component-ld) is not implemented.
 
 ## Where native tools are used today
 

@@ -29,6 +29,59 @@ public sealed class RelocationEngineTests
         Assert.Equal(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0x7F }, buffer);
     }
 
+    /// <summary>
+    /// The relocation types ILCompiler's WasmObjectWriter emits beyond the LLVM set: the 64-bit absolute forms,
+    /// the memory-base-relative SLEB (absolute in a non-PIC link) and the site-relative LOCREL.
+    /// </summary>
+    [Fact]
+    public void ApplyRelocations_PatchesILCompilerRelocationKinds()
+    {
+        byte[] sectionBytes = new byte[32];
+        var relocations = new List<Relocation>
+        {
+            new() { Type = RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB, Offset = 0, Index = 0, Addend = 4 },
+            new() { Type = RelocationType.R_WASM_MEMORY_ADDR_I64, Offset = 5, Index = 0, Addend = 8 },
+            new() { Type = RelocationType.R_WASM_TABLE_INDEX_I64, Offset = 13, Index = 1 },
+            new() { Type = RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32, Offset = 21, Index = 0, Addend = 2 },
+        };
+
+        var indexMap = new IndexMap();
+        indexMap.Tables[3] = 42;
+        var symbols = new RelocSymbolTable(
+        [
+            new WasmSymbol { Type = SymbolType.Data, Name = "data", SegmentIndex = 0, Offset = 16, Size = 4 },
+            new WasmSymbol { Type = SymbolType.Function, Name = "func", Index = 3 },
+        ]);
+
+        // The patched bytes of this section live at linear address 2000 + offset.
+        RelocationEngine.ApplyRelocations(
+            sectionBytes,
+            relocations,
+            indexMap,
+            symbols,
+            new Dictionary<uint, uint> { [0] = 1000 },
+            siteAddress: offset => 2000 + offset);
+
+        Assert.Equal(1020, ReadS32Leb(sectionBytes, 0, out int relBytes));
+        Assert.Equal(5, relBytes);
+        Assert.Equal(1024ul, BinaryPrimitives.ReadUInt64LittleEndian(sectionBytes.AsSpan(5, 8)));
+        Assert.Equal(42ul, BinaryPrimitives.ReadUInt64LittleEndian(sectionBytes.AsSpan(13, 8)));
+        Assert.Equal(unchecked((uint)(1018 - 2021)), BinaryPrimitives.ReadUInt32LittleEndian(sectionBytes.AsSpan(21, 4)));
+    }
+
+    [Fact]
+    public void ApplyRelocations_LocrelWithoutSiteAddress_Throws()
+    {
+        var relocations = new List<Relocation>
+        {
+            new() { Type = RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32, Offset = 0, Index = 0 },
+        };
+        var symbols = new RelocSymbolTable([new WasmSymbol { Type = SymbolType.Data, Name = "data", SegmentIndex = 0 }]);
+
+        Assert.Throws<InvalidOperationException>(() => RelocationEngine.ApplyRelocations(
+            new byte[4], relocations, new IndexMap(), symbols, new Dictionary<uint, uint> { [0] = 0 }));
+    }
+
     [Fact]
     public void ApplyRelocations_PatchesSupportedRelocationKindsInPlace()
     {

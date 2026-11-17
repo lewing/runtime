@@ -12,10 +12,13 @@ using Microsoft.NET.WebAssembly.Types;
 public sealed class LinkerOptions
 {
     /// <summary>
-    /// Name of the module entry-point function (e.g. <c>"_start"</c> or
-    /// <c>"__wasm_call_ctors"</c>). When non-null the linker sets the merged
-    /// module's start-function to the function with this export name.
+    /// Name of the module entry-point function (e.g. <c>"_start"</c>), or <c>null</c> for none.
     /// </summary>
+    /// <remarks>
+    /// When linking relocatable objects this follows <c>wasm-ld --entry</c>: the symbol must be a defined
+    /// function, and it is kept alive and exported under its name (it is not made the start function).
+    /// When merging complete modules the function with this export name becomes the start function.
+    /// </remarks>
     public string? EntryPoint { get; init; }
 
     /// <summary>
@@ -104,8 +107,17 @@ public sealed class LinkerOptions
     /// <summary>Byte address where data placement begins. Typical dotnet value: 1024 (null-guard page).</summary>
     public uint? GlobalBase { get; init; }
 
-    /// <summary>When true, stack is placed before data: [GlobalBase..GlobalBase+StackSize) = stack, then data follows.</summary>
-    public bool StackFirst { get; init; }
+    /// <summary>
+    /// When true, the stack is placed before data; when false, after it. <c>null</c> selects the default:
+    /// stack first for relocatable objects (as <c>wasm-ld</c> from LLD 22 does), data first when merging modules.
+    /// </summary>
+    public bool? StackFirst { get; init; }
+
+    /// <summary>
+    /// Selects how inputs are linked. <see cref="LinkerInputKind.Auto"/> links relocatable objects with
+    /// <c>wasm-ld</c> semantics and merges complete modules otherwise.
+    /// </summary>
+    public LinkerInputKind InputKind { get; init; }
 
     /// <summary>Shadow stack size in bytes. Default: 65536 (64 KiB). Dotnet SDK typically uses 8 MB.</summary>
     public uint StackSize { get; init; } = 65536;
@@ -148,6 +160,31 @@ public sealed class LinkerOptions
     public List<string> ExportIfDefined { get; set; } = new();
 }
 
+/// <summary>How <see cref="WasmLinker"/> treats its inputs.</summary>
+public enum LinkerInputKind
+{
+    /// <summary>Relocatable objects when every input is one, complete modules when none is.</summary>
+    Auto,
+
+    /// <summary>
+    /// Relocatable objects (<c>.o</c> files with <c>linking</c> and <c>reloc.*</c> sections), linked as
+    /// <c>wasm-ld</c> does: relocations are applied and memory, table and stack pointer are defined.
+    /// </summary>
+    RelocatableObjects,
+
+    /// <summary>Complete modules, concatenated with their imports kept and deduplicated.</summary>
+    Modules,
+}
+
+/// <summary>One linker input.</summary>
+/// <param name="Module">The parsed module or object.</param>
+/// <param name="Name">Display name for diagnostics.</param>
+/// <param name="IsArchiveMember">
+/// True for a member of a static archive. When linking relocatable objects, a member is loaded only if it
+/// defines a symbol that is otherwise undefined (pass false for <c>--whole-archive</c> semantics).
+/// </param>
+public sealed record LinkerInput(WasmModule Module, string? Name = null, bool IsArchiveMember = false);
+
 /// <summary>
 /// Managed WebAssembly static linker.  Merges N input <see cref="WasmModule"/> objects
 /// (typically parsed from <c>.wasm.o</c> object files) into a single, self-contained
@@ -178,15 +215,14 @@ public sealed class WasmLinker
     /// </summary>
     /// <param name="inputStreams">Input module streams in link order.</param>
     /// <param name="options">Optional linker configuration.</param>
-    /// <returns>A new <see cref="WasmModule"/> containing the merged content of all input modules.</returns>
+    /// <returns>
+    /// A mutable analytical <see cref="WasmModule"/> containing the merged content. The linker
+    /// validates its serialized product. The analytical model is valid under its compact metadata,
+    /// but <see cref="LinkToBinary(IEnumerable{Stream},LinkerOptions?)"/> is the canonical deployment
+    /// artifact because reparsing reconstructs exact reader-owned metadata.
+    /// </returns>
     public WasmModule Link(IEnumerable<Stream> inputStreams, LinkerOptions? options = null)
-    {
-        ArgumentNullException.ThrowIfNull(inputStreams);
-        var modules = new List<WasmModule>();
-        foreach (var stream in inputStreams)
-            modules.Add(ModuleReader.ReadModule(stream));
-        return Link(modules, options);
-    }
+        => Link(ParseInputModules(inputStreams), options);
 
     /// <summary>
     /// Links the supplied input modules into a merged output module.
@@ -194,11 +230,105 @@ public sealed class WasmLinker
     /// <param name="inputs">Input modules in link order.</param>
     /// <param name="options">Optional linker configuration.</param>
     /// <returns>
-    /// A new <see cref="WasmModule"/> whose sections contain the merged content of
-    /// all input modules.  Per-module <see cref="IndexMap"/>s are available via
+    /// A mutable analytical <see cref="WasmModule"/> whose sections contain the merged content.
+    /// The linker validates its serialized product. The analytical model is valid under its compact
+    /// metadata, but <see cref="LinkToBinary(IReadOnlyList{WasmModule},LinkerOptions?)"/> is the
+    /// canonical deployment artifact because reparsing reconstructs exact reader-owned metadata.
+    /// Per-module <see cref="IndexMap"/>s are available via
     /// <see cref="LastLinkIndexMaps"/> after the call returns.
     /// </returns>
     public WasmModule Link(IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
+        => LinkProduct(inputs, options).Module;
+
+    /// <summary>
+    /// Parses relocatable object streams without treating them as runtime loads, links them, and
+    /// emits the validated merged output as a binary <c>.wasm</c>.
+    /// </summary>
+    public byte[] LinkToBinary(IEnumerable<Stream> inputStreams, LinkerOptions? options = null)
+        => LinkToBinary(ParseInputModules(inputStreams), options);
+
+    /// <summary>Links the supplied input modules and immediately emits the merged output as a binary <c>.wasm</c>.</summary>
+    public byte[] LinkToBinary(IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
+        => LinkProduct(inputs, options).Binary;
+
+    /// <summary>Links inputs that may include lazily loaded archive members and emits the output as a binary <c>.wasm</c>.</summary>
+    public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
+        => LinkProduct(inputs, options).Binary;
+
+    /// <summary>Links inputs that may include lazily loaded archive members.</summary>
+    public WasmModule Link(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
+        => LinkProduct(inputs, options).Module;
+
+    private static List<WasmModule> ParseInputModules(IEnumerable<Stream> inputStreams)
+    {
+        ArgumentNullException.ThrowIfNull(inputStreams);
+        var modules = new List<WasmModule>();
+        foreach (var stream in inputStreams)
+            modules.Add(ModuleReader.ParseCoreModule(stream));
+        return modules;
+    }
+
+    private (WasmModule Module, byte[] Binary) LinkProduct(
+        IReadOnlyList<WasmModule> inputs,
+        LinkerOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        return LinkProduct([.. inputs.Select(static m => new LinkerInput(m))], options);
+    }
+
+    private (WasmModule Module, byte[] Binary) LinkProduct(
+        IReadOnlyList<LinkerInput> inputs,
+        LinkerOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        options ??= new LinkerOptions();
+        WasmModule mergedModule;
+        if (UsesObjectSemantics(inputs, options))
+        {
+            ValidateMemoryOptions(options);
+            var (module, objectLinker) = ObjectFileLinker.Link(inputs, options);
+            LastLinkIndexMaps = objectLinker.IndexMaps;
+            LastSymbolTable = objectLinker.SymbolTable;
+            mergedModule = module;
+        }
+        else
+        {
+            // Complete modules have no symbol table to drive lazy loading, so archive members are all linked.
+            mergedModule = LinkCore([.. inputs.Select(static i => i.Module)], options);
+        }
+
+        byte[] binary = new SectionMerger().EmitBinary(mergedModule);
+
+        // Link() returns the analytical model because reparsing loses linker-only state and object
+        // identity. Validate the exact bytes independently because model validation cannot establish
+        // that serialization preserved the linked product.
+        using var stream = new MemoryStream(binary, writable: false);
+        _ = ModuleReader.ReadModuleAndValidate(stream);
+        return (mergedModule, binary);
+    }
+
+    private static bool UsesObjectSemantics(IReadOnlyList<LinkerInput> inputs, LinkerOptions options)
+    {
+        switch (options.InputKind)
+        {
+            case LinkerInputKind.RelocatableObjects:
+                return true;
+            case LinkerInputKind.Modules:
+                return false;
+        }
+
+        int objects = inputs.Count(static i => ObjectFileLinker.IsRelocatableObject(i.Module));
+        if (objects == 0 || inputs.Count == 0)
+            return false;
+        if (objects == inputs.Count)
+            return true;
+        string nonObject = inputs.First(static i => !ObjectFileLinker.IsRelocatableObject(i.Module)).Name ?? "an input";
+        throw new LinkerException(
+            $"Cannot mix relocatable objects with complete modules ({nonObject} is not a relocatable object). " +
+            "Set LinkerOptions.InputKind to choose how the inputs are linked.");
+    }
+
+    private WasmModule LinkCore(IReadOnlyList<WasmModule> inputs, LinkerOptions? options)
     {
         options ??= new LinkerOptions();
         ValidateMemoryOptions(options);
@@ -210,6 +340,12 @@ public sealed class WasmLinker
 
         // ── Phase 1: Type deduplication ────────────────────────────────────────────
         var mergedTypes = sectionMerger.MergeTypes(inputs, indexMaps);
+
+        // The exact type space that runs in lockstep with mergedTypes. Built here, while the type
+        // index maps still name the pre-DCE space exactly. It is compacted alongside mergedTypes below
+        // and handed to BuildMergedModule, so the merged module carries real type definitions rather
+        // than an empty list that every downstream guard passes over (GitHub #383).
+        var mergedTypeDefinitions = sectionMerger.MergeTypeDefinitions(inputs, indexMaps, mergedTypes.Count);
 
         // ── Phase 2: Symbol resolution ─────────────────────────────────────────────
         var symbolTable = new SymbolTable();
@@ -224,7 +360,7 @@ public sealed class WasmLinker
         // ── Phase 3: Import deduplication + import-space index maps ───────────────
         // Imports are indexed separately per index space (functions start at 0 in
         // the function space, globals at 0 in the global space, etc.).
-        var mergedImportResult = sectionMerger.MergeImports(inputs, indexMaps);
+        var mergedImportResult = sectionMerger.MergeImports(inputs, indexMaps, mergedTypeDefinitions);
         var mergedImports = mergedImportResult.Imports;
         uint mergedFuncImportCount = mergedImportResult.FunctionImportCount;
         uint mergedGlobalImportCount = mergedImportResult.GlobalImportCount;
@@ -306,11 +442,12 @@ public sealed class WasmLinker
         DceLiveSet? liveSets = null;
         if (options.GcSections && inputs.Any(static m => m.LinkingSection is not null))
         {
-            var dce = new DeadCodeEliminator();
+            var dce = new DeadCodeEliminator { DiscoveryPassOrder = DcePassOrder };
             liveSets = dce.ComputeLiveSets(inputs, indexMaps, symbolTable, mergedFuncImportCount, options);
             DeadCodeEliminator.ComposeCompactionIntoIndexMaps(inputs, indexMaps, liveSets);
             UpdateSymbolMergedIndices(symbolTable, indexMaps);
-            mergedTypes = DeadCodeEliminator.CompactTypes(mergedTypes, liveSets, inputs, indexMaps, mergedImports);
+            mergedTypes = DeadCodeEliminator.CompactTypes(
+                mergedTypes, liveSets, inputs, indexMaps, mergedImports, mergedTypeDefinitions);
         }
 
         // ── Phase 5: Build merged sections ────────────────────────────────────────
@@ -321,7 +458,8 @@ public sealed class WasmLinker
             mergedImports,
             symbolTable.Symbols,
             options,
-            liveSets);
+            liveSets,
+            mergedTypeDefinitions);
 
         LastLinkIndexMaps = indexMaps;
         LastSymbolTable   = symbolTable;
@@ -329,15 +467,11 @@ public sealed class WasmLinker
         return mergedModule;
     }
 
-    /// <summary>Links the supplied input modules and immediately emits the merged output as a binary <c>.wasm</c>.</summary>
-    public byte[] LinkToBinary(IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
-    {
-        var mergedModule = Link(inputs, options);
-        return new SectionMerger().EmitBinary(mergedModule);
-    }
-
     /// <summary>Index maps from the most recent <see cref="Link(IReadOnlyList{WasmModule}, LinkerOptions?)"/> call. Useful for relocation patching.</summary>
     public IReadOnlyList<IndexMap>? LastLinkIndexMaps { get; private set; }
+
+    /// <inheritdoc cref="DeadCodeEliminator.DiscoveryPassOrder"/>
+    internal IReadOnlyList<int>? DcePassOrder { get; set; }
 
     /// <summary>Symbol table from the most recent <see cref="Link(IReadOnlyList{WasmModule}, LinkerOptions?)"/> call.</summary>
     public SymbolTable? LastSymbolTable { get; private set; }
@@ -354,14 +488,17 @@ public sealed class WasmLinker
             var map = indexMaps[sym.DefiningModuleIndex.Value];
             sym.MergedIndex = sym.Kind switch
             {
-                Binary.Linking.SymbolType.Function => map.Functions.GetValueOrDefault(sym.LocalIndex.Value),
-                Binary.Linking.SymbolType.Global   => map.Globals.GetValueOrDefault(sym.LocalIndex.Value),
+                Binary.Linking.SymbolType.Function => TryMapped(map.Functions, sym.LocalIndex.Value),
+                Binary.Linking.SymbolType.Global   => TryMapped(map.Globals, sym.LocalIndex.Value),
                 Binary.Linking.SymbolType.Table    => map.Tables.GetValueOrDefault(sym.LocalIndex.Value),
-                Binary.Linking.SymbolType.Event    => map.Tags.GetValueOrDefault(sym.LocalIndex.Value),
-                Binary.Linking.SymbolType.Data     => map.DataSegments.GetValueOrDefault(sym.LocalIndex.Value),
+                Binary.Linking.SymbolType.Event    => TryMapped(map.Tags, sym.LocalIndex.Value),
+                Binary.Linking.SymbolType.Data     => TryMapped(map.DataSegments, sym.LocalIndex.Value),
                 _ => sym.LocalIndex,
             };
         }
+
+        static uint? TryMapped(IReadOnlyDictionary<uint, uint> map, uint index) =>
+            map.TryGetValue(index, out uint mapped) ? mapped : null;
     }
 
     private const long MaxMemoryBytes = 4L * 1024 * 1024 * 1024; // 4 GiB

@@ -167,6 +167,46 @@ public class DwarfTypeReaderTests
         Assert.Equal(4, point.Members[1].ByteSize);
     }
 
+    // ── Test: 64-bit udata values do not desynchronise the DIE stream ────────────
+
+    /// <summary>
+    /// A DW_FORM_udata constant of 2^64-1 (libc++'s numeric_limits members) is a ten-byte ULEB128.
+    /// The reader used to stop after five bytes, leaving the cursor mid-number, so every later DIE in
+    /// the unit decoded as garbage: on corerun this hid InterpThreadContext's members and
+    /// InterpExecMethod itself (#538). The struct after the constant must still parse.
+    /// </summary>
+    [Fact]
+    public void Dwarf4_TenByteUdata_DoesNotDesyncLaterDies()
+    {
+        var abbrevData = BuildAbbrevSection(
+            new AbbrevDef(1, 0x11, true,  [(0x03, 0x08)]),                            // compile_unit: name(string)
+            new AbbrevDef(2, 0x34, false, [(0x03, 0x08), (0x1c, 0x0f)]),              // variable: name(string), const_value(udata)
+            new AbbrevDef(3, 0x13, true,  [(0x03, 0x08), (0x0b, 0x0b)]),              // structure_type: name, byte_size(data1)
+            new AbbrevDef(4, 0x0d, false, [(0x03, 0x08), (0x38, 0x0b)]));             // member: name, data_member_location(data1)
+
+        var dies = new List<byte>();
+        WriteUleb128(dies, 1);
+        WriteInlineString(dies, "limits.cpp");
+        WriteUleb128(dies, 2);
+        WriteInlineString(dies, "__max");
+        dies.AddRange([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]); // 2^64-1
+        WriteUleb128(dies, 3);
+        WriteInlineString(dies, "After");
+        dies.Add(8);
+        WriteUleb128(dies, 4);
+        WriteInlineString(dies, "field");
+        dies.Add(4);
+        dies.Add(0);
+        dies.Add(0);
+
+        var results = DwarfTypeReader.ParseStructTypes(
+            BuildInfoSection_D4(dies.ToArray()), abbrevData, null, null, null, null, 50);
+
+        var after = Assert.Single(results);
+        Assert.Equal("After", after.Name);
+        Assert.Equal(4, Assert.Single(after.Members).ByteOffset);
+    }
+
     // ── Test: strp form (DWARF 4 with .debug_str) ───────────────────────────────
 
     [Fact]
@@ -457,32 +497,6 @@ public class DwarfTypeReaderTests
         };
         var result = DwarfTypeReader.ReadStructTypes(module);
         Assert.Empty(result);
-    }
-
-    // ── Test: Real wasm integration (conditional) ────────────────────────────────
-
-    [Fact]
-    public void RealWasm_HelloWasi_ParsesSomeStructs()
-    {
-        const string path = "HelloWasi.wasm";
-        if (!File.Exists(path))
-            return; // Skip if wasm not available
-
-        var module = ModuleReader.ReadModule(File.OpenRead(path));
-        var types = DwarfTypeReader.ReadStructTypes(module, maxResults: 10);
-
-        // HelloWasi is built with debug info — should find at least one struct
-        // (if it has no debug_info at all, we gracefully return empty)
-        var debugInfo = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_info");
-        if (debugInfo is null)
-            return; // No debug info in this build — can't test
-
-        Assert.NotEmpty(types);
-        foreach (var t in types)
-        {
-            Assert.False(string.IsNullOrEmpty(t.Name));
-            Assert.True(t.ByteSize >= 0);
-        }
     }
 
     // ── Test: DW_AT_data_member_location via exprloc (DW_OP_plus_uconst) ────────

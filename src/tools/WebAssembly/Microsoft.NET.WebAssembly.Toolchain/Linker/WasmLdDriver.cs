@@ -6,8 +6,8 @@ using Microsoft.NET.WebAssembly.Module;
 
 namespace Microsoft.NET.WebAssembly.Linker;
 
-/// <summary>An input module and a display name identifying where it came from.</summary>
-public readonly record struct WasmLinkInput(string DisplayName, WasmModule Module);
+/// <summary>An input module, a display name identifying where it came from, and whether it is a lazily loaded archive member.</summary>
+public readonly record struct WasmLinkInput(string DisplayName, WasmModule Module, bool IsArchiveMember = false);
 
 /// <summary>
 /// Runs a link described by a <see cref="WasmLdCommandLine"/>: loads inputs, links, validates the result and writes it.
@@ -31,7 +31,7 @@ public static class WasmLdDriver
         foreach (string warning in commandLine.Warnings)
             warn?.Invoke(warning);
 
-        List<WasmLinkInput> inputs = LoadInputs(commandLine.InputFiles);
+        List<WasmLinkInput> inputs = LoadInputs(commandLine.Inputs);
         if (commandLine.Verbose)
         {
             foreach (WasmLinkInput input in inputs)
@@ -54,22 +54,21 @@ public static class WasmLdDriver
     /// <summary>Links already-loaded inputs and returns the encoded module.</summary>
     public static byte[] Link(IReadOnlyList<WasmLinkInput> inputs, LinkerOptions options)
     {
-        var modules = new List<WasmModule>(inputs.Count);
+        var linkerInputs = new List<LinkerInput>(inputs.Count);
         foreach (WasmLinkInput input in inputs)
-            modules.Add(input.Module);
-        return new WasmLinker().LinkToBinary(modules, options);
+            linkerInputs.Add(new LinkerInput(input.Module, input.DisplayName, input.IsArchiveMember));
+        return new WasmLinker().LinkToBinary(linkerInputs, options);
     }
 
     /// <summary>
-    /// Loads <c>.o</c>/<c>.wasm</c> modules and every WebAssembly member of <c>.a</c> archives.
+    /// Loads <c>.o</c>/<c>.wasm</c> modules and every WebAssembly member of <c>.a</c> archives. Archive members
+    /// are linked lazily (only when they resolve an undefined symbol) unless they came from a
+    /// <c>--whole-archive</c> region.
     /// </summary>
-    /// <remarks>
-    /// Archives are loaded whole (equivalent to wasm-ld <c>--whole-archive</c>); lazy member extraction is not implemented.
-    /// </remarks>
-    public static List<WasmLinkInput> LoadInputs(IEnumerable<string> paths)
+    public static List<WasmLinkInput> LoadInputs(IEnumerable<WasmLdInputFile> files)
     {
         var inputs = new List<WasmLinkInput>();
-        foreach (string path in paths)
+        foreach ((string path, bool wholeArchive) in files)
         {
             if (!File.Exists(path))
                 throw new FileNotFoundException($"Input file not found: {path}", path);
@@ -78,7 +77,7 @@ public static class WasmLdDriver
             if (Path.GetExtension(path).Equals(".a", StringComparison.OrdinalIgnoreCase))
             {
                 foreach ((WasmModule module, string label) in ArArchiveReader.ReadWasmModules(stream, path))
-                    inputs.Add(new WasmLinkInput(label, module));
+                    inputs.Add(new WasmLinkInput(label, module, IsArchiveMember: !wholeArchive));
             }
             else
             {

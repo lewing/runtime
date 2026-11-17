@@ -70,6 +70,26 @@ public class WasmLdCommandLineTests
         Assert.Equal(expected, WasmLdCommandLine.Parse(args).Options.EntryPoint);
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData(true, "--stack-first")]
+    [InlineData(false, "--no-stack-first")]
+    [InlineData(false, "--stack-first", "--no-stack-first")]
+    public void StackFirst_DefaultsToLinkerChoice(bool? expected, params string[] args)
+    {
+        Assert.Equal(expected, WasmLdCommandLine.Parse(args).Options.StackFirst);
+    }
+
+    [Fact]
+    public void WholeArchive_AppliesToInputsInsideTheRegion()
+    {
+        var commandLine = WasmLdCommandLine.Parse(["a.a", "--whole-archive", "b.a", "c.o", "--no-whole-archive", "d.a"]);
+
+        Assert.Equal(
+            [new WasmLdInputFile("a.a", false), new WasmLdInputFile("b.a", true), new WasmLdInputFile("c.o", true), new WasmLdInputFile("d.a", false)],
+            commandLine.Inputs);
+    }
+
     [Fact]
     public void MaxMemory_AcceptsFullWasm32AddressSpace()
     {

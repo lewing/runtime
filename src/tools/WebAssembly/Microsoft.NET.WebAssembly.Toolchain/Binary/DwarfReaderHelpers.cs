@@ -18,14 +18,66 @@ internal static class DwarfReaderHelpers
         public bool HasChildren;
         public Dictionary<ushort, object> Attributes = new();
         public int Depth;
+
+        /// <summary>
+        /// Attributes read with <c>DW_FORM_ref_addr</c>: their value is a .debug_info SECTION offset,
+        /// not a CU-relative one like every other reference form. Null when there are none.
+        /// </summary>
+        public List<ushort>? SectionRefAttributes;
     }
 
-    internal readonly struct StringContext(byte[]? strData, byte[]? lineStrData, byte[]? strOffsetsData, int strOffsetsBase)
+    /// <summary>Sections and per-unit bases needed to resolve string and indexed-address forms.</summary>
+    /// <param name="strData">.debug_str bytes.</param>
+    /// <param name="lineStrData">.debug_line_str bytes.</param>
+    /// <param name="strOffsetsData">.debug_str_offsets bytes.</param>
+    /// <param name="strOffsetsBase">The unit's <c>DW_AT_str_offsets_base</c>.</param>
+    /// <param name="addrData">.debug_addr bytes (DWARF 5 indexed addresses).</param>
+    /// <param name="addrBase">The CU's <c>DW_AT_addr_base</c>; negative when it has none.</param>
+    /// <param name="resolveAddrx">
+    /// When true, <c>DW_FORM_addrx*</c> values are resolved through <paramref name="addrData"/> at
+    /// <paramref name="addrBase"/> and an unresolvable index yields no value — an index must never be
+    /// mistaken for an address. When false (legacy callers that read no addresses), the raw index is
+    /// returned.
+    /// </param>
+    internal readonly struct StringContext(byte[]? strData, byte[]? lineStrData, byte[]? strOffsetsData, int strOffsetsBase,
+        byte[]? addrData = null, long addrBase = -1, bool resolveAddrx = false)
     {
         public readonly byte[]? StrData = strData;
         public readonly byte[]? LineStrData = lineStrData;
         public readonly byte[]? StrOffsetsData = strOffsetsData;
         public readonly int StrOffsetsBase = strOffsetsBase;
+        public readonly byte[]? AddrData = addrData;
+        public readonly long AddrBase = addrBase;
+        public readonly bool ResolveAddrx = resolveAddrx;
+    }
+
+    /// <summary>
+    /// Reads the per-unit bases a DWARF 5 compile unit DIE carries (<c>DW_AT_str_offsets_base</c>,
+    /// <c>DW_AT_addr_base</c>) without materializing the DIE, so string and address forms in the
+    /// unit can be resolved while it is parsed. Returns (0, -1) for DWARF &lt; 5 or when absent.
+    /// </summary>
+    internal static (int StrOffsetsBase, long AddrBase) ReadUnitBases(
+        byte[] data, int diePos, int cuEnd, ushort version,
+        Dictionary<uint, DwarfAbbrevEntry> abbrevTable, byte addrSize)
+    {
+        int strOffsetsBase = 0;
+        long addrBase = -1;
+        if (version < 5 || diePos >= cuEnd)
+            return (strOffsetsBase, addrBase);
+        int peekPos = diePos;
+        uint code = ReadULEB128(data, ref peekPos);
+        if (code == 0 || !abbrevTable.TryGetValue(code, out var entry) || entry.Tag != 0x11 /* DW_TAG_compile_unit */)
+            return (strOffsetsBase, addrBase);
+        foreach (var (attrName, attrForm, _) in entry.Attributes)
+        {
+            if (attrName == 0x72 /* DW_AT_str_offsets_base */)
+                strOffsetsBase = (int)ReadUnsignedFormValue(data, ref peekPos, attrForm, addrSize);
+            else if (attrName == 0x73 /* DW_AT_addr_base */)
+                addrBase = ReadUnsignedFormValue(data, ref peekPos, attrForm, addrSize);
+            else
+                SkipFormValue(data, ref peekPos, attrForm, addrSize);
+        }
+        return (strOffsetsBase, addrBase);
     }
 
     // DWARF tag constants (shared)
@@ -55,7 +107,8 @@ internal static class DwarfReaderHelpers
         Dictionary<uint, DwarfAbbrevEntry> abbrevTable,
         byte addrSize,
         in StringContext ctx,
-        int cuStart)
+        int cuStart,
+        Func<ushort, bool>? keepTag = null)
     {
         var dies = new List<DwarfDIE>();
         int pos = start;
@@ -74,6 +127,17 @@ internal static class DwarfReaderHelpers
             if (!abbrevTable.TryGetValue(abbrevCode, out var entry))
                 break;
 
+            // A filtered parse (keepTag) skips the attributes of every other DIE without
+            // materializing them; depth is still tracked so kept DIEs keep their nesting.
+            if (keepTag is not null && !keepTag(entry.Tag))
+            {
+                foreach (var (_, attrForm, _) in entry.Attributes)
+                    SkipFormValue(data, ref pos, attrForm, addrSize);
+                if (entry.HasChildren)
+                    depth++;
+                continue;
+            }
+
             var die = new DwarfDIE
             {
                 Offset = dieOffset,
@@ -84,9 +148,16 @@ internal static class DwarfReaderHelpers
 
             foreach (var (attrName, attrForm, implicitConst) in entry.Attributes)
             {
+                // The effective form decides how a reference is interpreted, so look through
+                // DW_FORM_indirect (whose operand is the real form) before recording provenance.
+                ushort effectiveForm = attrForm;
+                for (int peek = pos; effectiveForm == 0x16 /* DW_FORM_indirect */ && peek < data.Length;)
+                    effectiveForm = (ushort)ReadULEB128(data, ref peek);
                 var value = ReadAttributeValue(data, ref pos, attrForm, addrSize, ctx, implicitConst);
                 if (value is not null)
                     die.Attributes[attrName] = value;
+                if (effectiveForm == 0x10 /* DW_FORM_ref_addr */)
+                    (die.SectionRefAttributes ??= []).Add(attrName);
             }
 
             dies.Add(die);
@@ -114,21 +185,26 @@ internal static class DwarfReaderHelpers
             case 0x0b: // DW_FORM_data1
             case 0x11: // DW_FORM_ref1
             case 0x0c: // DW_FORM_flag
-            case 0x29: // DW_FORM_addrx1
                 return (long)data[pos++];
+            case 0x29: // DW_FORM_addrx1
+                return IndexedAddress(data[pos++], ctx, addrSize);
 
             case 0x05: // DW_FORM_data2
             case 0x12: // DW_FORM_ref2
-            case 0x2a: // DW_FORM_addrx2
             {
                 var v = (long)ReadU16LE(data, pos); pos += 2;
                 return v;
+            }
+            case 0x2a: // DW_FORM_addrx2
+            {
+                var v = (long)ReadU16LE(data, pos); pos += 2;
+                return IndexedAddress(v, ctx, addrSize);
             }
             case 0x2b: // DW_FORM_addrx3
             {
                 var v = (long)(data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16));
                 pos += 3;
-                return v;
+                return IndexedAddress(v, ctx, addrSize);
             }
 
             case 0x06: // DW_FORM_data4
@@ -137,10 +213,14 @@ internal static class DwarfReaderHelpers
             case 0x17: // DW_FORM_sec_offset
             case 0x1c: // DW_FORM_ref_sup4
             case 0x1d: // DW_FORM_strp_sup
-            case 0x2c: // DW_FORM_addrx4
             {
                 var v = (long)ReadU32LE(data, pos); pos += 4;
                 return v;
+            }
+            case 0x2c: // DW_FORM_addrx4
+            {
+                var v = (long)ReadU32LE(data, pos); pos += 4;
+                return IndexedAddress(v, ctx, addrSize);
             }
 
             case 0x0e: // DW_FORM_strp
@@ -192,9 +272,11 @@ internal static class DwarfReaderHelpers
             case 0x0d: // DW_FORM_sdata
                 return ReadSLEB128(data, ref pos);
 
+            case 0x1b: // DW_FORM_addrx
+                return IndexedAddress(ReadULEB128(data, ref pos), ctx, addrSize);
+
             case 0x0f: // DW_FORM_udata
             case 0x15: // DW_FORM_ref_udata
-            case 0x1b: // DW_FORM_addrx
             case 0x22: // DW_FORM_loclistx
             case 0x23: // DW_FORM_rnglistx
                 return (long)ReadULEB128(data, ref pos);
@@ -276,6 +358,26 @@ internal static class DwarfReaderHelpers
         if (value is long l) return l;
         if (value is byte[] block) return ExtractBlockLongValue(block);
         return 0L;
+    }
+
+    /// <summary>
+    /// A <c>DW_FORM_addrx*</c> value: the address at <paramref name="index"/> in the unit's
+    /// .debug_addr contribution when the context resolves indexed addresses; null when it cannot
+    /// (no .debug_addr, no <c>DW_AT_addr_base</c>, index out of range); the raw index for legacy
+    /// contexts.
+    /// </summary>
+    private static object? IndexedAddress(long index, in StringContext ctx, byte addrSize)
+    {
+        if (!ctx.ResolveAddrx)
+            return index;
+        if (ctx.AddrData is null || ctx.AddrBase < 0 || (addrSize != 4 && addrSize != 8))
+            return null;
+        long at = ctx.AddrBase + index * addrSize;
+        if (at < 0 || at + addrSize > ctx.AddrData.Length)
+            return null;
+        return addrSize == 8
+            ? (long)ReadU64LE(ctx.AddrData, (int)at)
+            : (long)ReadU32LE(ctx.AddrData, (int)at);
     }
 
     private static object ResolveStrx(int index, in StringContext ctx)
@@ -462,10 +564,13 @@ internal static class DwarfReaderHelpers
         while (pos < data.Length)
         {
             byte b = data[pos++];
-            result |= (uint)(b & 0x7F) << shift;
+            // Bits beyond 32 are dropped, but every continuation byte is still consumed: a 64-bit
+            // value (e.g. a DW_FORM_udata constant of 2^64-1, ten bytes) must not leave the cursor
+            // mid-number, or every DIE after it decodes as garbage.
+            if (shift < 32)
+                result |= (uint)(b & 0x7F) << shift;
             if ((b & 0x80) == 0) break;
             shift += 7;
-            if (shift >= 35) break;
         }
         return result;
     }

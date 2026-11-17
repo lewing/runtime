@@ -12,6 +12,9 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// </summary>
 public sealed class WasmBinaryReader
 {
+    private static readonly UTF8Encoding StrictUtf8 =
+        new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     private readonly BinaryReader _reader;
     private readonly long? _length;
     private long _position;
@@ -202,22 +205,17 @@ public sealed class WasmBinaryReader
     /// </summary>
     public long ReadS33Leb128()
     {
-        long result = 0;
-        int shift = 0;
-        byte b;
-
-        for (int i = 0; i < 5; i++)
+        Span<byte> encoded = stackalloc byte[S33Leb128.MaxBytes];
+        int length = 0;
+        for (; length < encoded.Length; length++)
         {
-            b = ReadByte();
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-
-            if ((b & 0x80) == 0)
+            byte current = ReadByte();
+            encoded[length] = current;
+            S33Leb128.ValidateTerminalByte(current, length);
+            if ((current & 0x80) == 0)
             {
-                // Sign extend if the sign bit of the last byte is set
-                if (shift < 64 && (b & 0x40) != 0)
-                    result |= ~0L << shift;
-                return result;
+                int offset = 0;
+                return S33Leb128.Read(encoded[..(length + 1)], ref offset);
             }
         }
 
@@ -262,14 +260,14 @@ public sealed class WasmBinaryReader
         {
             Span<byte> buf = stackalloc byte[(int)length];
             ReadBytes(buf);
-            try { return Encoding.UTF8.GetString(buf); }
+            try { return StrictUtf8.GetString(buf); }
             catch (DecoderFallbackException ex)
             { throw new WasmFormatException("Invalid UTF-8 encoding in name", ex); }
         }
         byte[] bytes = ReadBytes((int)length);
         try
         {
-            return Encoding.UTF8.GetString(bytes);
+            return StrictUtf8.GetString(bytes);
         }
         catch (DecoderFallbackException ex)
         {

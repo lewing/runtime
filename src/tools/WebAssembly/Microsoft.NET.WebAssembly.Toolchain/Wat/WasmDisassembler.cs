@@ -9,10 +9,32 @@ using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
+using ExactValueType = Microsoft.NET.WebAssembly.Types.ValueType;
 
 /// <summary>Disassembles a parsed <see cref="WasmModule"/> into WAT text format.</summary>
 public static class WasmDisassembler
 {
+    internal readonly record struct InstructionBoundary(
+        OpcodeId OpcodeId,
+        int ByteOffset,
+        int ImmediateOffset,
+        int EndOffset);
+
+    internal sealed record OmittedInstruction(
+        int Pc,
+        OpcodeId OpcodeId,
+        int ByteOffsetStart,
+        int ByteOffsetEnd,
+        string Reason);
+
+    internal sealed record FunctionBodyWindow(
+        string Preview,
+        int RenderedInstructions,
+        int CoveredInstructionStart,
+        int CoveredInstructionEnd,
+        OmittedInstruction? Omitted,
+        int? PreviousInstructionStart);
+
     /// <summary>Disassemble a parsed WasmModule to WAT text.</summary>
     public static string Disassemble(WasmModule module)
     {
@@ -26,14 +48,27 @@ public static class WasmDisassembler
     public static void Disassemble(WasmModule module, WatWriter writer)
     {
         var ctx = new DisassemblyContext(module);
-        writer.WriteLine("(module");
 
-        EmitTypes(writer, module);
+        // Emit the module header, including the name if the name section provided one.
+        if (ctx.ModuleName != null)
+        {
+            if (ctx.ModuleName.Length == 0)
+                writer.WriteLine($"(module (@name \"{Escape(ctx.ModuleName)}\")");
+            else
+                writer.WriteLine($"(module {FormatIdentifier(ctx.ModuleName)}");
+        }
+        else
+        {
+            writer.WriteLine("(module");
+        }
+
+        EmitTypes(writer, module, ctx);
         EmitImports(writer, module, ctx);
         EmitFunctions(writer, module, ctx);
         EmitTables(writer, module, ctx);
         EmitMemories(writer, module, ctx);
         EmitGlobals(writer, module, ctx);
+        EmitTags(writer, module, ctx);
         EmitExports(writer, module, ctx);
         EmitStart(writer, module, ctx);
         EmitElements(writer, module, ctx);
@@ -68,8 +103,30 @@ public static class WasmDisassembler
     /// <param name="exportFunctionIndex">The absolute function index (including imports).</param>
     public static string DisassembleFunction(WasmModule module, int exportFunctionIndex)
     {
-        var ctx = new DisassemblyContext(module);
         var writer = WatWriter.CreateStringWriter(out var sw);
+        DisassembleFunction(module, exportFunctionIndex, writer, inspectionMode: false);
+        writer.Flush();
+        return sw.ToString();
+    }
+
+    internal static long MeasureDisassembledFunctionSizeBytes(
+        WasmModule module,
+        int exportFunctionIndex)
+    {
+        using var counter = new Utf8CountingTextWriter();
+        using var writer = new WatWriter(counter);
+        DisassembleFunction(module, exportFunctionIndex, writer, inspectionMode: true);
+        writer.Flush();
+        return counter.ByteCount;
+    }
+
+    private static void DisassembleFunction(
+        WasmModule module,
+        int exportFunctionIndex,
+        WatWriter writer,
+        bool inspectionMode)
+    {
+        var ctx = new DisassemblyContext(module);
 
         int localIndex = exportFunctionIndex - ctx.ImportedFuncCount;
         if (localIndex < 0 || localIndex >= module.Functions.Count)
@@ -77,49 +134,147 @@ public static class WasmDisassembler
                 $"Function index {exportFunctionIndex} is out of range");
 
         var func = module.Functions[localIndex];
-        var funcName = ctx.FuncNames.TryGetValue(exportFunctionIndex, out var n) ? $" ${n}" : "";
-        var ft = module.Types[func.TypeIndex];
+        var funcName = ctx.FuncNames.TryGetValue(exportFunctionIndex, out var n) ? $" {FormatDefName(n)}" : "";
+        var ft = ExactFunctionType(module, func.TypeIndex, ctx);
 
         writer.Write($"(func{funcName}");
 
-        if (ft.Parameters.Length > 0)
-        {
-            writer.Write(" (param");
-            foreach (var p in ft.Parameters)
-                writer.Write($" {ValTypeName(p)}");
-            writer.Write(')');
-        }
-        if (ft.Results.Length > 0)
-        {
-            writer.Write(" (result");
-            foreach (var r in ft.Results)
-                writer.Write($" {ValTypeName(r)}");
-            writer.Write(')');
-        }
+        ctx.LocalNames.TryGetValue(exportFunctionIndex, out var localNames);
+        EmitParameters(writer, ft.Parameters, localNames, ctx);
+        EmitResults(writer, ft.Results, ctx);
         writer.WriteLine();
 
-        if (func.Locals.Count > 0)
-        {
-            int li = 0;
-            while (li < func.Locals.Count)
-            {
-                var lt = func.Locals[li];
-                int count = 1;
-                while (li + count < func.Locals.Count && func.Locals[li + count] == lt)
-                    count++;
-                writer.Write("  (local");
-                for (int c = 0; c < count; c++)
-                    writer.Write($" {ValTypeName(lt)}");
-                writer.WriteLine(")");
-                li += count;
-            }
-        }
+        EmitLocals(
+            writer,
+            ExactLocals(func),
+            ft.Parameters.Count,
+            localNames,
+            ctx,
+            indent: 1);
 
-        DisassembleBody(writer, func.Body, ctx);
+        DisassembleBody(
+            writer,
+            func.Body,
+            func.BranchHints,
+            ctx,
+            exportFunctionIndex,
+            inspectionMode: inspectionMode);
 
         writer.Write(')');
-        writer.Flush();
-        return sw.ToString();
+    }
+
+    /// <summary>Disassemble an instruction-aligned window from one defined function body.</summary>
+    /// <param name="module">The parsed module.</param>
+    /// <param name="exportFunctionIndex">The absolute function index (including imports).</param>
+    /// <param name="instructions">Decoded boundaries shared with the caller's window selection.</param>
+    /// <param name="startInstruction">First instruction PC to include.</param>
+    /// <param name="endInstructionExclusive">Instruction PC after the last instruction to include.</param>
+    /// <param name="maxCharacters">Maximum preview characters to materialize.</param>
+    /// <param name="previousInstructionLimit">Maximum preceding instructions considered for backward pagination.</param>
+    /// <param name="requiredInstruction">Instruction PC that must be included or reported as omitted.</param>
+    /// <param name="measureCharacters">Optional output-specific character measurement.</param>
+    internal static FunctionBodyWindow DisassembleFunctionBodyWindow(
+        WasmModule module,
+        int exportFunctionIndex,
+        IReadOnlyList<InstructionBoundary> instructions,
+        int startInstruction,
+        int endInstructionExclusive,
+        int maxCharacters,
+        int previousInstructionLimit,
+        int? requiredInstruction = null,
+        Func<string, int>? measureCharacters = null)
+    {
+        if (startInstruction < 0)
+            throw new ArgumentOutOfRangeException(nameof(startInstruction));
+        if (endInstructionExclusive < startInstruction)
+            throw new ArgumentOutOfRangeException(nameof(endInstructionExclusive));
+        if (endInstructionExclusive > instructions.Count)
+            throw new ArgumentOutOfRangeException(nameof(endInstructionExclusive));
+        if (maxCharacters <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxCharacters));
+        if (previousInstructionLimit < 0)
+            throw new ArgumentOutOfRangeException(nameof(previousInstructionLimit));
+        if (requiredInstruction is int required &&
+            (required < 0 ||
+             required >= instructions.Count ||
+             required < startInstruction ||
+             required >= endInstructionExclusive))
+            throw new ArgumentOutOfRangeException(nameof(requiredInstruction));
+
+        var ctx = new DisassemblyContext(module);
+        int localIndex = exportFunctionIndex - ctx.ImportedFuncCount;
+        if (localIndex < 0 || localIndex >= module.Functions.Count)
+            throw new ArgumentOutOfRangeException(nameof(exportFunctionIndex),
+                $"Function index {exportFunctionIndex} is out of range");
+
+        var func = module.Functions[localIndex];
+        return DisassembleBodyWindow(
+            func.Body,
+            func.BranchHints,
+            ctx,
+            exportFunctionIndex,
+            instructions,
+            startInstruction,
+            endInstructionExclusive,
+            maxCharacters,
+            previousInstructionLimit,
+            requiredInstruction,
+            measureCharacters ?? (static text => text.Length));
+    }
+
+    internal static IReadOnlyList<InstructionBoundary> DecodeFunctionBodyInstructions(byte[] body)
+    {
+        var instructions = new List<InstructionBoundary>();
+        var cursor = new InstructionCursor(body, WasmFeatures.All);
+        while (cursor.MoveNext(out var instruction))
+        {
+            bool isImplicitFunctionEnd =
+                instruction.OpcodeId.Opcode == 0x0B &&
+                cursor.Position == body.Length;
+            if (isImplicitFunctionEnd)
+                break;
+
+            instructions.Add(new InstructionBoundary(
+                instruction.OpcodeId,
+                instruction.ByteOffset,
+                instruction.ImmediateOffset,
+                cursor.Position));
+        }
+        return instructions;
+    }
+
+    internal static string GetInstructionMnemonic(OpcodeId opcodeId)
+    {
+        foreach (string mnemonic in GetAllMnemonics())
+        {
+            if (!OpcodeTable.TryGet(mnemonic, out var entry) || entry.Opcodes.Length == 0)
+                continue;
+            if (entry.Opcodes[0] != opcodeId.Opcode)
+                continue;
+            if (entry.Opcodes.Length == 1 && !opcodeId.IsPrefixed)
+                return mnemonic;
+            if (entry.Opcodes.Length > 1 &&
+                opcodeId.IsPrefixed &&
+                DecodeOpcodeSubImmediate(entry.Opcodes.AsSpan(1)) == opcodeId.SubOpcode)
+            {
+                return mnemonic;
+            }
+        }
+        return opcodeId.ToString();
+    }
+
+    private static uint DecodeOpcodeSubImmediate(ReadOnlySpan<byte> bytes)
+    {
+        uint result = 0;
+        int shift = 0;
+        foreach (byte value in bytes)
+        {
+            result |= (uint)(value & 0x7F) << shift;
+            if ((value & 0x80) == 0)
+                return result;
+            shift += 7;
+        }
+        return result;
     }
 
     // ── Context ──────────────────────────────────────────────────────────
@@ -131,8 +286,14 @@ public static class WasmDisassembler
         public readonly int ImportedTableCount;
         public readonly int ImportedMemCount;
         public readonly int ImportedGlobalCount;
-        public readonly Dictionary<int, string> FuncNames = new();
-        public readonly Dictionary<int, Dictionary<int, string>> LocalNames = new();
+        public readonly int ImportedTagCount;
+        public readonly Dictionary<int, string> FuncNames;
+        public readonly Dictionary<int, string> TypeNames = [];
+        public readonly Dictionary<int, string> TypeBindingNames = [];
+        public readonly Dictionary<int, Dictionary<int, string>> LocalNames;
+        public readonly Dictionary<int, TypeDefinition> ExactTypeDefinitions = [];
+        public readonly Dictionary<int, RecGroupIdentity> RecGroups = [];
+        public string? ModuleName;
 
         // Reverse opcode table: byte(s) → (mnemonic, ImmediateKind)
         public readonly Dictionary<byte, (string Mnemonic, ImmediateKind Imm)> SingleByteOpcodes = new();
@@ -149,11 +310,73 @@ public static class WasmDisassembler
                     case ImportDescriptor.Table: ImportedTableCount++; break;
                     case ImportDescriptor.Memory: ImportedMemCount++; break;
                     case ImportDescriptor.Global: ImportedGlobalCount++; break;
+                    case ImportDescriptor.Tag: ImportedTagCount++; break;
                 }
             }
 
+            IndexExactTypeMetadata(module);
             BuildReverseOpcodeTable();
+            // Function ids come from the name section only: they become WAT $ids, which must
+            // round-trip, so the resolver's export/import display fallbacks do not apply here.
+            var nameSection = Microsoft.NET.WebAssembly.Debugging.Symbols.ModuleSymbols.For(module).NameSection.Contents;
+            FuncNames = new Dictionary<int, string>(nameSection.FunctionNames);
+            LocalNames = nameSection.LocalNames.ToDictionary(kv => kv.Key, kv => new Dictionary<int, string>(kv.Value));
             ParseNameSection(module);
+            BuildTypeBindingNames();
+        }
+
+        private void IndexExactTypeMetadata(WasmModule module)
+        {
+            foreach (TypeDefinition definition in module.TypeDefinitions)
+            {
+                if ((uint)definition.Index >= (uint)module.Types.Count)
+                {
+                    throw new WatException(
+                        $"Exact type definition index {definition.Index} is outside the module's " +
+                        $"{module.Types.Count}-entry type index space.");
+                }
+                if (!ExactTypeDefinitions.TryAdd(definition.Index, definition))
+                    throw new WatException($"Exact type definition index {definition.Index} is duplicated.");
+
+                RecGroupIdentity group = definition.RecGroup;
+                if (group.Count <= 0 ||
+                    group.StartTypeIndex < 0 ||
+                    group.StartTypeIndex > module.Types.Count - group.Count ||
+                    definition.Index < group.StartTypeIndex ||
+                    definition.Index >= group.StartTypeIndex + group.Count)
+                {
+                    throw new WatException(
+                        $"Exact type definition {definition.Index} has invalid recursion group " +
+                        $"{group.Index} [{group.StartTypeIndex}, " +
+                        $"{group.StartTypeIndex + group.Count}).");
+                }
+
+                if (RecGroups.TryGetValue(group.Index, out RecGroupIdentity? existing) &&
+                    existing != group)
+                {
+                    throw new WatException(
+                        $"Recursion group {group.Index} has conflicting extents " +
+                        $"[{existing.StartTypeIndex}, {existing.StartTypeIndex + existing.Count}) and " +
+                        $"[{group.StartTypeIndex}, {group.StartTypeIndex + group.Count}).");
+                }
+                RecGroups[group.Index] = group;
+            }
+
+            foreach (RecGroupIdentity group in RecGroups.Values)
+            {
+                for (int index = group.StartTypeIndex;
+                     index < group.StartTypeIndex + group.Count;
+                     index++)
+                {
+                    if (!ExactTypeDefinitions.TryGetValue(index, out TypeDefinition? member) ||
+                        member.RecGroup != group)
+                    {
+                        throw new WatException(
+                            $"Recursion group {group.Index} requires exact type definition {index}; " +
+                            "compact fallback cannot represent only part of a recursion group.");
+                    }
+                }
+            }
         }
 
         private void BuildReverseOpcodeTable()
@@ -219,30 +442,22 @@ public static class WasmDisassembler
 
                 switch (subsectionId)
                 {
+                    case 0: // module name
+                        ModuleName = reader.ReadName();
+                        break;
                     case 1: // function names
-                        foreach (var _ in reader.ReadVectorHeader())
-                        {
-                            uint idx = reader.ReadU32Leb128();
-                            string name = reader.ReadName();
-                            FuncNames[(int)idx] = name;
-                        }
-                        break;
                     case 2: // local names
-                        foreach (var _ in reader.ReadVectorHeader())
-                        {
-                            uint funcIdx = reader.ReadU32Leb128();
-                            var locals = new Dictionary<int, string>();
-                            foreach (var __ in reader.ReadVectorHeader())
-                            {
-                                uint localIdx = reader.ReadU32Leb128();
-                                string name = reader.ReadName();
-                                locals[(int)localIdx] = name;
-                            }
-                            LocalNames[(int)funcIdx] = locals;
-                        }
+                        // Parsed by WasmNameSectionReader for all consumers.
                         break;
+                    case 4: // type names
+                    {
+                        uint count = reader.ReadU32Leb128();
+                        for (uint i = 0; i < count; i++)
+                            TypeNames[(int)reader.ReadU32Leb128()] = reader.ReadName();
+                        break;
+                    }
                     default:
-                        // Skip unknown subsection
+                        // Subsections 3+ are not modeled; their references remain numeric in WAT.
                         reader.ReadBytes((int)(subsectionSize - (reader.Position - start)));
                         break;
                 }
@@ -254,18 +469,34 @@ public static class WasmDisassembler
             }
         }
 
-        public string FuncName(int funcIdx)
+        private void BuildTypeBindingNames()
         {
-            if (FuncNames.TryGetValue(funcIdx, out var name))
-                return $"${name}";
-            return funcIdx.ToString();
-        }
+            var counts = TypeNames.Values
+                .Where(static name => name.Length > 0)
+                .GroupBy(static name => name, StringComparer.Ordinal)
+                .ToDictionary(
+                    static group => group.Key,
+                    static group => group.Count(),
+                    StringComparer.Ordinal);
+            var used = new HashSet<string>(
+                counts.Where(static entry => entry.Value == 1).Select(static entry => entry.Key),
+                StringComparer.Ordinal);
 
-        public string FuncRef(int funcIdx)
-        {
-            if (FuncNames.TryGetValue(funcIdx, out var name))
-                return $"$${name}";
-            return funcIdx.ToString();
+            foreach ((int typeIndex, string name) in TypeNames.OrderBy(static entry => entry.Key))
+            {
+                if (name.Length == 0)
+                    continue;
+                if (counts[name] == 1)
+                {
+                    TypeBindingNames[typeIndex] = name;
+                    continue;
+                }
+
+                string candidate = $"__nesm_type_{typeIndex}";
+                while (!used.Add(candidate))
+                    candidate += "_";
+                TypeBindingNames[typeIndex] = candidate;
+            }
         }
     }
 
@@ -278,7 +509,7 @@ public static class WasmDisassembler
         "try", "catch", "throw", "rethrow", "throw_ref",
         "end", "br", "br_if", "br_table", "return", "call",
         "delegate", "catch_all", "try_table", "cont.new", "cont.bind", "resume", "suspend", "switch",
-        "call_indirect", "return_call", "return_call_indirect",
+        "call_indirect", "return_call", "return_call_indirect", "call_ref", "return_call_ref",
         // Parametric
         "drop", "select",
         // Local/Global
@@ -342,6 +573,7 @@ public static class WasmDisassembler
         "i64.trunc_sat_f32_s", "i64.trunc_sat_f32_u", "i64.trunc_sat_f64_s", "i64.trunc_sat_f64_u",
         "memory.init", "data.drop", "memory.copy", "memory.fill",
         "table.init", "elem.drop", "table.copy", "table.grow", "table.size", "table.fill",
+        "i64.add128", "i64.sub128", "i64.mul_wide_s", "i64.mul_wide_u",
         // SIMD
         "v128.load", "v128.load8x8_s", "v128.load8x8_u", "v128.load16x4_s", "v128.load16x4_u",
         "v128.load32x2_s", "v128.load32x2_u", "v128.load8_splat", "v128.load16_splat",
@@ -453,28 +685,152 @@ public static class WasmDisassembler
 
     // ── Section emitters ─────────────────────────────────────────────────
 
-    private static void EmitTypes(WatWriter writer, WasmModule module)
+    private static void EmitTypes(WatWriter writer, WasmModule module, DisassemblyContext ctx)
     {
-        for (int i = 0; i < module.Types.Count; i++)
+        for (int i = 0; i < module.Types.Count;)
         {
-            var ft = module.Types[i];
-            writer.Write($"  (type (;{i};) (func");
-            if (ft.Parameters.Length > 0)
+            if (ctx.ExactTypeDefinitions.TryGetValue(i, out TypeDefinition? definition) &&
+                definition.RecGroup.Count > 1)
             {
-                writer.Write(" (param");
-                foreach (var p in ft.Parameters)
-                    writer.Write($" {ValTypeName(p)}");
-                writer.Write(')');
+                RecGroupIdentity group = definition.RecGroup;
+                if (group.StartTypeIndex != i)
+                {
+                    throw new WatException(
+                        $"Recursion group {group.Index} starts at type {group.StartTypeIndex}, " +
+                        $"but its first encountered member is type {i}.");
+                }
+
+                writer.WriteLine("  (rec");
+                for (int member = 0; member < group.Count; member++)
+                    EmitTypeDefinition(writer, module, i + member, ctx, indent: 2);
+                writer.WriteLine("  )");
+                i += group.Count;
+                continue;
             }
-            if (ft.Results.Length > 0)
-            {
-                writer.Write(" (result");
-                foreach (var r in ft.Results)
-                    writer.Write($" {ValTypeName(r)}");
-                writer.Write(')');
-            }
-            writer.WriteLine("))");
+
+            EmitTypeDefinition(writer, module, i, ctx, indent: 1);
+            i++;
         }
+    }
+
+    private static void EmitTypeDefinition(
+        WatWriter writer,
+        WasmModule module,
+        int typeIndex,
+        DisassemblyContext context,
+        int indent)
+    {
+        Indent(writer, indent);
+        string name;
+        if (!context.TypeNames.TryGetValue(typeIndex, out string? typeName))
+        {
+            name = $" (;{typeIndex};)";
+        }
+        else if (typeName.Length == 0)
+        {
+            name = """ (@name "")""";
+        }
+        else
+        {
+            string binding = context.TypeBindingNames[typeIndex];
+            name = binding == typeName
+                ? $" {FormatIdentifier(binding)}"
+                : $" {FormatIdentifier(binding)} (@name \"{Escape(typeName)}\")";
+        }
+        writer.Write($"(type{name} ");
+
+        if (context.ExactTypeDefinitions.TryGetValue(typeIndex, out TypeDefinition? definition))
+        {
+            writer.Write(TypeDefinitionText(definition, context));
+        }
+        else
+        {
+            // A programmatically-built module can carry only FuncType. In that model the compact
+            // bytes are the entire declaration, so their nullable abstract meanings are exact.
+            FuncType compact = module.Types[typeIndex];
+            writer.Write(FunctionTypeText(
+                compact.Parameters.Select(ExactValueType.FromStorageValType).ToArray(),
+                compact.Results.Select(ExactValueType.FromStorageValType).ToArray(),
+                context));
+        }
+
+        writer.WriteLine(")");
+    }
+
+    private static string TypeDefinitionText(
+        TypeDefinition definition,
+        DisassemblyContext context)
+    {
+        string composite = CompositeTypeText(definition.CompositeType, context);
+        if (definition.IsFinal && definition.SuperTypeIndices.Count == 0)
+            return composite;
+
+        var text = new StringBuilder("(sub");
+        if (definition.IsFinal)
+            text.Append(" final");
+        foreach (int superTypeIndex in definition.SuperTypeIndices)
+            text.Append(' ').Append(TypeReferenceText(superTypeIndex, context));
+        return text.Append(' ').Append(composite).Append(')').ToString();
+    }
+
+    private static string CompositeTypeText(
+        CompositeType composite,
+        DisassemblyContext context)
+    {
+        return composite switch
+        {
+            CompositeType.Function function =>
+                FunctionTypeText(function.Parameters, function.Results, context),
+            CompositeType.Struct structure =>
+                $"(struct{string.Concat(structure.Fields.Select(
+                    field => $" (field {FieldTypeText(field, context)})"))})",
+            CompositeType.Array array =>
+                $"(array {FieldTypeText(array.Field, context)})",
+            CompositeType.Continuation continuation =>
+                $"(cont {TypeReferenceText(continuation.FunctionTypeIndex, context)})",
+            _ => throw new NotSupportedException(
+                $"The WAT disassembler cannot represent composite type '{composite.GetType().Name}'."),
+        };
+    }
+
+    private static string FunctionTypeText(
+        IReadOnlyList<ExactValueType> parameters,
+        IReadOnlyList<ExactValueType> results,
+        DisassemblyContext context)
+    {
+        var text = new StringBuilder("(func");
+        AppendValueTypeGroup(text, "param", parameters, context);
+        AppendValueTypeGroup(text, "result", results, context);
+        return text.Append(')').ToString();
+    }
+
+    private static void AppendValueTypeGroup(
+        StringBuilder text,
+        string keyword,
+        IReadOnlyList<ExactValueType> types,
+        DisassemblyContext context)
+    {
+        if (types.Count == 0)
+            return;
+
+        text.Append(" (").Append(keyword);
+        foreach (ExactValueType type in types)
+            text.Append(' ').Append(ExactValueTypeText(type, context));
+        text.Append(')');
+    }
+
+    private static string FieldTypeText(FieldType field, DisassemblyContext context)
+    {
+        string storageType = field.StorageType switch
+        {
+            StorageType.Value value => ExactValueTypeText(value.Type, context),
+            StorageType.Packed { Type: PackedStorageType.I8 } => "i8",
+            StorageType.Packed { Type: PackedStorageType.I16 } => "i16",
+            _ => throw new NotSupportedException(
+                $"The WAT disassembler cannot represent storage type " +
+                $"'{field.StorageType.GetType().Name}'."),
+        };
+        return field.Mutability == Mutability.Var ? $"(mut {storageType})" : storageType;
     }
 
     private static void EmitImports(WatWriter writer, WasmModule module, DisassemblyContext ctx)
@@ -486,44 +842,121 @@ public static class WasmDisassembler
             switch (imp.Descriptor)
             {
                 case ImportDescriptor.Func f:
-                    var name = ctx.FuncNames.TryGetValue(funcIdx, out var n) ? $" ${n}" : "";
-                    writer.Write($"(func{name}");
-                    // Emit inline params/results (parser doesn't support (type N) in imports)
-                    var ft = module.Types[f.TypeIndex];
-                    if (ft.Parameters.Length > 0)
-                    {
-                        writer.Write(" (param");
-                        foreach (var p in ft.Parameters)
-                            writer.Write($" {ValTypeName(p)}");
-                        writer.Write(')');
-                    }
-                    if (ft.Results.Length > 0)
-                    {
-                        writer.Write(" (result");
-                        foreach (var r in ft.Results)
-                            writer.Write($" {ValTypeName(r)}");
-                        writer.Write(')');
-                    }
+                    var name = ctx.FuncNames.TryGetValue(funcIdx, out var n)
+                        ? $" {FormatDefName(n)}" : "";
+                    writer.Write($"(func{name} (type {f.TypeIndex})");
+                    var ft = ExactFunctionType(module, f.TypeIndex, ctx);
+                    ctx.LocalNames.TryGetValue(funcIdx, out var localNames);
+                    EmitParameters(writer, ft.Parameters, localNames, ctx);
+                    EmitResults(writer, ft.Results, ctx);
                     writer.Write(')');
                     funcIdx++;
                     break;
                 case ImportDescriptor.Table t:
-                    writer.Write($"(table {tableIdx} {FormatLimits(t.Type.Limits)} {RefTypeName(t.Type.ElementType)})");
+                    writer.Write(
+                        $"(table (;{tableIdx};) {FormatLimits(t.Type.Limits)} " +
+                        $"{ReferenceTypeText(ExactTableElementType(t.Type), ctx)})");
                     tableIdx++;
                     break;
                 case ImportDescriptor.Memory m:
-                    writer.Write($"(memory {memIdx} {FormatLimits(m.Type.Limits)})");
+                    writer.Write($"(memory (;{memIdx};) {FormatLimits(m.Type.Limits)})");
                     memIdx++;
                     break;
                 case ImportDescriptor.Global g:
-                    writer.Write($"(global {globalIdx} {FormatGlobalType(g.Type)})");
+                    writer.Write($"(global (;{globalIdx};) {FormatGlobalType(g.Type, ctx)})");
                     globalIdx++;
                     break;
                 case ImportDescriptor.Tag tag:
+                    _ = ExactFunctionType(module, tag.TypeIndex, ctx);
                     writer.Write($"(tag (type {tag.TypeIndex}))");
                     break;
             }
             writer.WriteLine(")");
+        }
+    }
+
+    private static void EmitParameters(
+        WatWriter writer,
+        IReadOnlyList<ExactValueType> parameters,
+        IReadOnlyDictionary<int, string>? localNames,
+        DisassemblyContext context)
+    {
+        if (parameters.Count == 0)
+            return;
+
+        bool hasParamNames = localNames?.Keys.Any(idx => idx >= 0 && idx < parameters.Count) == true;
+        if (!hasParamNames)
+        {
+            writer.Write(" (param");
+            foreach (var parameter in parameters)
+                writer.Write($" {ExactValueTypeText(parameter, context)}");
+            writer.Write(')');
+            return;
+        }
+
+        for (int i = 0; i < parameters.Count; i++)
+        {
+            writer.Write(" (param");
+            if (localNames!.TryGetValue(i, out var name))
+                writer.Write($" {FormatDefName(name)}");
+            writer.Write($" {ExactValueTypeText(parameters[i], context)})");
+        }
+    }
+
+    private static void EmitResults(
+        WatWriter writer,
+        IReadOnlyList<ExactValueType> results,
+        DisassemblyContext context)
+    {
+        if (results.Count == 0)
+            return;
+
+        writer.Write(" (result");
+        foreach (ExactValueType result in results)
+            writer.Write($" {ExactValueTypeText(result, context)}");
+        writer.Write(')');
+    }
+
+    private static void EmitLocals(
+        WatWriter writer,
+        IReadOnlyList<ExactValueType> locals,
+        int parameterCount,
+        IReadOnlyDictionary<int, string>? localNames,
+        DisassemblyContext context,
+        int indent)
+    {
+        if (locals.Count == 0)
+            return;
+
+        bool hasLocalNames = localNames?.Keys.Any(
+            idx => idx >= parameterCount && idx < parameterCount + locals.Count) == true;
+        if (hasLocalNames)
+        {
+            for (int i = 0; i < locals.Count; i++)
+            {
+                Indent(writer, indent);
+                writer.Write("(local");
+                if (localNames!.TryGetValue(parameterCount + i, out var name))
+                    writer.Write($" {FormatDefName(name)}");
+                writer.WriteLine($" {ExactValueTypeText(locals[i], context)})");
+            }
+            return;
+        }
+
+        // Group consecutive unnamed locals of the same type.
+        int localIndex = 0;
+        while (localIndex < locals.Count)
+        {
+            var localType = locals[localIndex];
+            int count = 1;
+            while (localIndex + count < locals.Count && locals[localIndex + count] == localType)
+                count++;
+            Indent(writer, indent);
+            writer.Write("(local");
+            for (int i = 0; i < count; i++)
+                writer.Write($" {ExactValueTypeText(localType, context)}");
+            writer.WriteLine(")");
+            localIndex += count;
         }
     }
 
@@ -533,63 +966,196 @@ public static class WasmDisassembler
         {
             var func = module.Functions[i];
             int absIdx = ctx.ImportedFuncCount + i;
-            var funcName = ctx.FuncNames.TryGetValue(absIdx, out var n) ? $" ${n}" : "";
-            var ft = module.Types[func.TypeIndex];
+            var funcName = ctx.FuncNames.TryGetValue(absIdx, out var n)
+                ? $" {FormatDefName(n)}" : "";
+            var ft = ExactFunctionType(module, func.TypeIndex, ctx);
 
             writer.Write($"  (func{funcName} (type {func.TypeIndex})");
 
             // Params
-            if (ft.Parameters.Length > 0)
-            {
-                writer.Write(" (param");
-                foreach (var p in ft.Parameters)
-                    writer.Write($" {ValTypeName(p)}");
-                writer.Write(')');
-            }
+            ctx.LocalNames.TryGetValue(absIdx, out var localNames);
+            EmitParameters(writer, ft.Parameters, localNames, ctx);
             // Results
-            if (ft.Results.Length > 0)
-            {
-                writer.Write(" (result");
-                foreach (var r in ft.Results)
-                    writer.Write($" {ValTypeName(r)}");
-                writer.Write(')');
-            }
+            EmitResults(writer, ft.Results, ctx);
             writer.WriteLine();
 
             // Locals
-            if (func.Locals.Count > 0)
-            {
-                // Group consecutive locals of same type
-                int li = 0;
-                while (li < func.Locals.Count)
-                {
-                    var lt = func.Locals[li];
-                    int count = 1;
-                    while (li + count < func.Locals.Count && func.Locals[li + count] == lt)
-                        count++;
-                    writer.Write("    (local");
-                    for (int c = 0; c < count; c++)
-                        writer.Write($" {ValTypeName(lt)}");
-                    writer.WriteLine(")");
-                    li += count;
-                }
-            }
+            EmitLocals(
+                writer,
+                ExactLocals(func),
+                ft.Parameters.Count,
+                localNames,
+                ctx,
+                indent: 2);
 
             // Body instructions
-            DisassembleBody(writer, func.Body, ctx);
+            DisassembleBody(writer, func.Body, func.BranchHints, ctx, absIdx);
 
             writer.WriteLine("  )");
         }
     }
 
+    private static CompositeType.Function ExactFunctionType(
+        WasmModule module,
+        int typeIndex,
+        DisassemblyContext context)
+    {
+        if ((uint)typeIndex >= (uint)module.Types.Count)
+            throw new WatException($"Function refers to type index {typeIndex}, which is out of range.");
+
+        if (context.ExactTypeDefinitions.TryGetValue(typeIndex, out TypeDefinition? definition))
+        {
+            return definition.CompositeType as CompositeType.Function ??
+                throw new WatException(
+                    $"Function refers to type index {typeIndex}, whose exact definition is " +
+                    $"{definition.CompositeType.GetType().Name}, not a function type.");
+        }
+
+        FuncType compact = module.Types[typeIndex];
+        return new CompositeType.Function(
+            compact.Parameters.Select(ExactValueType.FromStorageValType).ToArray(),
+            compact.Results.Select(ExactValueType.FromStorageValType).ToArray());
+    }
+
+    private static IReadOnlyList<ExactValueType> ExactLocals(WasmFunction function)
+    {
+        if (function.ExactLocals.Count == function.Locals.Count)
+            return function.ExactLocals;
+
+        if (function.ExactLocals.Count != 0)
+        {
+            throw new WatException(
+                $"Function has {function.Locals.Count} compact locals but " +
+                $"{function.ExactLocals.Count} exact locals; refusing a partial exact rendering.");
+        }
+
+        return function.Locals.Select(ExactValueType.FromStorageValType).ToArray();
+    }
+
+    /// <remarks>
+    /// Table initializers and exact reference types are both part of the table declaration. Omitting
+    /// either produces valid-looking text for a different module.
+    /// </remarks>
     private static void EmitTables(WatWriter writer, WasmModule module, DisassemblyContext ctx)
     {
         for (int i = 0; i < module.Tables.Count; i++)
         {
             int absIdx = ctx.ImportedTableCount + i;
             var t = module.Tables[i];
-            writer.WriteLine($"  (table (;{absIdx};) {FormatLimits(t.Limits)} {RefTypeName(t.ElementType)})");
+            writer.Write(
+                $"  (table (;{absIdx};) {FormatLimits(t.Limits)} " +
+                $"{ReferenceTypeText(ExactTableElementType(t), ctx)}");
+            if (t.InitExpr.Length > 0)
+            {
+                writer.Write(" (");
+                DisassembleInitExpr(writer, t.InitExpr, ctx, $"table {absIdx} initializer");
+                writer.Write(')');
+            }
+            writer.WriteLine(")");
         }
+    }
+
+    private static ExactValueType.Reference ExactTableElementType(TableType tableType)
+    {
+        if (tableType.ExactElementType is ExactValueType.Reference exact)
+            return exact;
+        if (tableType.ExactElementType is not null)
+        {
+            throw new WatException(
+                $"Table exact element type '{tableType.ExactElementType.Key}' is not a reference type.");
+        }
+
+        return new ExactValueType.Reference(
+            Nullability.Nullable,
+            new AbstractHeapType(
+                tableType.ElementType == RefType.ExternRef
+                    ? HeapTypeKind.Extern
+                    : HeapTypeKind.Func));
+    }
+
+    private static bool IsNullableAbstractFunc(Microsoft.NET.WebAssembly.Types.ValueType type) =>
+        type is Microsoft.NET.WebAssembly.Types.ValueType.Reference
+        {
+            Nullability: Nullability.Nullable,
+            HeapType: AbstractHeapType { Kind: HeapTypeKind.Func },
+        };
+
+    private static string ReferenceTypeText(
+        ExactValueType type,
+        DisassemblyContext context)
+    {
+        if (type is not Microsoft.NET.WebAssembly.Types.ValueType.Reference reference)
+            throw new WatException($"Element type '{type.Key}' is not a reference type.");
+
+        return reference.HeapType switch
+        {
+            DefinedHeapType defined =>
+                reference.Nullability == Nullability.Nullable
+                    ? $"(ref null {TypeReferenceText(defined.TypeIndex, context)})"
+                    : $"(ref {TypeReferenceText(defined.TypeIndex, context)})",
+            AbstractHeapType abstractType =>
+                reference.Nullability == Nullability.Nullable
+                    ? AbstractRefTypeName(abstractType.Kind)
+                    : $"(ref {HeapTypeName(abstractType.Kind)})",
+            RecursionVariableHeapType recursionVariable =>
+                reference.Nullability == Nullability.Nullable
+                    ? $"(ref null {RecursionVariableTypeReferenceText(recursionVariable, context)})"
+                    : $"(ref {RecursionVariableTypeReferenceText(recursionVariable, context)})",
+            _ => throw new NotSupportedException(
+                $"The WAT disassembler cannot represent heap type '{reference.HeapType.Key}'."),
+        };
+    }
+
+    private static string ExactValueTypeText(
+        ExactValueType type,
+        DisassemblyContext context) =>
+        type switch
+        {
+            ExactValueType.Number { Type: NumberType.I32 } => "i32",
+            ExactValueType.Number { Type: NumberType.I64 } => "i64",
+            ExactValueType.Number { Type: NumberType.F32 } => "f32",
+            ExactValueType.Number { Type: NumberType.F64 } => "f64",
+            ExactValueType.Vector { Type: VectorType.V128 } => "v128",
+            ExactValueType.Reference => ReferenceTypeText(type, context),
+            _ => throw new NotSupportedException(
+                $"The WAT disassembler cannot represent exact value type '{type.Key}'."),
+        };
+
+    private static string RecursionVariableTypeReferenceText(
+        RecursionVariableHeapType recursionVariable,
+        DisassemblyContext context)
+    {
+        if (!context.RecGroups.TryGetValue(
+                recursionVariable.RecGroupIndex,
+                out RecGroupIdentity? group))
+        {
+            throw new WatException(
+                $"Recursion variable {recursionVariable.Key} refers to unknown recursion group " +
+                $"{recursionVariable.RecGroupIndex}.");
+        }
+        if ((uint)recursionVariable.MemberIndex >= (uint)group.Count)
+        {
+            throw new WatException(
+                $"Recursion variable {recursionVariable.Key} refers to member " +
+                $"{recursionVariable.MemberIndex} of {group.Count}-member recursion group " +
+                $"{group.Index}.");
+        }
+
+        return TypeReferenceText(group.StartTypeIndex + recursionVariable.MemberIndex, context);
+    }
+
+    private static string TypeReferenceText(int typeIndex, DisassemblyContext context)
+    {
+        if ((uint)typeIndex >= (uint)context.Module.Types.Count)
+        {
+            throw new WatException(
+                $"Exact type refers to type index {typeIndex}, which is outside the module's " +
+                $"{context.Module.Types.Count}-entry type index space.");
+        }
+
+        return context.TypeBindingNames.TryGetValue(typeIndex, out string? name)
+            ? FormatIdentifier(name)
+            : typeIndex.ToString(CultureInfo.InvariantCulture);
     }
 
     private static void EmitMemories(WatWriter writer, WasmModule module, DisassemblyContext ctx)
@@ -607,9 +1173,22 @@ public static class WasmDisassembler
         {
             int absIdx = ctx.ImportedGlobalCount + i;
             var g = module.Globals[i];
-            writer.Write($"  (global (;{absIdx};) {FormatGlobalType(g.Type)} (");
-            DisassembleInitExpr(writer, g.InitExpr, ctx);
+            writer.Write($"  (global (;{absIdx};) {FormatGlobalType(g.Type, ctx)} (");
+            DisassembleInitExpr(writer, g.InitExpr, ctx, $"global {absIdx} initializer");
             writer.WriteLine("))");
+        }
+    }
+
+    private static void EmitTags(WatWriter writer, WasmModule module, DisassemblyContext context)
+    {
+        for (int i = 0; i < module.Tags.Count; i++)
+        {
+            int absoluteIndex = context.ImportedTagCount + i;
+            int typeIndex = module.Tags[i].TypeIndex;
+            _ = ExactFunctionType(module, typeIndex, context);
+            writer.WriteLine(
+                $"  (tag (;{absoluteIndex};) " +
+                $"(type {typeIndex}))");
         }
     }
 
@@ -621,7 +1200,8 @@ public static class WasmDisassembler
             switch (export.Descriptor)
             {
                 case ExportDescriptor.Func f:
-                    var fn = ctx.FuncNames.TryGetValue(f.FunctionIndex, out var n) ? $"${n}" : f.FunctionIndex.ToString();
+                    var fn = ctx.FuncNames.TryGetValue(f.FunctionIndex, out var n)
+                        ? FormatRefName(n, f.FunctionIndex) : f.FunctionIndex.ToString();
                     writer.Write($"(func {fn})");
                     break;
                 case ExportDescriptor.Table t:
@@ -645,7 +1225,8 @@ public static class WasmDisassembler
     {
         if (module.StartFunction.HasValue)
         {
-            var fn = ctx.FuncNames.TryGetValue(module.StartFunction.Value, out var n) ? $"${n}" : module.StartFunction.Value.ToString();
+            var fn = ctx.FuncNames.TryGetValue(module.StartFunction.Value, out var n)
+                ? FormatRefName(n, module.StartFunction.Value) : module.StartFunction.Value.ToString();
             writer.WriteLine($"  (start {fn})");
         }
     }
@@ -654,37 +1235,82 @@ public static class WasmDisassembler
     {
         for (int i = 0; i < module.Elements.Count; i++)
         {
-            var elem = module.Elements[i];
-            if (elem.TableIndex >= 0 && elem.OffsetExpr.Length > 0)
+            var element = module.Elements[i];
+            writer.Write($"  (elem (;{i};) ");
+
+            switch (element.Mode)
             {
-                // Active element segment
-                writer.Write($"  (elem (;{i};) ");
-                if (elem.TableIndex != 0)
-                    writer.Write($"(table {elem.TableIndex}) ");
-                writer.Write('(');
-                DisassembleInitExpr(writer, elem.OffsetExpr, ctx);
-                writer.Write(") func");
-                foreach (var funcIdx in elem.FunctionIndices)
+                case ElementMode.Active:
                 {
-                    var fn = ctx.FuncNames.TryGetValue(funcIdx, out var n) ? $" ${n}" : $" {funcIdx}";
-                    writer.Write(fn);
+                    if (element.TableIndex < 0)
+                        throw new WatException($"Element segment {i} is active but has no table index.");
+                    if (element.HasExplicitTableIndex || element.TableIndex != 0)
+                        writer.Write($"(table {element.TableIndex}) ");
+                    if (element.OffsetExpr.Length == 0)
+                        throw new WatException($"Element segment {i} is active but has no offset expression.");
+                    writer.Write('(');
+                    DisassembleInitExpr(writer, element.OffsetExpr, ctx, $"element segment {i} offset");
+                    writer.Write(") ");
+                    break;
+                }
+                case ElementMode.Passive:
+                    break;
+                case ElementMode.Declarative:
+                    writer.Write("declare ");
+                    break;
+                default:
+                    throw new WatException($"Element segment {i} has unknown mode {element.Mode}.");
+            }
+
+            if (element.UsesExpressions)
+            {
+                if (element.Mode == ElementMode.Active &&
+                    !element.HasExplicitTableIndex &&
+                    element.TableIndex == 0 &&
+                    !IsNullableAbstractFunc(element.ElementType))
+                {
+                    throw new WatException(
+                        $"Element segment {i} uses the implicit-table expression encoding (flag 4) " +
+                        $"but has element type '{element.ElementType.Key}', which flag 4 cannot encode.");
+                }
+
+                writer.Write(ReferenceTypeText(element.ElementType, ctx));
+                for (int expressionIndex = 0;
+                     expressionIndex < element.ElementExpressions.Count;
+                     expressionIndex++)
+                {
+                    writer.Write(" (");
+                    DisassembleInitExpr(
+                        writer,
+                        element.ElementExpressions[expressionIndex],
+                        ctx,
+                        $"element segment {i} expression {expressionIndex}");
+                    writer.Write(')');
                 }
                 writer.WriteLine(")");
+                continue;
             }
-            else
+
+            writer.Write("func");
+            IReadOnlyList<int> functionIndices =
+                element.Mode == ElementMode.Declarative
+                    ? element.DeclaredFunctionIndices
+                    : element.FunctionIndices;
+            foreach (int functionIndex in functionIndices)
             {
-                // Passive element segment
-                writer.Write($"  (elem (;{i};) func");
-                foreach (var funcIdx in elem.FunctionIndices)
+                if (functionIndex < 0)
                 {
-                    if (funcIdx >= 0)
-                    {
-                        var fn = ctx.FuncNames.TryGetValue(funcIdx, out var n) ? $" ${n}" : $" {funcIdx}";
-                        writer.Write(fn);
-                    }
+                    throw new WatException(
+                        $"Element segment {i} funcidx entry is negative ({functionIndex}); " +
+                        "it cannot be represented by the funcidx text form.");
                 }
-                writer.WriteLine(")");
+
+                string function = ctx.FuncNames.TryGetValue(functionIndex, out string? name)
+                    ? FormatRefName(name, functionIndex)
+                    : functionIndex.ToString(CultureInfo.InvariantCulture);
+                writer.Write($" {function}");
             }
+            writer.WriteLine(")");
         }
     }
 
@@ -703,7 +1329,7 @@ public static class WasmDisassembler
                 if (data.MemoryIndex != 0)
                     writer.Write($"(memory {data.MemoryIndex}) ");
                 writer.Write('(');
-                DisassembleInitExpr(writer, data.OffsetExpr, ctx);
+                DisassembleInitExpr(writer, data.OffsetExpr, ctx, $"data segment {i} offset");
                 writer.Write($") \"{EscapeDataString(data.InitData)}\")");
             }
             writer.WriteLine();
@@ -712,218 +1338,805 @@ public static class WasmDisassembler
 
     // ── Init expression disassembly ──────────────────────────────────────
 
-    private static void DisassembleInitExpr(WatWriter writer, byte[] expr, DisassemblyContext ctx)
+    private static void DisassembleInitExpr(
+        WatWriter writer,
+        byte[] expression,
+        DisassemblyContext context,
+        string site)
     {
-        int pos = 0;
-        bool first = true;
-        while (pos < expr.Length)
+        writer.Write(FormatConstantExpression(expression, context, site));
+    }
+
+    private static string FormatConstantExpression(
+        byte[] expression,
+        DisassemblyContext context,
+        string site)
+    {
+        var values = new List<string>();
+        var cursor = new InstructionCursor(expression, WasmFeatures.All);
+        try
         {
-            byte op = expr[pos++];
-            if (op == 0x0B) break; // END
-
-            if (!first) writer.Write(' ');
-            first = false;
-
-            switch (op)
+            while (cursor.MoveNext(out var instruction))
             {
-                case 0x41: // i32.const
-                    int i32val = ReadS32Leb128(expr, ref pos);
-                    writer.Write($"i32.const {i32val}");
-                    break;
-                case 0x42: // i64.const
-                    long i64val = ReadS64Leb128(expr, ref pos);
-                    writer.Write($"i64.const {i64val}");
-                    break;
-                case 0x43: // f32.const
-                    float f32val = BinaryPrimitives.ReadSingleLittleEndian(expr.AsSpan(pos));
-                    pos += 4;
-                    writer.Write($"f32.const {FormatFloat(f32val)}");
-                    break;
-                case 0x44: // f64.const
-                    double f64val = BinaryPrimitives.ReadDoubleLittleEndian(expr.AsSpan(pos));
-                    pos += 8;
-                    writer.Write($"f64.const {FormatDouble(f64val)}");
-                    break;
-                case 0x23: // global.get
-                    uint gidx = ReadU32Leb128(expr, ref pos);
-                    writer.Write($"global.get {gidx}");
-                    break;
-                case 0xD0: // ref.null
-                    byte refByte = expr[pos++];
-                    writer.Write($"ref.null {RefTypeNameFromByte(refByte)}");
-                    break;
-                case 0xD2: // ref.func
-                    uint fidx = ReadU32Leb128(expr, ref pos);
-                    var fn = ctx.FuncNames.TryGetValue((int)fidx, out var n) ? $"${n}" : fidx.ToString();
-                    writer.Write($"ref.func {fn}");
-                    break;
-                case 0xFD: // v128.const
-                    ReadU32Leb128(expr, ref pos); // sub-opcode (12)
-                    writer.Write("v128.const i32x4");
-                    for (int j = 0; j < 4; j++)
+                byte opcode = instruction.OpcodeId.Opcode;
+                if (opcode == 0x0B)
+                {
+                    if (cursor.Position != expression.Length)
+                        throw new WatException(
+                            $"Cannot disassemble {site}: bytes follow the constant-expression end.");
+                    if (values.Count != 1)
                     {
-                        int v = BinaryPrimitives.ReadInt32LittleEndian(expr.AsSpan(pos));
-                        pos += 4;
-                        writer.Write($" 0x{(uint)v:x8}");
+                        throw new WatException(
+                            $"Cannot disassemble {site}: constant expression leaves {values.Count} " +
+                            "values; WAT requires exactly one.");
                     }
-                    break;
-                // Extended constants
-                case 0x6A: writer.Write("i32.add"); break;
-                case 0x6B: writer.Write("i32.sub"); break;
-                case 0x6C: writer.Write("i32.mul"); break;
-                case 0x7C: writer.Write("i64.add"); break;
-                case 0x7D: writer.Write("i64.sub"); break;
-                case 0x7E: writer.Write("i64.mul"); break;
-                default:
-                    writer.Write($"<unknown 0x{op:X2}>");
-                    break;
+                    return values[0];
+                }
+
+                switch (opcode)
+                {
+                    case 0x23:
+                        values.Add($"global.get {instruction.Index0}");
+                        break;
+                    case 0x41:
+                        values.Add($"i32.const {unchecked((int)instruction.Index0)}");
+                        break;
+                    case 0x42:
+                        values.Add($"i64.const {unchecked((long)instruction.MemOffset)}");
+                        break;
+                    case 0x43:
+                        values.Add(
+                            $"f32.const {FormatFloat(BitConverter.UInt32BitsToSingle(instruction.Index0))}");
+                        break;
+                    case 0x44:
+                        values.Add(
+                            $"f64.const {FormatDouble(BitConverter.UInt64BitsToDouble(instruction.MemOffset))}");
+                        break;
+                    case 0x6A:
+                        FoldBinary(values, "i32.add", site);
+                        break;
+                    case 0x6B:
+                        FoldBinary(values, "i32.sub", site);
+                        break;
+                    case 0x6C:
+                        FoldBinary(values, "i32.mul", site);
+                        break;
+                    case 0x7C:
+                        FoldBinary(values, "i64.add", site);
+                        break;
+                    case 0x7D:
+                        FoldBinary(values, "i64.sub", site);
+                        break;
+                    case 0x7E:
+                        FoldBinary(values, "i64.mul", site);
+                        break;
+                    case 0xD0:
+                        values.Add($"ref.null {HeapTypeText(instruction.HeapType0, context)}");
+                        break;
+                    case 0xD2:
+                    {
+                        int functionIndex = checked((int)instruction.Index0);
+                        string function = context.FuncNames.TryGetValue(functionIndex, out string? name)
+                            ? FormatRefName(name, functionIndex)
+                            : functionIndex.ToString(CultureInfo.InvariantCulture);
+                        values.Add($"ref.func {function}");
+                        break;
+                    }
+                    case 0xFD when instruction.OpcodeId.SubOpcode == 0x0C:
+                    {
+                        ReadOnlySpan<byte> bytes = instruction.ImmediateBytes[^16..];
+                        var text = new StringBuilder("v128.const i32x4");
+                        for (int lane = 0; lane < 4; lane++)
+                        {
+                            uint value = BinaryPrimitives.ReadUInt32LittleEndian(bytes[(lane * 4)..]);
+                            text.Append(CultureInfo.InvariantCulture, $" 0x{value:x8}");
+                        }
+                        values.Add(text.ToString());
+                        break;
+                    }
+                    case 0xFB:
+                    {
+                        string name = GcConstantExpressionName(instruction.OpcodeId.SubOpcode);
+                        throw new NotSupportedException(
+                            $"Cannot disassemble {site}: {name} ({instruction.OpcodeId}) is a valid " +
+                            "binary constant-expression instruction, but nesm's WAT compiler does not " +
+                            "support GC instructions. Refusing to emit text that cannot round-trip.");
+                    }
+                    default:
+                        throw new WatException(
+                            $"Cannot disassemble {site}: opcode {instruction.OpcodeId} is not supported " +
+                            "in a constant expression; refusing to emit lossy text.");
+                }
             }
         }
+        catch (WasmFormatException ex)
+        {
+            throw new WatException(
+                $"Cannot disassemble {site}: malformed constant expression: {ex.Message}", ex);
+        }
+
+        throw new WatException(
+            $"Cannot disassemble {site}: constant expression is missing an end opcode.");
     }
+
+    private static void FoldBinary(List<string> values, string mnemonic, string site)
+    {
+        if (values.Count < 2)
+        {
+            throw new WatException(
+                $"Cannot disassemble {site}: {mnemonic} has fewer than two operands in the " +
+                "constant expression.");
+        }
+
+        string right = values[^1];
+        string left = values[^2];
+        values.RemoveRange(values.Count - 2, 2);
+        values.Add($"{mnemonic} ({left}) ({right})");
+    }
+
+    private static string GcConstantExpressionName(uint subOpcode) => subOpcode switch
+    {
+        0x00 => "struct.new",
+        0x01 => "struct.new_default",
+        0x06 => "array.new",
+        0x07 => "array.new_default",
+        0x08 => "array.new_fixed",
+        0x1A => "any.convert_extern",
+        0x1B => "extern.convert_any",
+        0x1C => "ref.i31",
+        _ => $"GC sub-opcode 0x{subOpcode:X}",
+    };
 
     // ── Instruction body disassembly ─────────────────────────────────────
 
-    private static void DisassembleBody(WatWriter writer, byte[] body, DisassemblyContext ctx)
+    private static void DisassembleBody(
+        WatWriter writer,
+        byte[] body,
+        IReadOnlyDictionary<int, BranchHint> branchHints,
+        DisassemblyContext ctx,
+        int funcIdx,
+        int startInstruction = 0,
+        int endInstructionExclusive = int.MaxValue,
+        bool inspectionMode = false)
     {
-        int pos = 0;
+        var instructions = DecodeFunctionBodyInstructions(body);
         int indent = 2; // base indent for function body
-        // Track block kinds for proper folded-style closing
         var blockStack = new Stack<string>();
+        var sink = new WatWriter(TextWriter.Null);
 
-        while (pos < body.Length)
+        for (int instructionOrdinal = 0; instructionOrdinal < instructions.Count; instructionOrdinal++)
         {
-            byte opByte = body[pos++];
-
-            // END — close the current block with )
-            if (opByte == 0x0B)
-            {
-                if (pos >= body.Length)
-                    break; // final function-level end — don't emit
-                var block = blockStack.Count > 0 ? blockStack.Pop() : "block";
-                if (block == "if-then")
-                {
-                    // Close (then and (if — no else branch
-                    indent--;
-                    Indent(writer, indent); writer.WriteLine(")");
-                    indent--;
-                    Indent(writer, indent); writer.WriteLine(")");
-                }
-                else if (block == "if-else")
-                {
-                    // Close (else and (if
-                    indent--;
-                    Indent(writer, indent); writer.WriteLine(")");
-                    indent--;
-                    Indent(writer, indent); writer.WriteLine(")");
-                }
-                else
-                {
-                    // Close (block, (loop, (try_table, etc.
-                    indent--;
-                    Indent(writer, indent); writer.WriteLine(")");
-                }
-                continue;
-            }
-
-            // ELSE — close (then, open (else
-            if (opByte == 0x05)
-            {
-                if (blockStack.Count > 0) blockStack.Pop(); // pop "if-then"
-                indent--;
-                Indent(writer, indent); writer.WriteLine(")");
-                Indent(writer, indent); writer.WriteLine("(else");
-                indent++;
-                blockStack.Push("if-else");
-                continue;
-            }
-
-            // Block-opening: block, loop
-            if (opByte is 0x02 or 0x03)
-            {
-                string mnemonic = opByte == 0x02 ? "block" : "loop";
-                Indent(writer, indent);
-                writer.Write($"({mnemonic}");
-                EmitBlockType(writer, body, ref pos);
-                writer.WriteLine();
-                indent++;
-                blockStack.Push(mnemonic);
-                continue;
-            }
-
-            // If
-            if (opByte == 0x04)
-            {
-                Indent(writer, indent);
-                writer.Write("(if");
-                EmitBlockType(writer, body, ref pos);
-                writer.WriteLine();
-                indent++;
-                Indent(writer, indent);
-                writer.WriteLine("(then");
-                indent++;
-                blockStack.Push("if-then");
-                continue;
-            }
-
-            // try (legacy)
-            if (opByte == 0x06)
-            {
-                Indent(writer, indent);
-                writer.Write("(block");  // emit as block for safety
-                EmitBlockType(writer, body, ref pos);
-                writer.WriteLine();
-                indent++;
-                blockStack.Push("block");
-                continue;
-            }
-
-            // try_table
-            if (opByte == 0x1F)
-            {
-                Indent(writer, indent);
-                writer.Write("(try_table");
-                EmitTryTableImmediate(writer, body, ref pos);
-                writer.WriteLine();
-                indent++;
-                blockStack.Push("try_table");
-                continue;
-            }
-
-            // Prefixed opcodes
-            if (opByte is 0xE0 or 0xFC or 0xFD)
-            {
-                uint sub = ReadU32Leb128(body, ref pos);
-                uint key = ((uint)opByte << 24) | sub;
-                if (!ctx.PrefixedOpcodes.TryGetValue(key, out var prefixedEntry))
-                {
-                    Indent(writer, indent);
-                    writer.WriteLine($"<unknown 0x{opByte:X2} {sub}>");
-                    continue;
-                }
-                Indent(writer, indent);
-                writer.Write(prefixedEntry.Mnemonic);
-                EmitImmediate(writer, body, ref pos, prefixedEntry.Imm, prefixedEntry.Mnemonic, ctx);
-                writer.WriteLine();
-                continue;
-            }
-
-            if (!ctx.SingleByteOpcodes.TryGetValue(opByte, out var entry))
-            {
-                Indent(writer, indent);
-                writer.WriteLine($"<unknown 0x{opByte:X2}>");
-                continue;
-            }
-
-            Indent(writer, indent);
-            writer.Write(entry.Mnemonic);
-            EmitImmediate(writer, body, ref pos, entry.Imm, entry.Mnemonic, ctx);
-            writer.WriteLine();
+            var output = instructionOrdinal >= startInstruction && instructionOrdinal < endInstructionExclusive
+                ? writer
+                : sink;
+            RenderBodyInstruction(
+                output,
+                body,
+                instructions[instructionOrdinal],
+                instructionOrdinal,
+                branchHints,
+                ctx,
+                funcIdx,
+                ref indent,
+                blockStack,
+                inspectionMode);
         }
     }
 
-    private static void EmitTryTableImmediate(WatWriter writer, byte[] body, ref int pos)
+    private static FunctionBodyWindow DisassembleBodyWindow(
+        byte[] body,
+        IReadOnlyDictionary<int, BranchHint> branchHints,
+        DisassemblyContext ctx,
+        int funcIdx,
+        IReadOnlyList<InstructionBoundary> instructions,
+        int startInstruction,
+        int endInstructionExclusive,
+        int maxCharacters,
+        int previousInstructionLimit,
+        int? requiredInstruction,
+        Func<string, int> measureCharacters)
     {
-        EmitBlockType(writer, body, ref pos);
+        int indent = 2;
+        var blockStack = new Stack<string>();
+        var sink = new WatWriter(TextWriter.Null);
+        int measurementStart = Math.Max(
+            startInstruction - previousInstructionLimit,
+            0);
+        var measuredInstructions = new List<(int Pc, string Text, int Characters, bool Oversized)>(
+            endInstructionExclusive - measurementStart);
+
+        for (int instructionOrdinal = 0;
+             instructionOrdinal < endInstructionExclusive;
+             instructionOrdinal++)
+        {
+            InstructionBoundary instruction = instructions[instructionOrdinal];
+            if (instructionOrdinal < measurementStart)
+            {
+                RenderBodyInstruction(
+                    sink,
+                    body,
+                    instruction,
+                    instructionOrdinal,
+                    branchHints,
+                    ctx,
+                    funcIdx,
+                    ref indent,
+                    blockStack,
+                    inspectionMode: true);
+                continue;
+            }
+
+            using var measuredText = new CharacterLimitTextWriter(maxCharacters);
+            using var measuredWriter = new WatWriter(measuredText);
+            RenderBodyInstruction(
+                measuredWriter,
+                body,
+                instruction,
+                instructionOrdinal,
+                branchHints,
+                ctx,
+                funcIdx,
+                ref indent,
+                blockStack,
+                inspectionMode: true);
+            measuredWriter.Flush();
+            string text = measuredText.ToString();
+            int characters = measureCharacters(text);
+            measuredInstructions.Add((
+                instructionOrdinal,
+                text,
+                characters,
+                measuredText.Exceeded || characters > maxCharacters));
+        }
+
+        (int Pc, string Text, int Characters, bool Oversized) Measured(int pc)
+            => measuredInstructions[pc - measurementStart];
+
+        var preview = new StringBuilder(Math.Min(maxCharacters, 1024));
+        int previewCharacters = 0;
+        int renderedInstructions = 0;
+        int coveredInstructionStart = startInstruction;
+        int coveredInstructionEnd = startInstruction;
+        OmittedInstruction? omitted = null;
+
+        if (requiredInstruction is int anchorPc)
+        {
+            var anchor = Measured(anchorPc);
+            coveredInstructionStart = anchorPc;
+            coveredInstructionEnd = anchorPc + 1;
+
+            if (anchor.Oversized)
+            {
+                InstructionBoundary instruction = instructions[anchorPc];
+                omitted = new OmittedInstruction(
+                    anchorPc,
+                    instruction.OpcodeId,
+                    instruction.ByteOffset,
+                    instruction.EndOffset,
+                    $"Rendered instruction exceeds the {maxCharacters}-character preview budget.");
+            }
+            else
+            {
+                int selectedCharacters = anchor.Characters;
+                bool precedingOpen = true;
+                bool followingOpen = true;
+                int distance = 1;
+
+                while (precedingOpen || followingOpen)
+                {
+                    int precedingPc = anchorPc - distance;
+                    if (precedingOpen && precedingPc >= startInstruction)
+                    {
+                        var preceding = Measured(precedingPc);
+                        if (!preceding.Oversized &&
+                            selectedCharacters + preceding.Characters <= maxCharacters)
+                        {
+                            coveredInstructionStart = precedingPc;
+                            selectedCharacters += preceding.Characters;
+                        }
+                        else
+                        {
+                            precedingOpen = false;
+                        }
+                    }
+                    else
+                    {
+                        precedingOpen = false;
+                    }
+
+                    int followingPc = anchorPc + distance;
+                    if (followingOpen && followingPc < endInstructionExclusive)
+                    {
+                        var following = Measured(followingPc);
+                        if (!following.Oversized &&
+                            selectedCharacters + following.Characters <= maxCharacters)
+                        {
+                            coveredInstructionEnd = followingPc + 1;
+                            selectedCharacters += following.Characters;
+                        }
+                        else
+                        {
+                            followingOpen = false;
+                        }
+                    }
+                    else
+                    {
+                        followingOpen = false;
+                    }
+
+                    distance++;
+                }
+
+                for (int pc = coveredInstructionStart; pc < coveredInstructionEnd; pc++)
+                    preview.Append(Measured(pc).Text);
+                renderedInstructions = coveredInstructionEnd - coveredInstructionStart;
+            }
+        }
+        else
+        {
+            for (int instructionOrdinal = startInstruction;
+                 instructionOrdinal < endInstructionExclusive;
+                 instructionOrdinal++)
+            {
+                var measured = Measured(instructionOrdinal);
+                if (measured.Oversized)
+                {
+                    InstructionBoundary instruction = instructions[instructionOrdinal];
+                    omitted = new OmittedInstruction(
+                        instructionOrdinal,
+                        instruction.OpcodeId,
+                        instruction.ByteOffset,
+                        instruction.EndOffset,
+                        $"Rendered instruction exceeds the {maxCharacters}-character preview budget.");
+                    coveredInstructionEnd = instructionOrdinal + 1;
+                    break;
+                }
+
+                if (previewCharacters + measured.Characters > maxCharacters)
+                {
+                    coveredInstructionEnd = instructionOrdinal;
+                    break;
+                }
+
+                preview.Append(measured.Text);
+                previewCharacters += measured.Characters;
+                renderedInstructions++;
+                coveredInstructionEnd = instructionOrdinal + 1;
+            }
+        }
+
+        int? previousInstructionStart = null;
+        int previousCharacters = 0;
+        int previousCandidateStart = Math.Max(
+            coveredInstructionStart - previousInstructionLimit,
+            0);
+        for (int pc = coveredInstructionStart - 1; pc >= previousCandidateStart; pc--)
+        {
+            var previous = Measured(pc);
+            if (previous.Oversized)
+            {
+                if (previousInstructionStart is null)
+                    previousInstructionStart = pc;
+                break;
+            }
+            if (previousCharacters + previous.Characters > maxCharacters)
+                break;
+
+            previousCharacters += previous.Characters;
+            previousInstructionStart = pc;
+        }
+
+        return new FunctionBodyWindow(
+            preview.ToString(),
+            renderedInstructions,
+            coveredInstructionStart,
+            coveredInstructionEnd,
+            omitted,
+            previousInstructionStart);
+    }
+
+    private static void RenderBodyInstruction(
+        WatWriter output,
+        byte[] body,
+        InstructionBoundary instruction,
+        int instructionOrdinal,
+        IReadOnlyDictionary<int, BranchHint> branchHints,
+        DisassemblyContext ctx,
+        int funcIdx,
+        ref int indent,
+        Stack<string> blockStack,
+        bool inspectionMode)
+    {
+        byte opByte = instruction.OpcodeId.Opcode;
+        int pos = instruction.ImmediateOffset;
+
+        if (branchHints.TryGetValue(instructionOrdinal, out BranchHint? branchHint))
+        {
+            if (opByte is not 0x04 and not 0x0D)
+            {
+                throw new WatException(
+                    $"Branch hint at instruction {instructionOrdinal} targets opcode " +
+                    $"0x{opByte:X2}, not if or br_if.");
+            }
+            Indent(output, indent);
+            output.WriteLine(
+                $"(@metadata.code.branch_hint \"\\0{(byte)branchHint.Kind}\")");
+        }
+
+        // END — close the current block with )
+        if (opByte == 0x0B)
+        {
+            var block = blockStack.Count > 0 ? blockStack.Pop() : "block";
+            if (block == "if-then")
+            {
+                indent--;
+                Indent(output, indent); output.WriteLine(")");
+                indent--;
+                Indent(output, indent); output.WriteLine(")");
+            }
+            else if (block == "if-else")
+            {
+                indent--;
+                Indent(output, indent); output.WriteLine(")");
+                indent--;
+                Indent(output, indent); output.WriteLine(")");
+            }
+            else
+            {
+                indent--;
+                Indent(output, indent); output.WriteLine(")");
+            }
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // ELSE — close (then, open (else
+        if (opByte == 0x05)
+        {
+            if (blockStack.Count > 0) blockStack.Pop();
+            indent--;
+            Indent(output, indent); output.WriteLine(")");
+            Indent(output, indent); output.WriteLine("(else");
+            indent++;
+            blockStack.Push("if-else");
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // Block-opening: block, loop
+        if (opByte is 0x02 or 0x03)
+        {
+            string mnemonic = opByte == 0x02 ? "block" : "loop";
+            Indent(output, indent);
+            output.Write($"({mnemonic}");
+            EmitBlockType(output, body, ref pos, ctx);
+            output.WriteLine();
+            indent++;
+            blockStack.Push(mnemonic);
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // If
+        if (opByte == 0x04)
+        {
+            Indent(output, indent);
+            output.Write("(if");
+            EmitBlockType(output, body, ref pos, ctx);
+            output.WriteLine();
+            indent++;
+            Indent(output, indent);
+            output.WriteLine("(then");
+            indent++;
+            blockStack.Push("if-then");
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // try (legacy)
+        if (opByte == 0x06)
+        {
+            Indent(output, indent);
+            output.Write("(block");
+            EmitBlockType(output, body, ref pos, ctx);
+            output.WriteLine();
+            indent++;
+            blockStack.Push("block");
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // try_table
+        if (opByte == 0x1F)
+        {
+            Indent(output, indent);
+            output.Write("(try_table");
+            EmitTryTableImmediate(output, body, ref pos, ctx);
+            output.WriteLine();
+            indent++;
+            blockStack.Push("try_table");
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        // select t*
+        if (opByte == 0x1C)
+        {
+            Indent(output, indent);
+            output.Write("select");
+            EmitSelectTypes(output, body, ref pos, ctx);
+            output.WriteLine();
+            VerifyInstructionEnd(instruction, pos);
+            return;
+        }
+
+        if (instruction.OpcodeId.IsPrefixed)
+        {
+            uint encodedSubOpcode = ReadU32Leb128(body, ref pos);
+            if (encodedSubOpcode != instruction.OpcodeId.SubOpcode)
+            {
+                throw new WatException(
+                    $"Instruction boundary recorded sub-opcode 0x{instruction.OpcodeId.SubOpcode:X}, " +
+                    $"but body bytes encode 0x{encodedSubOpcode:X}.");
+            }
+            uint key = ((uint)opByte << 24) | instruction.OpcodeId.SubOpcode;
+            if (ctx.PrefixedOpcodes.TryGetValue(key, out var prefixedEntry))
+            {
+                Indent(output, indent);
+                output.Write(prefixedEntry.Mnemonic);
+                EmitImmediate(output, body, ref pos, prefixedEntry.Imm, prefixedEntry.Mnemonic, ctx, funcIdx);
+                output.WriteLine();
+                VerifyInstructionEnd(instruction, pos);
+                return;
+            }
+
+            if (opByte == 0xFB && inspectionMode)
+            {
+                Indent(output, indent);
+                EmitGcInstruction(output, body, ref pos, instruction.OpcodeId.SubOpcode, ctx);
+                output.WriteLine();
+                VerifyInstructionEnd(instruction, pos);
+                return;
+            }
+
+            throw new WatException(
+                $"Cannot disassemble instruction {instructionOrdinal} at body bytes " +
+                $"[{instruction.ByteOffset}, {instruction.EndOffset}): unsupported opcode " +
+                $"{instruction.OpcodeId}.");
+        }
+
+        if (!ctx.SingleByteOpcodes.TryGetValue(opByte, out var entry))
+        {
+            throw new WatException(
+                $"Cannot disassemble instruction {instructionOrdinal} at body bytes " +
+                $"[{instruction.ByteOffset}, {instruction.EndOffset}): unsupported opcode " +
+                $"{instruction.OpcodeId}.");
+        }
+
+        Indent(output, indent);
+        output.Write(entry.Mnemonic);
+        EmitImmediate(output, body, ref pos, entry.Imm, entry.Mnemonic, ctx, funcIdx);
+        output.WriteLine();
+        VerifyInstructionEnd(instruction, pos);
+    }
+
+    private static void VerifyInstructionEnd(InstructionBoundary instruction, int renderedEnd)
+    {
+        if (renderedEnd != instruction.EndOffset)
+        {
+            throw new WatException(
+                $"Instruction renderer for {instruction.OpcodeId} consumed body bytes " +
+                $"[{instruction.ByteOffset}, {renderedEnd}), but the binary decoder selected " +
+                $"[{instruction.ByteOffset}, {instruction.EndOffset}).");
+        }
+    }
+
+    private static void EmitSelectTypes(
+        WatWriter writer,
+        byte[] body,
+        ref int pos,
+        DisassemblyContext context)
+    {
+        uint count = ReadU32Leb128(body, ref pos);
+        writer.Write(" (result");
+        for (uint i = 0; i < count; i++)
+        {
+            byte valueType = body[pos++];
+            if (valueType is 0x63 or 0x64)
+            {
+                long encodedHeapType = ReadS33Leb128(body, ref pos);
+                var exact = new ExactValueType.Reference(
+                    valueType == 0x63 ? Nullability.Nullable : Nullability.NonNullable,
+                    ExactHeapType(encodedHeapType));
+                writer.Write($" {ExactValueTypeText(exact, context)}");
+            }
+            else if (IsSingleByteValType(valueType))
+            {
+                writer.Write(
+                    $" {ExactValueTypeText(ExactValueType.FromStorageValType((ValType)valueType), context)}");
+            }
+            else
+            {
+                throw new WatException($"Invalid select value type 0x{valueType:X2}.");
+            }
+        }
+        writer.Write(')');
+    }
+
+    private static void EmitGcInstruction(
+        WatWriter writer,
+        byte[] body,
+        ref int pos,
+        uint subOpcode,
+        DisassemblyContext context)
+    {
+        string mnemonic = subOpcode switch
+        {
+            0x00 => "struct.new",
+            0x01 => "struct.new_default",
+            0x02 => "struct.get",
+            0x03 => "struct.get_s",
+            0x04 => "struct.get_u",
+            0x05 => "struct.set",
+            0x06 => "array.new",
+            0x07 => "array.new_default",
+            0x08 => "array.new_fixed",
+            0x09 => "array.new_data",
+            0x0A => "array.new_elem",
+            0x0B => "array.get",
+            0x0C => "array.get_s",
+            0x0D => "array.get_u",
+            0x0E => "array.set",
+            0x0F => "array.len",
+            0x10 => "array.fill",
+            0x11 => "array.copy",
+            0x12 => "array.init_data",
+            0x13 => "array.init_elem",
+            0x14 => "ref.test",
+            0x15 => "ref.test",
+            0x16 => "ref.cast",
+            0x17 => "ref.cast",
+            0x18 => "br_on_cast",
+            0x19 => "br_on_cast_fail",
+            0x1A => "any.convert_extern",
+            0x1B => "extern.convert_any",
+            0x1C => "ref.i31",
+            0x1D => "i31.get_s",
+            0x1E => "i31.get_u",
+            _ => throw new WatException($"Unknown GC sub-opcode 0x{subOpcode:X}.")
+        };
+        writer.Write(mnemonic);
+
+        switch (subOpcode)
+        {
+            case 0x00:
+            case 0x01:
+            case 0x06:
+            case 0x07:
+            case 0x0B:
+            case 0x0C:
+            case 0x0D:
+            case 0x0E:
+            case 0x10:
+                writer.Write($" {ReadU32Leb128(body, ref pos)}");
+                break;
+            case 0x02:
+            case 0x03:
+            case 0x04:
+            case 0x05:
+            case 0x08:
+            case 0x09:
+            case 0x0A:
+            case 0x11:
+            case 0x12:
+            case 0x13:
+                writer.Write(
+                    $" {ReadU32Leb128(body, ref pos)} {ReadU32Leb128(body, ref pos)}");
+                break;
+            case 0x14:
+            case 0x15:
+            case 0x16:
+            case 0x17:
+            {
+                bool nullable = subOpcode is 0x15 or 0x17;
+                string heapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
+                writer.Write(nullable ? $" (ref null {heapType})" : $" (ref {heapType})");
+                break;
+            }
+            case 0x18:
+            case 0x19:
+            {
+                byte flags = body[pos++];
+                uint label = ReadU32Leb128(body, ref pos);
+                string sourceHeapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
+                string targetHeapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
+                string sourceNull = (flags & 0x01) != 0 ? " null" : "";
+                string targetNull = (flags & 0x02) != 0 ? " null" : "";
+                writer.Write(
+                    $" {label} (ref{sourceNull} {sourceHeapType}) (ref{targetNull} {targetHeapType})");
+                break;
+            }
+        }
+    }
+
+    private sealed class CharacterLimitTextWriter(int limit) : TextWriter
+    {
+        private readonly StringBuilder _text = new(Math.Min(limit, 1024));
+
+        public override Encoding Encoding => Encoding.UTF8;
+        public bool Exceeded { get; private set; }
+
+        public override void Write(char value)
+        {
+            if (_text.Length < limit)
+                _text.Append(value);
+            else
+                Exceeded = true;
+        }
+
+        public override void Write(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return;
+
+            int remaining = limit - _text.Length;
+            if (value.Length <= remaining)
+            {
+                _text.Append(value);
+                return;
+            }
+
+            if (remaining > 0)
+                _text.Append(value.AsSpan(0, remaining));
+            Exceeded = true;
+        }
+
+        public override void Write(ReadOnlySpan<char> buffer)
+        {
+            int remaining = limit - _text.Length;
+            if (buffer.Length <= remaining)
+            {
+                _text.Append(buffer);
+                return;
+            }
+
+            if (remaining > 0)
+                _text.Append(buffer[..remaining]);
+            Exceeded = true;
+        }
+
+        public override string ToString() => _text.ToString();
+    }
+
+    private sealed class Utf8CountingTextWriter : TextWriter
+    {
+        public override Encoding Encoding => Encoding.UTF8;
+        public long ByteCount { get; private set; }
+
+        public override void Write(char value)
+        {
+            Span<char> buffer = stackalloc char[1];
+            buffer[0] = value;
+            ByteCount += Encoding.UTF8.GetByteCount(buffer);
+        }
+
+        public override void Write(string? value)
+        {
+            if (value is not null)
+                ByteCount += Encoding.UTF8.GetByteCount(value);
+        }
+
+        public override void Write(ReadOnlySpan<char> buffer) =>
+            ByteCount += Encoding.UTF8.GetByteCount(buffer);
+    }
+
+    private static void EmitTryTableImmediate(
+        WatWriter writer,
+        byte[] body,
+        ref int pos,
+        DisassemblyContext context)
+    {
+        EmitBlockType(writer, body, ref pos, context);
         uint handlerCount = ReadU32Leb128(body, ref pos);
         for (uint i = 0; i < handlerCount; i++)
         {
@@ -958,10 +2171,11 @@ public static class WasmDisassembler
                 }
             }
         }
+
     }
 
     private static void EmitImmediate(WatWriter writer, byte[] body, ref int pos,
-        ImmediateKind imm, string mnemonic, DisassemblyContext ctx)
+        ImmediateKind imm, string mnemonic, DisassemblyContext ctx, int funcIdx)
     {
         switch (imm)
         {
@@ -969,7 +2183,7 @@ public static class WasmDisassembler
                 break;
 
             case ImmediateKind.BlockType:
-                EmitBlockType(writer, body, ref pos);
+                EmitBlockType(writer, body, ref pos, ctx);
                 break;
 
             case ImmediateKind.LocalIdx:
@@ -985,7 +2199,11 @@ public static class WasmDisassembler
             {
                 uint idx = ReadU32Leb128(body, ref pos);
                 if (imm == ImmediateKind.FuncIdx && ctx.FuncNames.TryGetValue((int)idx, out var n))
-                    writer.Write($" ${n}");
+                    writer.Write($" {FormatRefName(n, (int)idx)}");
+                else if (imm == ImmediateKind.LocalIdx
+                    && ctx.LocalNames.TryGetValue(funcIdx, out var localNames)
+                    && localNames.TryGetValue((int)idx, out var localName))
+                    writer.Write($" {FormatRefName(localName, (int)idx)}");
                 else
                     writer.Write($" {idx}");
                 break;
@@ -1128,8 +2346,9 @@ public static class WasmDisassembler
 
             case ImmediateKind.RefType:
             {
-                byte rt = body[pos++];
-                writer.Write($" {RefTypeNameFromByte(rt)}");
+                // `ref.null` is the only instruction with this immediate, and it takes a heap type
+                // encoded as an s33 — a defined type index when non-negative.
+                writer.Write($" {HeapTypeText(ReadS33Leb128(body, ref pos), ctx)}");
                 break;
             }
 
@@ -1173,7 +2392,11 @@ public static class WasmDisassembler
         }
     }
 
-    private static void EmitBlockType(WatWriter writer, byte[] body, ref int pos)
+    private static void EmitBlockType(
+        WatWriter writer,
+        byte[] body,
+        ref int pos,
+        DisassemblyContext context)
     {
         byte b = body[pos];
         if (b == 0x40)
@@ -1181,19 +2404,59 @@ public static class WasmDisassembler
             // void block — no output needed
             pos++;
         }
-        else if (b == (byte)ValType.ContRef || (b >= 0x6F && b <= 0x7F))
+        else if (IsSingleByteValType(b))
         {
             // value type
             pos++;
-            writer.Write($" (result {ValTypeName((ValType)b)})");
+            writer.Write(
+                $" (result {ExactValueTypeText(ExactValueType.FromStorageValType((ValType)b), context)})");
+        }
+        else if (b is 0x63 or 0x64)
+        {
+            pos++;
+            long encodedHeapType = ReadS33Leb128(body, ref pos);
+            HeapType heapType = ExactHeapType(encodedHeapType);
+            var exact = new ExactValueType.Reference(
+                b == 0x63 ? Nullability.Nullable : Nullability.NonNullable,
+                heapType);
+            writer.Write($" (result {ExactValueTypeText(exact, context)})");
         }
         else
         {
             // type index (s33 LEB)
             long typeIdx = ReadS33Leb128(body, ref pos);
-            writer.Write($" (type {typeIdx})");
+            if (typeIdx < 0 || typeIdx > int.MaxValue)
+                throw new WatException($"Invalid block type index {typeIdx}.");
+            writer.Write($" (type {TypeReferenceText((int)typeIdx, context)})");
         }
     }
+
+    private static HeapType ExactHeapType(long encodedHeapType)
+    {
+        if (encodedHeapType >= 0)
+            return new DefinedHeapType(checked((int)encodedHeapType));
+
+        byte code = (byte)(encodedHeapType & 0x7F);
+        if (AbstractHeapTypeCodes.TryFromCode(code, out HeapTypeKind kind))
+            return new AbstractHeapType(kind);
+        throw new WatException($"Unknown abstract heap-type code 0x{code:X2}.");
+    }
+
+    /// <summary>
+    /// True when <paramref name="b"/> is a complete one-byte value type — a number/vector type, or
+    /// the nullable shorthand for an abstract heap type.
+    /// </summary>
+    /// <remarks>
+    /// The predicate this replaces was <c>b == 0x65 || (b &gt;= 0x6F &amp;&amp; b &lt;= 0x7F)</c>, a
+    /// range that happens to cover <c>funcref</c>/<c>externref</c> and the numeric types and misses
+    /// every other abstract heap type: <c>exnref</c> (0x69), <c>arrayref</c> (0x6A) …
+    /// <c>i31ref</c> (0x6C), and the renumbered <c>contref</c> (0x68). A missed code is not a
+    /// cosmetic problem — the byte was then handed to <c>ReadS33Leb128</c> and printed as a type
+    /// index, so <c>(block (result exnref))</c> disassembled to <c>(type -23)</c>. Derived from
+    /// <see cref="AbstractHeapTypeCodes"/> so a new abstract type is one edit, in one file.
+    /// </remarks>
+    private static bool IsSingleByteValType(byte b) =>
+        b is 0x7B or 0x7C or 0x7D or 0x7E or 0x7F || AbstractHeapTypeCodes.TryFromCode(b, out _);
 
     // ── LEB128 readers (from byte array) ─────────────────────────────────
 
@@ -1246,61 +2509,83 @@ public static class WasmDisassembler
     }
 
     private static long ReadS33Leb128(byte[] data, ref int pos)
-    {
-        long result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            b = data[pos++];
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-
-        if (shift < 64 && (b & 0x40) != 0)
-            result |= ~0L << shift;
-        return result;
-    }
+        => S33Leb128.Read(data, ref pos);
 
     // ── Formatting helpers ───────────────────────────────────────────────
 
-    private static string ValTypeName(ValType vt) => vt switch
+    /// <summary>
+    /// Spells a <c>ref.null</c> operand as the <em>heap</em> type the spec requires — <c>func</c>,
+    /// not <c>funcref</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The two are the same byte but not the same text: wasm-tools 1.253.0 rejects
+    /// <c>(ref.null funcref)</c> outright, so the reftype spelling made every disassembled
+    /// <c>ref.null</c> unusable outside nesm. It surfaced with #383 because the canonical null table
+    /// initializer — <c>(table 0 funcref (ref.null func))</c>, table.wast:19 — is the shape this
+    /// helper is now asked to print.
+    /// </para>
+    /// <para>
+    /// The operand is an <b>s33</b>, not a byte: non-negative values are defined type indices. Both
+    /// call sites used to consume a single byte and print it as <c>0x00</c> when it was an index,
+    /// which is neither valid text nor recoverable, and truncated any index above 127.
+    /// </para>
+    /// </remarks>
+    private static string HeapTypeText(long heapType, DisassemblyContext context)
     {
-        ValType.I32 => "i32",
-        ValType.I64 => "i64",
-        ValType.F32 => "f32",
-        ValType.F64 => "f64",
-        ValType.V128 => "v128",
-        ValType.FuncRef => "funcref",
-        ValType.ExternRef => "externref",
-        ValType.ExnRef => "exnref",
-        ValType.ContRef => "contref",
-        _ => $"<unknown 0x{(byte)vt:X2}>",
+        if (heapType >= 0)
+            return TypeReferenceText(checked((int)heapType), context);
+
+        return AbstractHeapTypeCodes.TryFromCode((byte)(heapType & 0x7F), out var kind)
+            ? HeapTypeName(kind)
+            : throw new WatException(
+                $"Unknown abstract heap-type code 0x{(byte)(heapType & 0x7F):X2}.");
+    }
+
+    /// <summary>The spec's heap-type keyword — <c>func</c>, <c>extern</c>, <c>eq</c>, …</summary>
+    private static string HeapTypeName(HeapTypeKind kind) => kind switch
+    {
+        HeapTypeKind.Func => "func",
+        HeapTypeKind.Extern => "extern",
+        HeapTypeKind.Any => "any",
+        HeapTypeKind.Eq => "eq",
+        HeapTypeKind.I31 => "i31",
+        HeapTypeKind.Struct => "struct",
+        HeapTypeKind.Array => "array",
+        HeapTypeKind.None => "none",
+        HeapTypeKind.NoFunc => "nofunc",
+        HeapTypeKind.NoExtern => "noextern",
+        HeapTypeKind.Exn => "exn",
+        HeapTypeKind.NoExn => "noexn",
+        HeapTypeKind.Cont => "cont",
+        HeapTypeKind.NoCont => "nocont",
+        _ => kind.ToString().ToLowerInvariant(),
     };
 
-    private static string RefTypeName(RefType rt) => rt switch
+    /// <summary>The nullable reference-type abbreviation — <c>funcref</c>, <c>eqref</c>, …</summary>
+    private static string AbstractRefTypeName(HeapTypeKind kind) => kind switch
     {
-        RefType.FuncRef => "funcref",
-        RefType.ExternRef => "externref",
-        _ => $"<unknown 0x{(byte)rt:X2}>",
-    };
-
-    private static string RefTypeNameFromByte(byte b) => b switch
-    {
-        0x70 => "funcref",
-        0x6F => "externref",
-        0x69 => "exnref",
-        0x65 => "contref",
-        _ => $"0x{b:X2}",
+        HeapTypeKind.None => "nullref",
+        HeapTypeKind.NoFunc => "nullfuncref",
+        HeapTypeKind.NoExtern => "nullexternref",
+        HeapTypeKind.NoExn => "nullexnref",
+        HeapTypeKind.NoCont => "nullcontref",
+        _ => HeapTypeName(kind) + "ref",
     };
 
     private static string FormatLimits(Limits limits) =>
         limits.Max.HasValue ? $"{limits.Min} {limits.Max.Value}" : $"{limits.Min}";
 
-    private static string FormatGlobalType(GlobalType gt) =>
-        gt.Mutability == Mutability.Var
-            ? $"(mut {ValTypeName(gt.ContentType)})"
-            : ValTypeName(gt.ContentType);
+    private static string FormatGlobalType(
+        GlobalType globalType,
+        DisassemblyContext context)
+    {
+        ExactValueType exact =
+            globalType.ExactContentType ??
+            ExactValueType.FromStorageValType(globalType.ContentType);
+        string text = ExactValueTypeText(exact, context);
+        return globalType.Mutability == Mutability.Var ? $"(mut {text})" : text;
+    }
 
     private static string FormatFloat(float val)
     {
@@ -1336,8 +2621,44 @@ public static class WasmDisassembler
         return s;
     }
 
-    private static string Escape(string s) =>
-        s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
+    private static string Escape(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var c in s)
+        {
+            switch (c)
+            {
+                case '\\': sb.Append("\\\\"); break;
+                case '"':  sb.Append("\\\""); break;
+                case '\n': sb.Append("\\n");  break;
+                case '\r': sb.Append("\\r");  break;
+                case '\t': sb.Append("\\t");  break;
+                default:
+                    if (c < ' ')
+                        sb.Append($"\\{(byte)c:x2}");
+                    else
+                        sb.Append(c);
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Returns true when <paramref name="name"/> is a valid WAT bare identifier.</summary>
+    private static bool IsValidIdentifier(string name) =>
+        name.Length > 0 && name.All(WatLexer.IsBareIdentifierChar);
+
+    /// <summary>Formats a non-empty name using the shortest standardized identifier syntax.</summary>
+    private static string FormatIdentifier(string name) =>
+        IsValidIdentifier(name) ? $"${name}" : $"$\"{Escape(name)}\"";
+
+    /// <summary>Formats a name for a definition site; empty debug names require @name.</summary>
+    private static string FormatDefName(string name) =>
+        name.Length > 0 ? FormatIdentifier(name) : """(@name "")""";
+
+    /// <summary>Formats a name for a reference site; empty names fall back to the numeric index.</summary>
+    private static string FormatRefName(string name, int fallbackIdx) =>
+        name.Length > 0 ? FormatIdentifier(name) : fallbackIdx.ToString();
 
     private static string EscapeDataString(byte[] data)
     {

@@ -84,7 +84,7 @@ public static class ArArchiveReader
             if (member.Data.Length < 4 || !member.Data.AsSpan(0, 4).SequenceEqual(WasmMagicBytes))
                 continue;
 
-            var module = ModuleReader.ReadModule(member.Data.AsMemory());
+            var module = ModuleReader.ParseCoreModule(member.Data.AsMemory());
             string label = sourcePath is not null ? $"{sourcePath}({member.Name})" : member.Name;
             result.Add((module, label));
         }

@@ -131,16 +131,11 @@ public sealed class WatResolver
         {
             if (imp.Kind == ImportKind.Func)
             {
-                var paramTypes = imp.Params.Select(p => p.Type).ToArray();
-                var resultTypes = imp.Results.ToArray();
-                int typeIdx = FindOrAddType(new FuncType(paramTypes, resultTypes));
-                importTypeIndices.Add(typeIdx);
+                importTypeIndices.Add(ResolveImportTypeUse(imp, includeResults: true));
             }
             else if (imp.Kind == ImportKind.Tag)
             {
-                var paramTypes = imp.Params.Select(p => p.Type).ToArray();
-                int typeIdx = FindOrAddType(new FuncType(paramTypes, []));
-                importTagTypeIndices.Add(typeIdx);
+                importTagTypeIndices.Add(ResolveImportTypeUse(imp, includeResults: true));
             }
         }
 
@@ -165,7 +160,11 @@ public sealed class WatResolver
         var tagTypeIndices = new List<int>();
         foreach (var t in _module.Tags)
         {
-            if (t.TypeIndex.HasValue)
+            if (t.TypeName is { } typeName)
+            {
+                tagTypeIndices.Add(ResolveTypeName(typeName));
+            }
+            else if (t.TypeIndex.HasValue)
             {
                 tagTypeIndices.Add(t.TypeIndex.Value);
             }
@@ -230,6 +229,17 @@ public sealed class WatResolver
                         MemMax = imp.MemMax,
                     });
                     break;
+                case ImportKind.Table:
+                    resolvedImports.Add(new ResolvedImport
+                    {
+                        ModuleName = imp.ModuleName,
+                        FieldName = imp.FieldName,
+                        Kind = ImportKind.Table,
+                        TableMin = imp.TableMin,
+                        TableMax = imp.TableMax,
+                        TableElementType = ResolveReferenceType(imp.TableElementType),
+                    });
+                    break;
                 case ImportKind.Global:
                     resolvedImports.Add(new ResolvedImport
                     {
@@ -277,11 +287,15 @@ public sealed class WatResolver
             });
         }
 
-        // 14. Resolve tables
+        // 14. Resolve tables. The initializer is a constant expression like a global's, so it goes
+        // through the same ResolveInstruction path — that is what turns `(ref.func $f)` into a
+        // function index and `(global.get $g)` into a global index.
         var resolvedTables = _module.Tables.Select(t => new ResolvedTable
         {
             Min = t.Min,
             Max = t.Max,
+            ElementType = ResolveReferenceType(t.ElementType),
+            Init = t.Init != null ? ResolveInstruction(t.Init, [], []) : null,
         }).ToList();
 
         // 15. Resolve element segments
@@ -289,10 +303,31 @@ public sealed class WatResolver
         foreach (var e in _module.Elements)
         {
             var offset = e.Offset != null ? ResolveInstruction(e.Offset, [], []) : null;
+            var functionIndices = new List<int>(e.FuncIndices.Count);
+            for (int i = 0; i < e.FuncIndices.Count; i++)
+            {
+                string? name = i < e.FuncNames.Count ? e.FuncNames[i] : null;
+                functionIndices.Add(name is null ? e.FuncIndices[i] : ResolveFuncName(name));
+            }
+
             resolvedElems.Add(new ResolvedElem
             {
+                Mode = e.Mode,
+                TableIndex = e.TableIndex,
+                HasExplicitTable = e.HasExplicitTable,
                 Offset = offset,
-                FuncIndices = [.. e.FuncIndices],
+                FuncIndices = functionIndices,
+                UsesExpressions = e.UsesExpressions,
+                ElementType = ResolveReferenceType(e.ElementType),
+                ElementExpressions =
+                [
+                    .. e.ElementExpressions.Select(expression =>
+                    {
+                        var resolved = new List<WatInstruction>(expression.Count);
+                        ResolveInstructions(expression, resolved, [], []);
+                        return resolved;
+                    }),
+                ],
             });
         }
 
@@ -316,6 +351,84 @@ public sealed class WatResolver
             References = _references,
         };
 
+        // Compute name section data: @name overrides $id; $id without @name emits by itself.
+        string? moduleName = _module.AnnotationName
+            ?? (_module.ModuleId is { } mid ? StripDollar(mid) : null);
+
+        var funcNameMap = new Dictionary<int, string>();
+        // Import functions occupy the low indices (0.._importFuncCount-1) and must appear first.
+        int nameImportIdx = 0;
+        foreach (var imp in _module.Imports)
+        {
+            if (imp.Kind == ImportKind.Func)
+            {
+                var name = imp.AnnotationName
+                    ?? (imp.FuncName is { } fn ? StripDollar(fn) : null);
+                if (name != null)
+                    funcNameMap[nameImportIdx] = name;
+                nameImportIdx++;
+            }
+        }
+        for (int i = 0; i < _module.Funcs.Count; i++)
+        {
+            var f = _module.Funcs[i];
+            var name = f.AnnotationName ?? (f.Name is { } fn ? StripDollar(fn) : null);
+            if (name != null)
+                funcNameMap[i + _importFuncCount] = name;
+        }
+
+        var typeNameMap = new Dictionary<int, string>();
+        for (int i = 0; i < _module.Types.Count; i++)
+        {
+            if (_module.Types[i].Name is { } name)
+                typeNameMap[i] = StripDollar(name);
+        }
+
+        var localNameMap = new Dictionary<int, Dictionary<int, string>>();
+        for (int i = 0; i < _module.Funcs.Count; i++)
+        {
+            var f = _module.Funcs[i];
+            int absIdx = i + _importFuncCount;
+            Dictionary<int, string>? locals = null;
+            int localIdx = 0;
+            foreach (var p in f.Params)
+            {
+                var name = p.AnnotationName ?? (p.Name is { } pn ? StripDollar(pn) : null);
+                if (name != null)
+                {
+                    locals ??= [];
+                    locals[localIdx] = name;
+                }
+                localIdx++;
+            }
+            foreach (var l in f.Locals)
+            {
+                var name = l.AnnotationName ?? (l.Name is { } ln ? StripDollar(ln) : null);
+                if (name != null)
+                {
+                    locals ??= [];
+                    locals[localIdx] = name;
+                }
+                localIdx++;
+            }
+            if (locals != null)
+                localNameMap[absIdx] = locals;
+        }
+
+        int? startFunction = null;
+        if (_module.Start is { } start)
+        {
+            startFunction = start.Ref is { } name ? ResolveFuncName(name) : start.Index;
+            if (start.Ref is { } referencedName)
+            {
+                _references.Add(new SymbolReference(
+                    referencedName,
+                    start.Span,
+                    startFunction.Value,
+                    SymbolKind.Function));
+            }
+        }
+
         return new ResolvedModule
         {
             Types = _types,
@@ -329,8 +442,16 @@ public sealed class WatResolver
             Elements = resolvedElems,
             Tags = resolvedTags,
             ImportFuncCount = _importFuncCount,
+            ModuleName = moduleName,
+            FuncNameMap = funcNameMap,
+            TypeNameMap = typeNameMap,
+            LocalNameMap = localNameMap,
+            StartFunction = startFunction,
         };
     }
+
+    private static string StripDollar(string id) =>
+        id.Length > 0 && id[0] == '$' ? id[1..] : id;
 
     /// <summary>
     /// Collects exports in the order they appear in source,
@@ -392,6 +513,31 @@ public sealed class WatResolver
         return exports;
     }
 
+    private int ResolveImportTypeUse(WatImport import, bool includeResults)
+    {
+        var inlineType = new FuncType(
+            import.Params.Select(parameter => parameter.Type).ToArray(),
+            includeResults ? import.Results.ToArray() : []);
+        if (!import.TypeIndex.HasValue && import.TypeName is null)
+            return FindOrAddType(inlineType);
+
+        int typeIndex = import.TypeName is { } typeName
+            ? ResolveTypeName(typeName)
+            : import.TypeIndex!.Value;
+        if ((uint)typeIndex >= (uint)_types.Count)
+            throw new WatException($"Imported function or tag refers to unknown type {typeIndex}.");
+
+        if ((inlineType.Parameters.Length > 0 || inlineType.Results.Length > 0) &&
+            (!_types[typeIndex].Parameters.AsSpan().SequenceEqual(inlineType.Parameters) ||
+             !_types[typeIndex].Results.AsSpan().SequenceEqual(inlineType.Results)))
+        {
+            throw new WatException(
+                $"Imported function or tag inline signature does not match type {typeIndex}.");
+        }
+
+        return typeIndex;
+    }
+
     private int FindOrAddType(FuncType ft)
     {
         for (int i = 0; i < _types.Count; i++)
@@ -445,16 +591,10 @@ public sealed class WatResolver
     private WatInstruction ResolveInstruction(WatInstruction instr, Dictionary<string, int> localMap,
         List<string?> labelStack)
     {
-        var r = new WatInstruction
-        {
-            Mnemonic = instr.Mnemonic,
-            IntValue = instr.IntValue,
-            FloatValue = instr.FloatValue,
-            Index = instr.Index,
-            IdValue = instr.IdValue,
-            BlockResultType = instr.BlockResultType,
-            BlockTypeIndex = instr.BlockTypeIndex,
-        };
+        // Carry every immediate the resolve pass does not rewrite. The copy lives on
+        // WatInstruction, beside the fields it mirrors — see issue #419, where a hand-written
+        // copy here silently dropped V128Bytes and LaneIndex.
+        var r = instr.CreateResolvedShell();
 
         // Multi-value block results need a type index
         if (instr.BlockResultTypes is { Count: > 0 })
@@ -470,6 +610,7 @@ public sealed class WatResolver
             int resolvedIdx;
             SymbolKind refKind;
             bool resolvesTypeTagPair = false;
+            bool resolvesHeapType = false;
             switch (entry.Immediate)
             {
                 case ImmediateKind.LocalIdx when instr.Mnemonic is "br" or "br_if":
@@ -501,15 +642,21 @@ public sealed class WatResolver
                     refKind = SymbolKind.Tag;
                     resolvesTypeTagPair = true;
                     break;
+                case ImmediateKind.RefType:
+                    resolvedIdx = ResolveTypeName(instr.IdValue);
+                    refKind = SymbolKind.Type;
+                    resolvesHeapType = true;
+                    break;
                 default:
                     resolvedIdx = instr.Index ?? 0;
                     refKind = SymbolKind.Function;
                     break;
             }
-            if (resolvesTypeTagPair)
+            if (resolvesTypeTagPair || resolvesHeapType)
                 r.IntValue = resolvedIdx;
             else
                 r.Index = resolvedIdx;
+            r.IdValue = null;
             if (entry.Immediate is not ImmediateKind.None)
                 _references.Add(new SymbolReference(instr.IdValue, instr.Span, resolvedIdx, refKind));
         }
@@ -688,6 +835,30 @@ public sealed class WatResolver
         throw new WatException($"Unknown function: {name}");
     }
 
+    private int ResolveTypeName(string name)
+    {
+        if (_typeNames.TryGetValue(name, out int idx))
+            return idx;
+        if (_diagnostics != null) { _diagnostics.Add(new WatDiagnostic(0, 0, $"Unknown type: {name}")); return 0; }
+        throw new WatException($"Unknown type: {name}");
+    }
+
+    private Microsoft.NET.WebAssembly.Types.ValueType.Reference ResolveReferenceType(WatReferenceType type)
+    {
+        HeapType heapType = type.TypeName is { } name
+            ? new DefinedHeapType(ResolveTypeName(name))
+            : type.HeapType ?? throw new WatException("Reference type is missing its heap type.");
+
+        if (heapType is DefinedHeapType defined &&
+            (defined.TypeIndex < 0 || defined.TypeIndex >= _types.Count))
+        {
+            throw new WatException(
+                $"Type index {defined.TypeIndex} is out of range for {_types.Count} defined type(s).");
+        }
+
+        return new Microsoft.NET.WebAssembly.Types.ValueType.Reference(type.Nullability, heapType);
+    }
+
     private int ResolveGlobalName(string name)
     {
         if (_globalNames.TryGetValue(name, out int idx))
@@ -736,6 +907,15 @@ public sealed class ResolvedModule
     public required List<ResolvedElem> Elements { get; init; }
     public required List<ResolvedTag> Tags { get; init; }
     public int ImportFuncCount { get; init; }
+    /// <summary>Module name for the name section (from @name or $id, @name wins).</summary>
+    public string? ModuleName { get; init; }
+    /// <summary>Function name map for the name section: absolute func index → name string.</summary>
+    public Dictionary<int, string> FuncNameMap { get; init; } = [];
+    /// <summary>Type name map for name-section subsection 4: type index → name string.</summary>
+    public Dictionary<int, string> TypeNameMap { get; init; } = [];
+    /// <summary>Local name map for the name section: absolute func index → (local index → name string).</summary>
+    public Dictionary<int, Dictionary<int, string>> LocalNameMap { get; init; } = [];
+    public int? StartFunction { get; init; }
 }
 
 public sealed class ResolvedFunc
@@ -768,6 +948,11 @@ public sealed class ResolvedImport
     // For memory imports
     public int MemMin { get; init; }
     public int? MemMax { get; init; }
+    // For table imports
+    public uint TableMin { get; init; }
+    public uint? TableMax { get; init; }
+    public Microsoft.NET.WebAssembly.Types.ValueType.Reference TableElementType { get; init; } =
+        new(Nullability.Nullable, new AbstractHeapType(HeapTypeKind.Func));
     // For global imports
     public ValType GlobalType { get; init; }
     public bool GlobalMutable { get; init; }
@@ -788,14 +973,38 @@ public sealed class ResolvedData
 
 public sealed class ResolvedTable
 {
+    private Microsoft.NET.WebAssembly.Types.ValueType.Reference _elementType =
+        new(Nullability.Nullable, new AbstractHeapType(HeapTypeKind.Func));
+
     public required uint Min { get; init; }
     public uint? Max { get; init; }
+    public Microsoft.NET.WebAssembly.Types.ValueType.Reference ElementType
+    {
+        get => _elementType;
+        init => _elementType = value;
+    }
+    public ValType ElemType
+    {
+        get => _elementType.ToStorageValType();
+        init => _elementType = (Microsoft.NET.WebAssembly.Types.ValueType.Reference)
+            Microsoft.NET.WebAssembly.Types.ValueType.FromStorageValType(value);
+    }
+
+    /// <summary>Resolved initializer constant expression, or null for a default-initialized table.</summary>
+    public WatInstruction? Init { get; init; }
 }
 
 public sealed class ResolvedElem
 {
+    public required WatElemMode Mode { get; init; }
+    public required int TableIndex { get; init; }
+    public required bool HasExplicitTable { get; init; }
     public WatInstruction? Offset { get; init; }
     public required List<int> FuncIndices { get; init; }
+    public bool UsesExpressions { get; init; }
+    public Microsoft.NET.WebAssembly.Types.ValueType.Reference ElementType { get; init; } =
+        new(Nullability.Nullable, new AbstractHeapType(HeapTypeKind.Func));
+    public List<List<WatInstruction>> ElementExpressions { get; init; } = [];
 }
 
 public sealed class ResolvedTag

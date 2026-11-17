@@ -7,6 +7,8 @@ using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Linker;
 using Microsoft.NET.WebAssembly.Module;
+using Microsoft.NET.WebAssembly.Types;
+using Microsoft.NET.WebAssembly.Validation;
 using Microsoft.NET.WebAssembly.Wat;
 
 /// <summary>
@@ -123,6 +125,91 @@ public class WatIntegrationTests
         Assert.Single(reparsed.Types); // both share the same (i32)→(i32) signature
     }
 
+    [Fact]
+    public void LinkToBinary_StreamInputs_AreParsedByTheLinker()
+    {
+        var first = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "first") (result i32)
+                (i32.const 1)))
+            """);
+        var second = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "second") (result i32)
+                (i32.const 2)))
+            """);
+
+        using var firstStream = new MemoryStream(new SectionMerger().EmitBinary(first));
+        using var secondStream = new MemoryStream(new SectionMerger().EmitBinary(second));
+
+        byte[] bytes = _linker.LinkToBinary([firstStream, secondStream]);
+        var reparsed = ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes));
+
+        Assert.True(reparsed.Exports.ContainsKey("first"));
+        Assert.True(reparsed.Exports.ContainsKey("second"));
+    }
+
+    [Fact]
+    public void Link_ValidProduct_AnalyticalModelAndSerializedProductBothValidate()
+    {
+        var first = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "first") (param i32) (result i32)
+                (local i32)
+                (local.set 1 (local.get 0))
+                (local.get 1)))
+            """);
+        var second = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "second") (param i32) (result i32)
+                (local.get 0)))
+            """);
+
+        var linked = _linker.Link([first, second]);
+
+        // Compact metadata now makes the analytical model directly validatable despite retaining
+        // linker-only state that is absent from the serialized product.
+        Assert.Single(linked.Types);
+        // The merged module carries an exact type-definition space in lockstep with its compact one.
+        // It used to come out empty, and that emptiness was not free: every writer-side guard that
+        // consults TypeDefinitions then passed on a hole rather than on a type, which is how a
+        // struct-typed table reached the output as a function-typed one (GitHub #383).
+        Assert.Equal(linked.Types.Count, linked.TypeDefinitions.Count);
+        Assert.Equal(
+            linked.Types[0].Parameters,
+            ((CompositeType.Function)linked.TypeDefinitions[0].CompositeType)
+                .Parameters.Select(p => p.ToStorageValType()).ToArray());
+        Assert.Equal(
+            linked.Types[0].Results,
+            ((CompositeType.Function)linked.TypeDefinitions[0].CompositeType)
+                .Results.Select(r => r.ToStorageValType()).ToArray());
+        Assert.Equal(
+            [new Microsoft.NET.WebAssembly.Types.ValueType.Number(NumberType.I32)],
+            linked.Functions[0].ExactLocals);
+        var directResult = WasmModuleValidator.Validate(linked);
+        Assert.True(directResult.IsValid, FormatDiagnostics(directResult));
+
+        byte[] shippedBinary = new SectionMerger().EmitBinary(linked);
+        var shippedModule = ModuleReader.ReadModuleAndValidate(new MemoryStream(shippedBinary));
+        AssertSemanticValidatorsAccept(shippedModule);
+        Assert.Equal(first.Functions[0].Body, WasmAssert.ExportedFunctionBody(shippedModule, "first").Body);
+    }
+
+    [Fact]
+    public void Link_InvalidSerializedProduct_IsRejected()
+    {
+        var invalidInput = new WasmModule
+        {
+            Memories = [new MemoryType(new Limits(2, 1))],
+        };
+
+        Assert.Throws<WasmValidationException>(() => _linker.Link([invalidInput]));
+    }
+
     // ── GcSections=true with plain WAT (no linking section) ─────────────────────
 
     [Fact]
@@ -142,6 +229,21 @@ public class WatIntegrationTests
         Assert.True(merged.Exports.ContainsKey("visible"));
         Assert.True(merged.Exports.ContainsKey("also_visible"));
     }
+
+    private static void AssertSemanticValidatorsAccept(WasmModule module)
+    {
+        var typeResult = TypeDeclarationValidator.Validate(module);
+        Assert.True(typeResult.IsValid, FormatDiagnostics(typeResult));
+
+        var bodyResult = FunctionBodyValidator.ValidateModule(module, WasmFeatures.All);
+        Assert.True(bodyResult.IsValid, FormatDiagnostics(bodyResult));
+
+        var moduleResult = WasmModuleValidator.Validate(module);
+        Assert.True(moduleResult.IsValid, FormatDiagnostics(moduleResult));
+    }
+
+    private static string FormatDiagnostics(WasmValidationResult result)
+        => string.Join(Environment.NewLine, result.Diagnostics.Select(static diagnostic => diagnostic.Message));
 
     // ── Type deduplication under linking ────────────────────────────────────────
 
