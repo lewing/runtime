@@ -112,7 +112,7 @@ public class SingleObjectRelocatorTests
     /// Section layout (used to verify TargetSectionIndex values):
     /// <c>type(0) func(1) memory(2) global(3) code(4) data(5) linking(6) reloc.CODE(7)</c>
     /// </summary>
-    private static byte[] BuildRelocatableObject()
+    private static byte[] BuildRelocatableObject(byte memoryRelocationType = 0x03, int memoryAddend = 0)
     {
         // ── type section (section index 0) ────────────────────────────────────
         // One type: () -> ()
@@ -221,10 +221,10 @@ public class SingleObjectRelocatorTests
             .. U32Leb(4),       // offset in code section payload = 4
             .. U32Leb(0),       // symbol index = 0 (__stack_pointer)
             // Entry 1: memory addr LEB reloc
-            0x03,               // R_WASM_MEMORY_ADDR_LEB
+            memoryRelocationType, // R_WASM_MEMORY_ADDR_LEB by default
             .. U32Leb(10),      // offset in code section payload = 10
             .. U32Leb(1),       // symbol index = 1 (my_data)
-            .. S32Leb(0),       // addend = 0
+            .. S32Leb(memoryAddend),
         ];
         byte[] relocCodeSection = CustomSection("reloc.CODE", relocCodePayload);
 
@@ -330,6 +330,24 @@ public class SingleObjectRelocatorTests
         Assert.Equal(0x80, codePatch[12] & 0x80); // byte 2: continuation bit set
         Assert.Equal(0x80, codePatch[13] & 0x80); // byte 3: continuation bit set
         Assert.Equal(0x00, codePatch[14] & 0x80); // byte 4: no continuation bit
+    }
+
+    /// <summary>
+    /// PIC code adds <c>R_WASM_MEMORY_ADDR_REL_SLEB</c> values to <c>__memory_base</c>, which stays an import. Under the
+    /// dylink convention the host supplies <c>__memory_base</c> = where the data was placed (globalBase), so the
+    /// value is the address relative to globalBase.
+    /// </summary>
+    [Fact]
+    public void Relocate_MemoryAddrRelSleb_IsRelativeToGlobalBase()
+    {
+        byte[] objBytes = BuildRelocatableObject(memoryRelocationType: (byte)RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB, memoryAddend: 2);
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
+
+        byte[] result = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 1024);
+
+        var (codePayloadStart, _) = SingleObjectRelocator.ScanSectionPayloads(result)[4];
+        Assert.Equal(2u, ReadPaddedU32Leb(result.AsSpan((int)codePayloadStart).ToArray(), 10));
     }
 
     [Fact]

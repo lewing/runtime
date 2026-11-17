@@ -37,6 +37,7 @@ internal sealed class ObjectFileLinker
     private const string CallCtorsName = "__wasm_call_ctors";
     private const string MemoryBaseName = "__memory_base";
     private const string TableBaseName = "__table_base";
+    private const string TlsBaseName = "__tls_base";
 
     private readonly LinkerOptions _options;
     private readonly List<ObjFile> _files = [];
@@ -100,6 +101,7 @@ internal sealed class ObjectFileLinker
         DataAddress,
         MemoryBase,
         TableBase,
+        TlsBase,
     }
 
     /// <summary>A symbol: one shared instance per global name, or a private instance per local symbol.</summary>
@@ -482,7 +484,7 @@ internal sealed class ObjectFileLinker
     // ── Synthetic symbols ─────────────────────────────────────────────────────
 
     private static readonly string[] s_dataAddressSymbols =
-        ["__data_end", "__heap_base", "__heap_end", "__global_base", "__stack_low", "__stack_high", "__dso_handle"];
+        ["__data_end", "__heap_base", "__heap_end", "__global_base", "__stack_low", "__stack_high", "__dso_handle", "__wasm_first_page_end"];
 
     private void DefineSynthetics()
     {
@@ -529,6 +531,11 @@ internal sealed class ObjectFileLinker
             if (_globals.TryGetValue(name, out Sym? sym) && !sym.IsDefined)
                 sym.Synthetic = sym.Kind == SymbolType.Data ? Synthetic.DataAddress : kind;
         }
+
+        // Thread-local accesses (wasi-libc's errno) read __tls_base. Without shared memory wasm-ld defines it as
+        // an immutable global; TLS segments are rejected, so it is 0.
+        if (_globals.TryGetValue(TlsBaseName, out Sym? tlsBase) && !tlsBase.IsDefined && tlsBase.Kind == SymbolType.Global)
+            tlsBase.Synthetic = Synthetic.TlsBase;
     }
 
     private void CheckRoots()
@@ -917,13 +924,13 @@ internal sealed class ObjectFileLinker
             globalNames.Add(StackPointerName);
         }
         // wasm-ld (LLD 23+) creates these in a fixed order after __stack_pointer.
-        foreach (string baseName in (ReadOnlySpan<string>)[MemoryBaseName, TableBaseName])
+        foreach (string baseName in (ReadOnlySpan<string>)[MemoryBaseName, TableBaseName, TlsBaseName])
         {
-            if (_globals.TryGetValue(baseName, out Sym? sym) && sym.Live && sym.Synthetic is Synthetic.MemoryBase or Synthetic.TableBase)
+            if (_globals.TryGetValue(baseName, out Sym? sym) && sym.Live && sym.Synthetic is Synthetic.MemoryBase or Synthetic.TableBase or Synthetic.TlsBase)
             {
                 sym.OutIndex = nextGlobal++;
                 sym.HasOutIndex = true;
-                uint value = sym.Synthetic == Synthetic.MemoryBase ? 0 : _options.TableBase ?? 1;
+                uint value = sym.Synthetic == Synthetic.TableBase ? _options.TableBase ?? 1 : 0;
                 globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
                 globalNames.Add(sym.Name);
             }
@@ -1496,6 +1503,7 @@ internal sealed class ObjectFileLinker
             "__stack_low" => StackLow,
             "__stack_high" => StackHigh,
             "__dso_handle" => GlobalBase, // wasm-ld: the start of data
+            "__wasm_first_page_end" => PageSize, // wasi-libc's sbrk and getpagesize use it as the page size
             "__memory_base" => 0,
             "__table_base" => TableBase,
             _ => throw new LinkerException($"Unknown linker-defined symbol '{name}'."),
