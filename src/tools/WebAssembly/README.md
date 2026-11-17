@@ -63,6 +63,11 @@ tests (`WasmLdParityTests`) record any future divergence in `s_knownGaps` with i
 * Shared memory and atomics (`--shared-memory`, `0xFE` instructions) are not supported. Threaded builds can't be linked
   (Blazor-Playground/nesm#572).
 * `.debug_str` is not merged across inputs.
+* Linking against wasi-libc fails, which also blocks a real NativeAOT WASI app link (Blazor-Playground/nesm#573).
+  Causes: `R_WASM_TABLE_INDEX_REL_SLEB` is parsed with an addend; objects without a memory import (such as
+  wasi-libc's `component-type` object) are treated as complete modules; undefined symbols with explicit import names
+  aren't imported automatically; `__memory_base` isn't synthesized; and the output then has an out-of-range global
+  index. The `wasi-libc` parity scenario covers this.
 * Component output (`--component-type`, wasm-component-ld) is not implemented.
 
 ## Native tools in CoreCLR and NativeAOT WebAssembly app builds
