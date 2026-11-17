@@ -328,6 +328,14 @@ internal sealed class R2RTestRunner
         Assert.True(result.Success,
             $"crossgen2 failed for '{testName}':\n{result.StandardError}\n{result.StandardOutput}");
 
+        if (TestPaths.IsWasmTarget)
+        {
+            // Cross-check every WebAssembly image this compilation wrote against an independent reader and
+            // validator (src/tools/WebAssembly).
+            foreach (string wasm in Directory.EnumerateFiles(Path.GetDirectoryName(outputFile)!, "*.wasm"))
+                WasmToolchainValidation.AssertValid(wasm);
+        }
+
         return outputFile;
     }
 
