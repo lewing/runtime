@@ -161,6 +161,8 @@
       <GroupBuildCmd Condition="'$(TestBuildMode)' == 'nativeaot'">$(GroupBuildCmd) "/p:DefaultBuildAllTarget=BuildNativeAot"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(IlcMultiModule)' == 'true'">$(GroupBuildCmd) "/p:IlcMultiModule=true"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(IlcUseServerGc)' == 'false'">$(GroupBuildCmd) "/p:IlcUseServerGc=false"</GroupBuildCmd>
+      <GroupBuildCmd Condition="'$(IlcUseManagedWasmLinker)' == 'true'">$(GroupBuildCmd) "/p:IlcUseManagedWasmLinker=true"</GroupBuildCmd>
+      <GroupBuildCmd Condition="'$(IlcManagedWasmLinkerPath)' != ''">$(GroupBuildCmd) "/p:IlcManagedWasmLinkerPath=$(IlcManagedWasmLinkerPath)"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(BuildNativeAotFrameworkObjects)' == 'true'">$(GroupBuildCmd) "/p:BuildNativeAotFrameworkObjects=true"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(ContinuousIntegrationBuild)' == 'true'">$(GroupBuildCmd) /p:ContinuousIntegrationBuild=true</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(BuildTestsOnHelix)' == 'true'">$(GroupBuildCmd) "/p:BuildTestsOnHelix=true"</GroupBuildCmd>
