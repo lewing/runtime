@@ -29,6 +29,9 @@ public class WasmLdParityTests
     private sealed record Scenario(string[] Args, params (string Name, string Source)[] Sources)
     {
         public bool ArchiveLastSource { get; init; }
+
+        /// <summary>Compile for wasm32-wasip2 and link a WASI command against wasi-libc and compiler-rt, as NativeAOT does.</summary>
+        public bool WasiLibc { get; init; }
     }
 
     private const string CrossUnitA = """
@@ -63,6 +66,11 @@ public class WasmLdParityTests
             int value;
             void _start(void) { value = 1; }
             """)),
+        ["wasi-libc"] = new([], ("hello", """
+            #include <stdio.h>
+            #include <stdlib.h>
+            int main(int argc, char** argv) { char* p = malloc(16); snprintf(p, 16, "%d", argc); puts(p); free(p); return 0; }
+            """)) { WasiLibc = true },
         ["stack"] = new(["--no-entry"], ("sum", """
             extern void fill(int *p, int n);
             __attribute__((export_name("sum"))) int sum(int n) { int arr[32]; fill(arr, n & 31); int s = 0; for (int i = 0; i < (n & 31); i++) s += arr[i]; return s; }
@@ -73,8 +81,16 @@ public class WasmLdParityTests
 
     // Divergences from wasm-ld that the managed linker does not handle yet. Each entry is skipped with its reason
     // rather than asserted, so the table doubles as the list of gaps to close before it can replace wasm-ld.
+    private const string WasiLibcGap =
+        "linking wasi-libc fails: TABLE_INDEX_REL_SLEB addend parsing, object classification, explicit-import symbols and __memory_base (Blazor-Playground/nesm#573)";
+
     private static readonly Dictionary<(string Scenario, Facet Facet), string> s_knownGaps = new()
     {
+        [("wasi-libc", Facet.Exports)] = WasiLibcGap,
+        [("wasi-libc", Facet.FunctionImports)] = WasiLibcGap,
+        [("wasi-libc", Facet.MemoryAndTable)] = WasiLibcGap,
+        [("wasi-libc", Facet.StackPointer)] = WasiLibcGap,
+        [("wasi-libc", Facet.ValidatesWithWasmTools)] = WasiLibcGap,
     };
 
     public static IEnumerable<object[]> Cases() =>
@@ -130,7 +146,7 @@ public class WasmLdParityTests
             string c = Path.Combine(dir, name + ".c");
             string o = Path.Combine(dir, name + ".o");
             File.WriteAllText(c, source);
-            Run(Path.Combine(bin, "clang"), ["--target=wasm32-unknown-unknown", "-O2", "-c", c, "-o", o]);
+            Run(Path.Combine(bin, "clang"), [scenario.WasiLibc ? "--target=wasm32-wasip2" : "--target=wasm32-unknown-unknown", "-O2", "-c", c, "-o", o]);
             inputs.Add(o);
         }
 
@@ -141,10 +157,21 @@ public class WasmLdParityTests
             inputs[^1] = archive;
         }
 
+        string[] args = scenario.Args;
+        if (scenario.WasiLibc)
+        {
+            string sdk = Path.GetDirectoryName(bin)!;
+            string libDir = Path.Combine(sdk, "share", "wasi-sysroot", "lib", "wasm32-wasip2");
+            string builtins = Directory.GetFiles(Path.Combine(sdk, "lib", "clang"), "libclang_rt.builtins.a", SearchOption.AllDirectories)
+                .First(p => p.Contains("wasm32-unknown-wasip2", StringComparison.Ordinal));
+            inputs.Insert(0, Path.Combine(libDir, "crt1-command.o"));
+            args = [.. args, $"-L{libDir}", "-lc", builtins];
+        }
+
         string expectedPath = Path.Combine(dir, "wasm-ld.wasm");
         string actualPath = Path.Combine(dir, "managed.wasm");
-        Run(Path.Combine(bin, "wasm-ld"), [.. scenario.Args, .. inputs, "-o", expectedPath]);
-        WasmModule actual = WasmLdDriver.Run(WasmLdCommandLine.Parse([.. scenario.Args, .. inputs, "-o", actualPath]));
+        Run(Path.Combine(bin, "wasm-ld"), [.. args, .. inputs, "-o", expectedPath]);
+        WasmModule actual = WasmLdDriver.Run(WasmLdCommandLine.Parse([.. args, .. inputs, "-o", actualPath]));
 
         return (ModuleReader.ReadModule(File.OpenRead(expectedPath)), actual, actualPath);
     }
