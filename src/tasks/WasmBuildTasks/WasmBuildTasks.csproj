@@ -14,6 +14,11 @@
     <Compile Include="..\Common\LogAsErrorException.cs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)src\tools\WebAssembly\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
+    <InternalsVisibleTo Include="Microsoft.NET.WebAssembly.Toolchain.Tests" />
+  </ItemGroup>
+
   <Target Name="PublishBuilder"
           AfterTargets="Build"
           DependsOnTargets="Publish" />
@@ -21,6 +26,7 @@
   <Target Name="GetFilesToPackage" Returns="@(FilesToPackage)">
     <ItemGroup>
       <FilesToPackage Include="$(OutputPath)$(MSBuildProjectName)*" TargetPath="tasks\net" />
+      <FilesToPackage Include="$(OutputPath)Microsoft.NET.WebAssembly.Toolchain.dll" TargetPath="tasks\net" />
     </ItemGroup>
   </Target>
 

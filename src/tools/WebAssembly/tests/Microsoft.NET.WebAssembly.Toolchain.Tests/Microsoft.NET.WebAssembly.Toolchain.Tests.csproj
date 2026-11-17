@@ -9,10 +9,20 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.DotNet.XUnitExtensions" Version="$(MicrosoftDotNetXUnitExtensionsVersion)" />
     <ProjectReference Include="..\..\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
+    <!-- The in-proc WasmLink MSBuild task that wraps the linker. -->
+    <ProjectReference Include="$(RepoTasksDir)WasmBuildTasks\WasmBuildTasks.csproj" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="$(MicrosoftBuildFrameworkVersion)" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="$(MicrosoftBuildUtilitiesCoreVersion)" />
   </ItemGroup>
 
   <ItemGroup>
     <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!-- wasm-ld parity tests use the wasi-sdk and wasm-tools from the shared wasm tool cache when present. -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Microsoft.NET.WebAssembly.Toolchain.Tests.WasiSdkPath" Value="$(WasiSdkCacheDir)" />
+    <RuntimeHostConfigurationOption Include="Microsoft.NET.WebAssembly.Toolchain.Tests.WasmToolsPath" Value="$(WasmToolsCacheDir)" />
   </ItemGroup>
 
   <ItemGroup>

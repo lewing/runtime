@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- wasm-ld compatible command-line front end for the managed WebAssembly linker. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
+    <AssemblyName>wasm-link</AssemblyName>
+    <RootNamespace>Microsoft.NET.WebAssembly.Link</RootNamespace>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
+  </ItemGroup>
+
+</Project>
