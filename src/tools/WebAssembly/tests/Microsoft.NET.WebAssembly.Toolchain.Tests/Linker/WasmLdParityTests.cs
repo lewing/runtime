@@ -71,19 +71,10 @@ public class WasmLdParityTests
             """)),
     };
 
-    private const string UnreferencedStackPointerGap =
-        "__stack_pointer is always defined, even when nothing references it; wasm-ld omits the unreferenced global";
-
     // Divergences from wasm-ld that the managed linker does not handle yet. Each entry is skipped with its reason
     // rather than asserted, so the table doubles as the list of gaps to close before it can replace wasm-ld.
     private static readonly Dictionary<(string Scenario, Facet Facet), string> s_knownGaps = new()
     {
-        [("cross-unit", Facet.StackPointer)] = UnreferencedStackPointerGap,
-        [("archive", Facet.StackPointer)] = UnreferencedStackPointerGap,
-        [("export-flags", Facet.StackPointer)] = UnreferencedStackPointerGap,
-        [("import-memory", Facet.StackPointer)] = UnreferencedStackPointerGap,
-        [("constructor", Facet.StackPointer)] = UnreferencedStackPointerGap,
-        [("default-entry", Facet.StackPointer)] = UnreferencedStackPointerGap,
     };
 
     public static IEnumerable<object[]> Cases() =>

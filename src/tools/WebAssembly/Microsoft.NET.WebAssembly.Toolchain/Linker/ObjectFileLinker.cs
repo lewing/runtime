@@ -448,7 +448,10 @@ internal sealed class ObjectFileLinker
     {
         _stackPointer = GetOrCreateGlobal(StackPointerName, SymbolType.Global);
         if (!_stackPointer.IsDefined)
+        {
             _stackPointer.Synthetic = Synthetic.StackPointer;
+            _stackPointer.Kind = SymbolType.Global;
+        }
 
         if (_globals.TryGetValue(IndirectFunctionTableName, out Sym? table) && !table.IsDefined)
         {
@@ -504,7 +507,10 @@ internal sealed class ObjectFileLinker
     {
         bool gc = _options.GcSections;
 
-        MarkSymbol(_stackPointer!);
+        // As in wasm-ld (LLD 23+), __stack_pointer is defined only when it is live: referenced by live code,
+        // exported, or kept because --no-gc-sections keeps everything.
+        if (!gc || _options.ExportAll)
+            MarkSymbol(_stackPointer!);
         if (!gc && _callCtors is not null)
             MarkSymbol(_callCtors);
         if (_options.EntryPoint is { } entry)
@@ -849,7 +855,7 @@ internal sealed class ObjectFileLinker
 
         // ── Globals ──
         uint nextGlobal = globalImportCount;
-        if (_stackPointer!.Synthetic == Synthetic.StackPointer)
+        if (_stackPointer!.Synthetic == Synthetic.StackPointer && _stackPointer.Live)
         {
             _stackPointer.OutIndex = nextGlobal++;
             _stackPointer.HasOutIndex = true;

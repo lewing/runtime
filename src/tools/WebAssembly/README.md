@@ -56,11 +56,9 @@ nesm when you can so the patches shrink. After a sync that fixes a gap, remove i
 
 Linking clang objects now matches wasm-ld on the parity scenarios: memory, table and stack definition, data layout,
 constructors, `--allow-undefined`, `--export`, the entry point, lazy archive members, COMDAT, and the relocation types
-ILCompiler's `WasmObjectWriter` emits. The parity tests (`WasmLdParityTests`) skip the remaining divergence with its
-reason. Remaining gaps:
+ILCompiler's `WasmObjectWriter` emits, and defining `__stack_pointer` only when it's used (as LLD 23 does). The parity
+tests (`WasmLdParityTests`) record any future divergence in `s_knownGaps` with its reason. Remaining gaps:
 
-* `__stack_pointer` is always defined, even when nothing references it. wasm-ld omits it, so the output has one extra
-  global.
 * TLS (`__tls_base`, TLS segments and relocations) is not supported.
 * Shared memory and atomics (`--shared-memory`, `0xFE` instructions) are not supported. Threaded builds can't be linked
   (Blazor-Playground/nesm#572).
