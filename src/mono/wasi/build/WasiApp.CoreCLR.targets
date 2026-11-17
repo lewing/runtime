@@ -226,8 +226,7 @@
       <_WasiComponentLd Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiComponentLd).exe</_WasiComponentLd>
       <!-- Experimental: link and build the component with the managed linker (src/tools/WebAssembly/wasm-link)
            instead of wasm-component-ld. clang++ runs the linker through an executable path, so a generated
-           launcher runs wasm-link.dll in wasm-component-ld mode. The host currently traps at startup
-           (Blazor-Playground/nesm#577). -->
+           launcher runs wasm-link.dll in wasm-component-ld mode. -->
       <WasiUseManagedWasmLinker Condition="'$(WasiUseManagedWasmLinker)' == ''">false</WasiUseManagedWasmLinker>
       <_WasiDotNetHostPath>$(DOTNET_HOST_PATH)</_WasiDotNetHostPath>
       <_WasiDotNetHostPath Condition="'$(_WasiDotNetHostPath)' == ''">dotnet</_WasiDotNetHostPath>
