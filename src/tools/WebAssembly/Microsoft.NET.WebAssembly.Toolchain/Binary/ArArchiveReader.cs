@@ -130,7 +130,8 @@ public static class ArArchiveReader
 
     private static string ReadLongName(ReadOnlySpan<byte> longNameBytes)
     {
-        int end = longNameBytes.IndexOf((byte)'/');
+        // GNU entries end with "/\n"; a name may itself contain '/' (llvm-ar puts such names in the table).
+        int end = longNameBytes.IndexOf("/\n"u8);
         if (end < 0) end = longNameBytes.IndexOf((byte)'\n');
         if (end < 0) end = longNameBytes.Length;
 

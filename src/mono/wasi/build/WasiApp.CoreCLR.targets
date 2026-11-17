@@ -269,20 +269,6 @@
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
     <Exec Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))" Command="chmod +x &quot;$(_WasiComponentLd)&quot;" />
-    <!-- The managed linker reads binary component-type payloads only, not WIT text
-         (Blazor-Playground/nesm#576), so encode the wasi:http world into a dummy module's
-         component-type section with wasm-tools first. -->
-    <PropertyGroup Condition="'$(WasiUseManagedWasmLinker)' == 'true'">
-      <_WasiManagedLinkerWasmTools>$(WasmToolsCacheDir)wasm-tools$(_ExeExt)</_WasiManagedLinkerWasmTools>
-      <_WasiHttpWorldComponentType>$(_WasiRelinkObjDir)WasiHttpWorld_component_type.wasm</_WasiHttpWorldComponentType>
-    </PropertyGroup>
-    <Error Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !Exists('$(_WasiManagedLinkerWasmTools)')"
-           Text="WasiUseManagedWasmLinker=true needs wasm-tools to encode the wasi:http WIT world (not found at '$(_WasiManagedLinkerWasmTools)')." />
-    <Exec Condition="'$(WasiUseManagedWasmLinker)' == 'true'"
-          Command="&quot;$(_WasiManagedLinkerWasmTools)&quot; component embed --dummy &quot;$(_WasiHttpWorldWit)&quot; -o &quot;$(_WasiHttpWorldComponentType)&quot;" />
-    <PropertyGroup Condition="'$(WasiUseManagedWasmLinker)' == 'true'">
-      <_WasiHttpWorldWit>$(_WasiHttpWorldComponentType)</_WasiHttpWorldWit>
-    </PropertyGroup>
     <WriteLinesToFile Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_WasiComponentLd)"
                       Lines="@&quot;$(_WasiDotNetHostPath)&quot; &quot;$(WasiManagedWasmLinkerPath)&quot; --component %25*"

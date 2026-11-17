@@ -701,7 +701,7 @@ public sealed class SectionMerger
     /// Rebases a <see cref="DefinedHeapType"/> inside an exact reference type through the merged type
     /// space, returning the input unchanged when it names no type index.
     /// </summary>
-    private static Microsoft.NET.WebAssembly.Types.ValueType? RemapExactRefType(
+    internal static Microsoft.NET.WebAssembly.Types.ValueType? RemapExactRefType(
         Microsoft.NET.WebAssembly.Types.ValueType? exactType, Func<uint, uint> mapType)
     {
         if (exactType is not Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType defined } reference)
@@ -1598,7 +1598,7 @@ public sealed class SectionMerger
     }
 
     /// <summary>Rewrites a table type's exact element type — and its cached key — through <paramref name="mapType"/>.</summary>
-    private static TableType RemapTableTypeIndices(TableType type, Func<uint, uint> mapType)
+    internal static TableType RemapTableTypeIndices(TableType type, Func<uint, uint> mapType)
     {
         var remapped = RemapExactRefType(type.ExactElementType, mapType);
         if (ReferenceEquals(remapped, type.ExactElementType))
@@ -1614,7 +1614,7 @@ public sealed class SectionMerger
     }
 
     /// <summary>Rewrites a global type's exact content type — and its cached key — through <paramref name="mapType"/>.</summary>
-    private static GlobalType RemapGlobalTypeIndices(GlobalType type, Func<uint, uint> mapType)
+    internal static GlobalType RemapGlobalTypeIndices(GlobalType type, Func<uint, uint> mapType)
     {
         var remapped = RemapExactRefType(type.ExactContentType, mapType);
         if (ReferenceEquals(remapped, type.ExactContentType))
@@ -2565,7 +2565,7 @@ public sealed class SectionMerger
         }
     }
 
-    private static byte[] RemapConstExprIndices(byte[] expr, IndexMap indexMap) =>
+    internal static byte[] RemapConstExprIndices(byte[] expr, IndexMap indexMap) =>
         ConstExprScanner.Rewrite(expr, (kind, value) => kind switch
         {
             ConstExprScanner.OperandKind.FunctionIndex =>
