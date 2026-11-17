@@ -65,6 +65,20 @@ public sealed class LinkerOptions
     public bool StripDebug { get; init; }
 
     /// <summary>
+    /// When <c>true</c>, relocated LEB128 operands in code are re-encoded at their minimal width instead of the
+    /// padded width objects reserve (<c>wasm-ld --compress-relocations</c>). Requires <see cref="StripDebug"/> or
+    /// <see cref="StripAll"/>, because DWARF code offsets would no longer match. Relocatable objects only.
+    /// </summary>
+    public bool CompressRelocations { get; init; }
+
+    /// <summary>
+    /// When <c>true</c>, the output carries no debug, <c>name</c>, <c>producers</c> or <c>target_features</c>
+    /// sections, as with <c>wasm-ld --strip-all</c> (<c>-s</c>). Implies <see cref="StripDebug"/> and
+    /// <see cref="NoNameSection"/>.
+    /// </summary>
+    public bool StripAll { get; init; }
+
+    /// <summary>
     /// When <c>true</c>, suppresses emission of the <c>name</c> custom section.
     /// Default: <c>false</c> (emit name section when symbol names are available).
     /// </summary>
@@ -317,12 +331,14 @@ public sealed class WasmLinker
                 return false;
         }
 
-        int objects = inputs.Count(static i => ObjectFileLinker.IsRelocatableObject(i.Module));
-        if (objects == 0 || inputs.Count == 0)
+        // Once any input is recognisably an object, every input with a version-2 linking section is one too, as in
+        // wasm-ld: some objects (wasi-libc's wasip2_component_type.o) have no memory import to recognise them by.
+        if (!inputs.Any(static i => ObjectFileLinker.IsRelocatableObject(i.Module)))
             return false;
-        if (objects == inputs.Count)
+        LinkerInput? nonObjectInput = inputs.FirstOrDefault(static i => i.Module.LinkingSection is not { Version: 2 });
+        if (nonObjectInput is null)
             return true;
-        string nonObject = inputs.First(static i => !ObjectFileLinker.IsRelocatableObject(i.Module)).Name ?? "an input";
+        string nonObject = nonObjectInput.Name ?? "an input";
         throw new LinkerException(
             $"Cannot mix relocatable objects with complete modules ({nonObject} is not a relocatable object). " +
             "Set LinkerOptions.InputKind to choose how the inputs are linked.");

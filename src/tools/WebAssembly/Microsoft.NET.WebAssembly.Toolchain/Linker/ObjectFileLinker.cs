@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Linker;
 
 using System.Buffers.Binary;
+using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
@@ -34,10 +35,11 @@ internal sealed class ObjectFileLinker
     private const string IndirectFunctionTableName = "__indirect_function_table";
     private const string StackPointerName = "__stack_pointer";
     private const string CallCtorsName = "__wasm_call_ctors";
+    private const string MemoryBaseName = "__memory_base";
+    private const string TableBaseName = "__table_base";
 
     private readonly LinkerOptions _options;
     private readonly List<ObjFile> _files = [];
-    private readonly Queue<ObjFile> _pendingLoads = new();
     private readonly Dictionary<string, Sym> _globals = new(StringComparer.Ordinal);
     private readonly List<Sym> _globalOrder = [];
     private readonly Dictionary<string, ObjFile> _comdats = new(StringComparer.Ordinal);
@@ -96,6 +98,8 @@ internal sealed class ObjectFileLinker
         IndirectTable,
         CallCtors,
         DataAddress,
+        MemoryBase,
+        TableBase,
     }
 
     /// <summary>A symbol: one shared instance per global name, or a private instance per local symbol.</summary>
@@ -125,6 +129,14 @@ internal sealed class ObjectFileLinker
         public bool HasOutIndex;
         public uint Address;
         public uint TableSlot;
+
+        // An undefined symbol with an explicit import module/name (WASM_SYM_EXPLICIT_NAME) is always imported.
+        public bool ExplicitImport;
+
+        // Index of the internal global that replaces this symbol's GOT.mem/GOT.func import, when PIC code
+        // addresses it through the GOT.
+        public uint GotIndex;
+        public bool HasGot;
 
         public bool IsDefined => DefFile is not null || Synthetic != Synthetic.None;
         public bool IsWeakDef => Def is not null && (Def.Flags & SymbolFlags.BindingWeak) != 0;
@@ -163,6 +175,11 @@ internal sealed class ObjectFileLinker
         public uint[] SegOffsetInOut = [];
         public uint[] SegAddress = [];
 
+        // For a segment merged into a string table: each piece's offset in the segment and in the merged chunk.
+        public MergedChunk?[] SegMerged = [];
+        public uint[][] PieceInput = [];
+        public uint[][] PieceOutput = [];
+
         public Dictionary<uint, string> FunctionExportNames = [];
     }
 
@@ -174,7 +191,22 @@ internal sealed class ObjectFileLinker
         public uint Address;
         public bool IsBss => Name.StartsWith(".bss", StringComparison.Ordinal);
         public readonly List<(ObjFile File, int Segment)> Members = [];
+
+        // Layout order: a member, or a merged chunk standing where its first member was.
+        public readonly List<object> Parts = [];
         public byte[] Bytes = [];
+    }
+
+    /// <summary>
+    /// wasm-ld's SyntheticMergedChunk: the deduplicated, tail-merged strings of every mergeable member (STRINGS,
+    /// byte-aligned) of one output segment.
+    /// </summary>
+    private sealed class MergedChunk
+    {
+        public required SegmentFlags Flags { get; init; }
+        public readonly List<(ObjFile File, int Segment)> Members = [];
+        public byte[] Bytes = [];
+        public uint Offset;
     }
 
     // ── Driver ────────────────────────────────────────────────────────────────
@@ -183,6 +215,8 @@ internal sealed class ObjectFileLinker
     {
         if (_options.SharedMemory)
             throw new LinkerException("--shared-memory is not supported yet when linking relocatable objects.");
+        if (_options.CompressRelocations && !_options.StripDebug && !_options.StripAll)
+            throw new LinkerException("--compress-relocations is incompatible with output debug information. Pass --strip-debug or --strip-all.");
 
         var all = new List<ObjFile>(inputs.Count);
         for (int i = 0; i < inputs.Count; i++)
@@ -193,20 +227,21 @@ internal sealed class ObjectFileLinker
             all.Add(new ObjFile { InputIndex = i, Name = input.Name ?? $"input #{i}", Module = input.Module });
         }
 
-        // Command-line roots behave like undefined references: they extract archive members.
-        if (_options.EntryPoint is { } entry)
-            AddRootReference(entry);
-        foreach (string name in _options.Exports)
-            AddRootReference(name);
-
+        // As in wasm-ld, an archive member is extracted the moment a strong undefined reference meets its lazy
+        // symbol, recursively, so output order is a depth-first walk of the extraction graph.
         for (int i = 0; i < all.Count; i++)
         {
             if (inputs[i].IsArchiveMember)
                 AddLazy(all[i]);
             else
                 Load(all[i]);
-            DrainLoads();
         }
+
+        // Command-line roots are resolved after every input has been added, and can extract members too.
+        if (_options.EntryPoint is { } entry)
+            AddRootReference(entry);
+        foreach (string name in _options.Exports)
+            AddRootReference(name);
 
         DefineSynthetics();
         CheckRoots();
@@ -221,6 +256,8 @@ internal sealed class ObjectFileLinker
     {
         Sym sym = GetOrCreateGlobal(name, SymbolType.Function);
         sym.Forced = true;
+        if (!sym.IsDefined && sym.LazyFile is { Loaded: false } lazy)
+            Load(lazy);
     }
 
     private Sym GetOrCreateGlobal(string name, SymbolType kind)
@@ -250,8 +287,11 @@ internal sealed class ObjectFileLinker
                 if (!existing.Referenced)
                     existing.Kind = raw.Type;
                 existing.LazyFile = file;
-                if ((existing.Referenced && !existing.AllRefsWeak) || existing.Forced)
-                    _pendingLoads.Enqueue(file);
+                if (existing.Referenced && !existing.AllRefsWeak)
+                {
+                    Load(file);
+                    return;
+                }
             }
             else
             {
@@ -261,18 +301,11 @@ internal sealed class ObjectFileLinker
         }
     }
 
-    private void DrainLoads()
-    {
-        while (_pendingLoads.TryDequeue(out ObjFile? file))
-            Load(file);
-    }
-
     private void Load(ObjFile file)
     {
         if (file.Loaded)
             return;
         file.Loaded = true;
-        _files.Add(file);
 
         WasmModule m = file.Module;
         if (m.Memories.Count > 0 || m.Imports.Count(static i => i.Descriptor is ImportDescriptor.Memory) > 1)
@@ -350,6 +383,9 @@ internal sealed class ObjectFileLinker
         // Objects from before reference-types address the table without a table symbol.
         if (!tableSymbolSeen && file.TableImportList.Any(static t => t.Name == IndirectFunctionTableName))
             _indirectTableNeeded = true;
+
+        // Appended after its symbols are processed, so members it extracts come first (post-order, as wasm-ld).
+        _files.Add(file);
     }
 
     private Sym AddSymbol(ObjFile file, WasmSymbol raw)
@@ -384,10 +420,14 @@ internal sealed class ObjectFileLinker
                 sym.RefIndex = undefined && raw.Index is int index ? (uint)index : 0;
             }
             sym.Referenced = true;
-            if (!weak || discarded)
+            if (undefined && (raw.Flags & SymbolFlags.ExplicitName) != 0 && raw.Type is SymbolType.Function or SymbolType.Global or SymbolType.Tag)
+                sym.ExplicitImport = true;
+            // A COMDAT-discarded definition becomes an undefined reference with its own binding, as in wasm-ld;
+            // being weak (inline functions are), it extracts no archive member.
+            if (!weak)
                 sym.AllRefsWeak = false;
             if (!sym.IsDefined && sym.LazyFile is { Loaded: false } lazy && !sym.AllRefsWeak)
-                _pendingLoads.Enqueue(lazy);
+                Load(lazy);
             return sym;
         }
 
@@ -480,6 +520,14 @@ internal sealed class ObjectFileLinker
         {
             if (_globals.TryGetValue(name, out Sym? sym) && !sym.IsDefined && sym.Kind == SymbolType.Data)
                 sym.Synthetic = Synthetic.DataAddress;
+        }
+
+        // PIC objects (wasi-libc is built -fPIC) address memory and the table relative to these globals. In a
+        // non-PIC link they are constants: memory starts at 0 and the table at --table-base.
+        foreach ((string name, Synthetic kind) in (ReadOnlySpan<(string, Synthetic)>)[(MemoryBaseName, Synthetic.MemoryBase), (TableBaseName, Synthetic.TableBase)])
+        {
+            if (_globals.TryGetValue(name, out Sym? sym) && !sym.IsDefined)
+                sym.Synthetic = sym.Kind == SymbolType.Data ? Synthetic.DataAddress : kind;
         }
     }
 
@@ -614,6 +662,8 @@ internal sealed class ObjectFileLinker
         // Undefined.
         if (sym.AllRefsWeak && !sym.Forced)
             return;
+        if (sym.ExplicitImport)
+            return;
         if (_options.AllowUndefined && sym.Kind is SymbolType.Function or SymbolType.Global or SymbolType.Table or SymbolType.Tag or SymbolType.Data)
             return;
         _undefinedErrors.Add(sym.Name);
@@ -646,7 +696,7 @@ internal sealed class ObjectFileLinker
                 MarkSymbol(file.Symbols[reloc.Index]);
 
             // Taking a function's address needs the indirect function table even when no object names it.
-            if (IsTableIndexRelocation(reloc.Type))
+            if (IsTableIndexRelocation(reloc.Type) || IsGotRelocation(file, reloc) && file.Symbols[reloc.Index].Kind == SymbolType.Function)
                 MarkSymbol(_indirectTable!);
         }
     }
@@ -701,9 +751,9 @@ internal sealed class ObjectFileLinker
 
         // Type order follows wasm-ld: signatures named by type relocations, then imported functions, then
         // defined functions in output order.
+        // Like wasm-ld's relocation scan, types are registered in first-use order.
         foreach (ObjFile file in _files)
         {
-            var used = new SortedSet<uint>();
             for (int f = 0; f < file.FuncLive.Length; f++)
             {
                 if (!file.FuncLive[f])
@@ -712,11 +762,9 @@ internal sealed class ObjectFileLinker
                 foreach (Relocation reloc in RelocsInRange(file.CodeRelocs, fn.BodyCodeSectionOffset, (uint)fn.Body.Length))
                 {
                     if (reloc.Type == RelocationType.R_WASM_TYPE_INDEX_LEB)
-                        used.Add(reloc.Index);
+                        TypeIndexOf(file.Module.Types[(int)reloc.Index]);
                 }
             }
-            foreach (uint type in used)
-                TypeIndexOf(file.Module.Types[(int)type]);
         }
 
         // ── Imports ──
@@ -753,7 +801,7 @@ internal sealed class ObjectFileLinker
         {
             if (sym.IsDefined || !sym.Live)
                 continue;
-            if (sym.AllRefsWeak && !sym.Forced)
+            if (sym.AllRefsWeak && !sym.Forced && !sym.ExplicitImport)
             {
                 if (sym.Kind == SymbolType.Function && sym.RefFile is not null && calledDirectly.Contains(sym))
                     weakStubs.Add(sym);
@@ -817,6 +865,19 @@ internal sealed class ObjectFileLinker
             functions.Add(null!);
             functionNames.Add(CallCtorsName);
         }
+
+        // Synthetic functions come first in wasm-ld's creation order: __wasm_call_ctors, undefined-weak stubs,
+        // then __wasm_init_memory.
+        var stubSlots = new List<(Sym Sym, FuncType Type, int Slot)>();
+        foreach (Sym stub in weakStubs)
+        {
+            Import import = stub.RefFile!.FuncImportList[stub.RefIndex];
+            stub.OutIndex = nextFunc++;
+            stub.HasOutIndex = true;
+            stubSlots.Add((stub, stub.RefFile.Module.Types[((ImportDescriptor.Func)import.Descriptor).TypeIndex], functions.Count));
+            functions.Add(null!);
+            functionNames.Add("undefined_weak:" + stub.Name);
+        }
         if (zeroBssAtStart)
         {
             initMemorySlot = functions.Count;
@@ -831,16 +892,11 @@ internal sealed class ObjectFileLinker
             for (int f = 0; f < file.FuncOut.Length; f++)
                 file.FuncOut[f] = file.FuncLive[f] ? (int)nextFunc++ : -1;
         }
-        var stubSlots = new List<(Sym Sym, FuncType Type)>();
-        foreach (Sym stub in weakStubs)
-        {
-            Import import = stub.RefFile!.FuncImportList[stub.RefIndex];
-            stub.OutIndex = nextFunc++;
-            stub.HasOutIndex = true;
-            stubSlots.Add((stub, stub.RefFile.Module.Types[((ImportDescriptor.Func)import.Descriptor).TypeIndex]));
-        }
-
-        if (callCtorsSlot is not null || initMemorySlot is not null)
+        if (callCtorsSlot is not null)
+            TypeIndexOf(s_voidType);
+        foreach ((_, FuncType stubType, _) in stubSlots)
+            TypeIndexOf(stubType);
+        if (initMemorySlot is not null)
             TypeIndexOf(s_voidType);
         foreach (ObjFile file in _files)
         {
@@ -850,8 +906,6 @@ internal sealed class ObjectFileLinker
                     TypeIndexOf(file.Module.Types[file.Module.Functions[f].TypeIndex]);
             }
         }
-        foreach ((_, FuncType stubType) in stubSlots)
-            TypeIndexOf(stubType);
 
         // ── Globals ──
         uint nextGlobal = globalImportCount;
@@ -861,6 +915,18 @@ internal sealed class ObjectFileLinker
             _stackPointer.HasOutIndex = true;
             globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Var), InitExpr = ConstI32(layout.StackPointer) });
             globalNames.Add(StackPointerName);
+        }
+        // wasm-ld (LLD 23+) creates these in a fixed order after __stack_pointer.
+        foreach (string baseName in (ReadOnlySpan<string>)[MemoryBaseName, TableBaseName])
+        {
+            if (_globals.TryGetValue(baseName, out Sym? sym) && sym.Live && sym.Synthetic is Synthetic.MemoryBase or Synthetic.TableBase)
+            {
+                sym.OutIndex = nextGlobal++;
+                sym.HasOutIndex = true;
+                uint value = sym.Synthetic == Synthetic.MemoryBase ? 0 : _options.TableBase ?? 1;
+                globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
+                globalNames.Add(sym.Name);
+            }
         }
         foreach (ObjFile file in _files)
         {
@@ -946,7 +1012,7 @@ internal sealed class ObjectFileLinker
                         sym.HasOutIndex = true;
                         break;
                     case SymbolType.Data when file.SegOut[index] is not null:
-                        sym.Address = file.SegAddress[index] + (sym.Def!.Offset ?? 0);
+                        sym.Address = AddressIn(file, (int)index, sym.Def!.Offset ?? 0);
                         sym.HasOutIndex = true;
                         break;
                 }
@@ -984,6 +1050,30 @@ internal sealed class ObjectFileLinker
         if (tableSlots.Count > 0 && !tableLive)
             throw new LinkerException("Internal error: address-taken functions without an indirect function table.");
 
+        // ── GOT: PIC code loads addresses from GOT.mem/GOT.func globals; a static link makes them constants ──
+        foreach (ObjFile file in _files)
+        {
+            for (int f = 0; f < file.FuncOut.Length; f++)
+            {
+                if (file.FuncOut[f] < 0)
+                    continue;
+                WasmFunction fn = file.Module.Functions[f];
+                foreach (Relocation reloc in RelocsInRange(file.CodeRelocs, fn.BodyCodeSectionOffset, (uint)fn.Body.Length))
+                {
+                    if (!IsGotRelocation(file, reloc))
+                        continue;
+                    Sym sym = file.Symbols[reloc.Index];
+                    if (sym.HasGot)
+                        continue;
+                    uint value = sym.Kind == SymbolType.Function ? sym.TableSlot : (uint)DataAddress(sym, new Relocation());
+                    sym.GotIndex = nextGlobal++;
+                    sym.HasGot = true;
+                    globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
+                    globalNames.Add((sym.Kind == SymbolType.Function ? "GOT.func.internal." : "GOT.data.internal.") + sym.Name);
+                }
+            }
+        }
+
         // ── Function bodies ──
         foreach (ObjFile file in _files)
         {
@@ -993,8 +1083,11 @@ internal sealed class ObjectFileLinker
                     continue;
                 WasmFunction source = file.Module.Functions[f];
                 byte[] body = [.. source.Body];
-                foreach (Relocation reloc in RelocsInRange(file.CodeRelocs, source.BodyCodeSectionOffset, (uint)source.Body.Length))
+                ArraySegment<Relocation> bodyRelocs = RelocsInRange(file.CodeRelocs, source.BodyCodeSectionOffset, (uint)source.Body.Length);
+                foreach (Relocation reloc in bodyRelocs)
                     Apply(file, reloc, body, checked((int)(reloc.Offset - source.BodyCodeSectionOffset)), site: null);
+                if (_options.CompressRelocations)
+                    body = CompressRelocations(body, bodyRelocs, source.BodyCodeSectionOffset);
 
                 if (source.ExactLocals.Any(static l => l is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType }))
                     throw new LinkerException($"{file.Name}: function locals of defined reference types are not supported.");
@@ -1010,11 +1103,8 @@ internal sealed class ObjectFileLinker
                 functionNames.Add(FunctionName(file, file.FuncImports + (uint)f));
             }
         }
-        foreach ((Sym stub, FuncType type) in stubSlots)
-        {
-            functions.Add(new WasmFunction { TypeIndex = TypeIndexOf(type), Locals = [], Body = [0x00, 0x0B] });
-            functionNames.Add("undefined_weak:" + stub.Name);
-        }
+        foreach ((_, FuncType type, int slot) in stubSlots)
+            functions[slot] = new WasmFunction { TypeIndex = TypeIndexOf(type), Locals = [], Body = [0x00, 0x0B] };
         if (callCtorsSlot is int ctorsSlot)
             functions[ctorsSlot] = BuildCallCtors();
         if (initMemorySlot is int initSlot)
@@ -1026,9 +1116,17 @@ internal sealed class ObjectFileLinker
             if (segment.IsBss && !(_options.ImportMemory && !zeroBssAtStart))
                 continue;
             segment.Bytes = new byte[segment.Size];
+            foreach (MergedChunk merged in segment.Parts.OfType<MergedChunk>())
+                merged.Bytes.CopyTo(segment.Bytes, (int)merged.Offset);
             foreach ((ObjFile file, int s) in segment.Members)
             {
                 Data data = file.Module.DataSegments[s];
+                if (file.SegMerged[s] is not null)
+                {
+                    if (RelocsInRange(file.DataRelocs, data.SectionPayloadOffset, (uint)data.InitData.Length).Count > 0)
+                        throw new LinkerException($"{file.Name}: relocations in mergeable string segment {s} are not supported.");
+                    continue;
+                }
                 int start = checked((int)file.SegOffsetInOut[s]);
                 data.InitData.CopyTo(segment.Bytes, start);
                 foreach (Relocation reloc in RelocsInRange(file.DataRelocs, data.SectionPayloadOffset, (uint)data.InitData.Length))
@@ -1128,11 +1226,10 @@ internal sealed class ObjectFileLinker
 
         // ── Custom sections ──
         var customSections = new List<CustomSection>();
-        if (!_options.StripDebug)
-            customSections.AddRange(BuildDebugSections(functions, funcImportCount));
-        if (!_options.NoNameSection)
+        customSections.AddRange(BuildDebugSections(functions, funcImportCount));
+        if (!_options.NoNameSection && !_options.StripAll)
             customSections.Add(BuildNameSection(functionNames, globalNames, [.. emitted.Select(static s => s.Name)]));
-        if (BuildTargetFeatures() is { } targetFeatures)
+        if (!_options.StripAll && BuildTargetFeatures() is { } targetFeatures)
             customSections.Add(targetFeatures);
 
         if (_options.PrintGcSections)
@@ -1154,7 +1251,7 @@ internal sealed class ObjectFileLinker
             Elements = elements,
             DataSegments = dataSegments,
             CustomSections = customSections,
-            ProducersSection = SectionMerger.MergeProducers([.. _files.Select(static f => f.Module)]),
+            ProducersSection = _options.StripAll ? null : SectionMerger.MergeProducers([.. _files.Select(static f => f.Module)]),
         };
     }
 
@@ -1172,11 +1269,13 @@ internal sealed class ObjectFileLinker
         return local;
     }
 
+    private readonly Dictionary<uint, uint> _tableSlotByFunction = [];
+
     private void AssignTableSlots(ObjFile file, ArraySegment<Relocation> relocs, List<int> slots, uint tableBase)
     {
         foreach (Relocation reloc in relocs)
         {
-            if (!IsTableIndexRelocation(reloc.Type))
+            if (!IsTableIndexRelocation(reloc.Type) && !(IsGotRelocation(file, reloc) && file.Symbols[reloc.Index].Kind == SymbolType.Function))
                 continue;
 
             Sym sym = file.Symbols[reloc.Index];
@@ -1184,10 +1283,81 @@ internal sealed class ObjectFileLinker
                 continue;
             if (sym.Kind != SymbolType.Function)
                 throw new LinkerException($"{file.Name}: table index relocation against non-function symbol '{sym.Name}'.");
-            if (!sym.IsDefined && sym.AllRefsWeak && !sym.Forced)
+            if (!sym.IsDefined && sym.AllRefsWeak && !sym.Forced && !sym.ExplicitImport)
                 continue;
-            sym.TableSlot = tableBase + (uint)slots.Count;
-            slots.Add((int)sym.OutIndex);
+
+            // Slots belong to functions, not symbols: aliases (a C++ D1/D2 destructor pair) share one entry.
+            if (!_tableSlotByFunction.TryGetValue(sym.OutIndex, out uint slot))
+            {
+                slot = tableBase + (uint)slots.Count;
+                _tableSlotByFunction[sym.OutIndex] = slot;
+                slots.Add((int)sym.OutIndex);
+            }
+            sym.TableSlot = slot;
+        }
+    }
+
+    /// <summary>A global-index relocation against a function or data symbol addresses it through the GOT.</summary>
+    private static bool IsGotRelocation(ObjFile file, Relocation reloc) =>
+        reloc.Type is RelocationType.R_WASM_GLOBAL_INDEX_LEB or RelocationType.R_WASM_GLOBAL_INDEX_I32 &&
+        file.Symbols[reloc.Index].Kind is SymbolType.Function or SymbolType.Data;
+
+    /// <summary>
+    /// Re-encodes every relocated LEB128 operand at its minimal width, as <c>wasm-ld --compress-relocations</c>
+    /// does. Fixed-width (I32/I64) relocations are copied unchanged.
+    /// </summary>
+    private static byte[] CompressRelocations(byte[] body, ArraySegment<Relocation> relocs, uint bodyStart)
+    {
+        using var output = new MemoryStream(body.Length);
+        int copied = 0;
+        foreach (Relocation reloc in relocs)
+        {
+            (int width, bool signed) = reloc.Type switch
+            {
+                RelocationType.R_WASM_FUNCTION_INDEX_LEB or RelocationType.R_WASM_TYPE_INDEX_LEB
+                    or RelocationType.R_WASM_GLOBAL_INDEX_LEB or RelocationType.R_WASM_TAG_INDEX_LEB
+                    or RelocationType.R_WASM_TABLE_NUMBER_LEB or RelocationType.R_WASM_MEMORY_ADDR_LEB => (5, false),
+                RelocationType.R_WASM_TABLE_INDEX_SLEB or RelocationType.R_WASM_TABLE_INDEX_REL_SLEB
+                    or RelocationType.R_WASM_MEMORY_ADDR_SLEB or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB
+                    or RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB => (5, true),
+                RelocationType.R_WASM_MEMORY_ADDR_LEB64 => (10, false),
+                RelocationType.R_WASM_TABLE_INDEX_SLEB64 or RelocationType.R_WASM_TABLE_INDEX_REL_SLEB64
+                    or RelocationType.R_WASM_MEMORY_ADDR_SLEB64 or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB64
+                    or RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB64 => (10, true),
+                _ => (0, false),
+            };
+            if (width == 0)
+                continue;
+
+            int at = checked((int)(reloc.Offset - bodyStart));
+            output.Write(body, copied, at - copied);
+            ulong value = 0;
+            for (int i = 0; i < width; i++)
+                value |= (ulong)(body[at + i] & 0x7F) << (7 * i);
+            if (signed)
+            {
+                int bits = 7 * width;
+                long signedValue = bits < 64 ? (long)(value << (64 - bits)) >> (64 - bits) : (long)value;
+                WasmEncoder.WriteS64Leb(output, signedValue);
+            }
+            else
+            {
+                WriteU64Leb(output, value);
+            }
+            copied = at + width;
+        }
+        output.Write(body, copied, body.Length - copied);
+        return output.ToArray();
+
+        static void WriteU64Leb(Stream stream, ulong value)
+        {
+            do
+            {
+                byte b = (byte)(value & 0x7F);
+                value >>= 7;
+                stream.WriteByte(value == 0 ? b : (byte)(b | 0x80));
+            }
+            while (value != 0);
         }
     }
 
@@ -1209,6 +1379,8 @@ internal sealed class ObjectFileLinker
 
             RelocationType.R_WASM_FUNCTION_INDEX_LEB or RelocationType.R_WASM_FUNCTION_INDEX_I32
                 => OutIndex(sym!, file),
+            RelocationType.R_WASM_GLOBAL_INDEX_LEB or RelocationType.R_WASM_GLOBAL_INDEX_I32 when IsGotRelocation(file, reloc)
+                => sym!.HasGot ? sym.GotIndex : throw new LinkerException($"{file.Name}: no GOT entry for '{sym.Name}'."),
             RelocationType.R_WASM_GLOBAL_INDEX_LEB or RelocationType.R_WASM_GLOBAL_INDEX_I32
                 => OutIndex(sym!, file),
             RelocationType.R_WASM_TAG_INDEX_LEB or RelocationType.R_WASM_TABLE_NUMBER_LEB
@@ -1226,7 +1398,9 @@ internal sealed class ObjectFileLinker
                 or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB64
                 => DataAddress(sym!, reloc),
             RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32
-                => unchecked(DataAddress(sym!, reloc) - (site ?? throw new LinkerException($"{file.Name}: R_WASM_MEMORY_ADDR_LOCREL_I32 outside a data segment."))),
+                => unchecked(DataAddress(sym!, reloc) - (site ?? throw new LinkerException($"{file.Name}: R_WASM_MEMORY_ADDR_LOCREL_I32 outside a data segment."))) & 0xFFFF_FFFF,
+            RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I64
+                => unchecked(DataAddress(sym!, reloc) - (site ?? throw new LinkerException($"{file.Name}: R_WASM_MEMORY_ADDR_LOCREL_I64 outside a data segment."))),
 
             _ => throw new LinkerException($"{file.Name}: relocation type {reloc.Type} is not supported in code or data."),
         };
@@ -1287,6 +1461,7 @@ internal sealed class ObjectFileLinker
             case RelocationType.R_WASM_TABLE_INDEX_I64:
             case RelocationType.R_WASM_MEMORY_ADDR_I64:
             case RelocationType.R_WASM_FUNCTION_OFFSET_I64:
+            case RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I64:
                 BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(at, 8), value);
                 break;
             default:
@@ -1309,7 +1484,7 @@ internal sealed class ObjectFileLinker
 
     private sealed class MemoryLayout
     {
-        public uint StackPointer, StackLow, StackHigh, GlobalBase, DataEnd, HeapBase, InitialPages;
+        public uint StackPointer, StackLow, StackHigh, GlobalBase, DataEnd, HeapBase, InitialPages, TableBase;
         public ulong? MaxPages;
 
         public uint AddressOf(string name) => name switch
@@ -1320,7 +1495,9 @@ internal sealed class ObjectFileLinker
             "__global_base" => GlobalBase,
             "__stack_low" => StackLow,
             "__stack_high" => StackHigh,
-            "__dso_handle" => 0,
+            "__dso_handle" => GlobalBase, // wasm-ld: the start of data
+            "__memory_base" => 0,
+            "__table_base" => TableBase,
             _ => throw new LinkerException($"Unknown linker-defined symbol '{name}'."),
         };
     }
@@ -1335,6 +1512,9 @@ internal sealed class ObjectFileLinker
             file.SegOut = new OutSegment?[count];
             file.SegOffsetInOut = new uint[count];
             file.SegAddress = new uint[count];
+            file.SegMerged = new MergedChunk?[count];
+            file.PieceInput = new uint[count][];
+            file.PieceOutput = new uint[count][];
             List<SegmentInfo> infos = file.Module.LinkingSection!.SegmentInfos;
             for (int s = 0; s < count; s++)
             {
@@ -1352,18 +1532,57 @@ internal sealed class ObjectFileLinker
                     byName[outName] = outSegment;
                     ordered.Add(outSegment);
                 }
-                outSegment.Size = AlignUp(outSegment.Size, alignment);
                 file.SegOut[s] = outSegment;
-                file.SegOffsetInOut[s] = outSegment.Size;
-                outSegment.Size = checked(outSegment.Size + (uint)data.InitData.Length);
                 outSegment.Alignment = Math.Max(outSegment.Alignment, alignment);
                 outSegment.Members.Add((file, s));
+
+                SegmentFlags flags = s < infos.Count ? infos[s].Flags : SegmentFlags.None;
+                if ((flags & SegmentFlags.Strings) != 0 && alignment == 1 && data.InitData.Length > 0)
+                {
+                    MergedChunk? merged = outSegment.Parts.OfType<MergedChunk>().FirstOrDefault(m => m.Flags == flags);
+                    if (merged is null)
+                    {
+                        merged = new MergedChunk { Flags = flags };
+                        outSegment.Parts.Add(merged);
+                    }
+                    merged.Members.Add((file, s));
+                    file.SegMerged[s] = merged;
+                }
+                else
+                {
+                    outSegment.Parts.Add((file, s));
+                }
             }
+        }
+
+        foreach (OutSegment outSegment in ordered)
+        {
+            foreach (MergedChunk merged in outSegment.Parts.OfType<MergedChunk>())
+                MergeStrings(merged);
+
+            uint size = 0;
+            foreach (object part in outSegment.Parts)
+            {
+                if (part is MergedChunk merged)
+                {
+                    merged.Offset = size;
+                    foreach ((ObjFile file, int s) in merged.Members)
+                        file.SegOffsetInOut[s] = size;
+                    size = checked(size + (uint)merged.Bytes.Length);
+                    continue;
+                }
+                (ObjFile f, int seg) = ((ObjFile, int))part;
+                List<SegmentInfo> infos = f.Module.LinkingSection!.SegmentInfos;
+                size = AlignUp(size, 1u << (int)(seg < infos.Count ? infos[seg].Alignment : 0));
+                f.SegOffsetInOut[seg] = size;
+                size = checked(size + (uint)f.Module.DataSegments[seg].InitData.Length);
+            }
+            outSegment.Size = size;
         }
 
         List<OutSegment> segments = [.. ordered.OrderBy(static s => SegmentRank(s.Name))];
 
-        layout = new MemoryLayout();
+        layout = new MemoryLayout { TableBase = _options.TableBase ?? 1 };
         bool stackFirst = _options.StackFirst ?? true;
         if (_options.StackSize % StackAlignment != 0)
             throw new LinkerException($"Stack size must be {StackAlignment}-byte aligned.");
@@ -1419,6 +1638,90 @@ internal sealed class ObjectFileLinker
         }
 
         return segments;
+    }
+
+    /// <summary>
+    /// Splits each member into NUL-terminated pieces, deduplicates them and lays them out as LLVM's
+    /// <c>StringTableBuilder::finalize()</c> does: sorted by reversed content, a string that is a suffix of the
+    /// previous one sharing its tail.
+    /// </summary>
+    private static void MergeStrings(MergedChunk merged)
+    {
+        var distinct = new Dictionary<string, uint>(StringComparer.Ordinal);
+        foreach ((ObjFile file, int s) in merged.Members)
+        {
+            byte[] data = file.Module.DataSegments[s].InitData;
+            var inputs = new List<uint>();
+            for (int start = 0; start < data.Length;)
+            {
+                int end = Array.IndexOf(data, (byte)0, start);
+                if (end < 0)
+                    throw new LinkerException($"{file.Name}: string in mergeable segment {s} is not null terminated.");
+                inputs.Add((uint)start);
+                distinct.TryAdd(Latin1(data.AsSpan(start, end + 1 - start)), 0);
+                start = end + 1;
+            }
+            file.PieceInput[s] = [.. inputs];
+        }
+
+        // Latin-1 maps bytes to chars one-to-one, so ordinal string comparison is byte comparison.
+        string[] strings = [.. distinct.Keys];
+        Array.Sort(strings, static (a, b) =>
+        {
+            for (int k = 0; ; k++)
+            {
+                int ca = k < a.Length ? a[a.Length - 1 - k] : -1;
+                int cb = k < b.Length ? b[b.Length - 1 - k] : -1;
+                if (ca != cb)
+                    return cb.CompareTo(ca);
+                if (ca == -1)
+                    return 0;
+            }
+        });
+
+        var content = new System.Text.StringBuilder();
+        string previous = "";
+        foreach (string str in strings)
+        {
+            if (previous.EndsWith(str, StringComparison.Ordinal))
+            {
+                distinct[str] = (uint)(content.Length - str.Length);
+                continue;
+            }
+            distinct[str] = (uint)content.Length;
+            content.Append(str);
+            previous = str;
+        }
+        merged.Bytes = System.Text.Encoding.Latin1.GetBytes(content.ToString());
+
+        foreach ((ObjFile file, int s) in merged.Members)
+        {
+            byte[] data = file.Module.DataSegments[s].InitData;
+            uint[] inputs = file.PieceInput[s];
+            var outputs = new uint[inputs.Length];
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                int start = (int)inputs[i];
+                int end = Array.IndexOf(data, (byte)0, start);
+                outputs[i] = distinct[Latin1(data.AsSpan(start, end + 1 - start))];
+            }
+            file.PieceOutput[s] = outputs;
+        }
+
+        static string Latin1(ReadOnlySpan<byte> bytes) => System.Text.Encoding.Latin1.GetString(bytes);
+    }
+
+    /// <summary>Linear-memory address of <paramref name="offset"/> within input data segment <paramref name="segment"/>.</summary>
+    private static uint AddressIn(ObjFile file, int segment, uint offset)
+    {
+        if (file.SegMerged[segment] is null)
+            return file.SegAddress[segment] + offset;
+
+        uint[] inputs = file.PieceInput[segment];
+        int index = Array.BinarySearch(inputs, offset);
+        if (index < 0)
+            index = ~index - 1;
+        return file.SegAddress[segment] + file.PieceOutput[segment][index] + (offset - inputs[index]);
     }
 
     private static string OutputSegmentName(string name)
@@ -1509,6 +1812,16 @@ internal sealed class ObjectFileLinker
 
     // ── Debug, name and bookkeeping ───────────────────────────────────────────
 
+    /// <summary>
+    /// Custom sections wasm-ld concatenates into the output: DWARF (unless stripped) and any section it does not
+    /// interpret itself, such as wit-bindgen's <c>component-type:*</c> sections that wasm-component-ld consumes.
+    /// </summary>
+    private bool IsPassThroughSection(string name) =>
+        name.StartsWith(".debug_", StringComparison.Ordinal)
+            ? !_options.StripDebug && !_options.StripAll
+            : name is not ("linking" or "name" or "producers" or "target_features" or "dylink" or "dylink.0" or BranchHintMetadataReader.SectionName)
+              && !name.StartsWith("reloc.", StringComparison.Ordinal);
+
     private List<CustomSection> BuildDebugSections(List<WasmFunction> functions, uint funcImportCount)
     {
         var names = new List<string>();
@@ -1516,7 +1829,7 @@ internal sealed class ObjectFileLinker
         {
             foreach (CustomSection section in file.Module.CustomSections)
             {
-                if (section.Name.StartsWith(".debug_", StringComparison.Ordinal) && !names.Contains(section.Name))
+                if (IsPassThroughSection(section.Name) && !names.Contains(section.Name))
                     names.Add(section.Name);
             }
         }

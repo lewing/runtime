@@ -81,16 +81,8 @@ public class WasmLdParityTests
 
     // Divergences from wasm-ld that the managed linker does not handle yet. Each entry is skipped with its reason
     // rather than asserted, so the table doubles as the list of gaps to close before it can replace wasm-ld.
-    private const string WasiLibcGap =
-        "linking wasi-libc fails: TABLE_INDEX_REL_SLEB addend parsing, object classification, explicit-import symbols and __memory_base (Blazor-Playground/nesm#573)";
-
     private static readonly Dictionary<(string Scenario, Facet Facet), string> s_knownGaps = new()
     {
-        [("wasi-libc", Facet.Exports)] = WasiLibcGap,
-        [("wasi-libc", Facet.FunctionImports)] = WasiLibcGap,
-        [("wasi-libc", Facet.MemoryAndTable)] = WasiLibcGap,
-        [("wasi-libc", Facet.StackPointer)] = WasiLibcGap,
-        [("wasi-libc", Facet.ValidatesWithWasmTools)] = WasiLibcGap,
     };
 
     public static IEnumerable<object[]> Cases() =>

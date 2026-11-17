@@ -54,20 +54,21 @@ nesm when you can so the patches shrink. After a sync that fixes a gap, remove i
 
 ## Known gaps before the linker can replace wasm-ld
 
+A real NativeAOT WASI link (`nativeaot/SmokeTests/UnitTests`) now produces a core module byte-identical to wasm-ld's,
+through both `wasm-link` and the `WasmLink` task. That link covers the ILCompiler object, the runtime and framework
+archives, wasi-libc, libc++ and compiler-rt, with `-s` and `--compress-relocations`. After wrapping with
+`wasm-tools component new`, the app passes under wasmtime.
+
 Linking clang objects now matches wasm-ld on the parity scenarios: memory, table and stack definition, data layout,
 constructors, `--allow-undefined`, `--export`, the entry point, lazy archive members, COMDAT, and the relocation types
 ILCompiler's `WasmObjectWriter` emits, and defining `__stack_pointer` only when it's used (as LLD 23 does). The parity
 tests (`WasmLdParityTests`) record any future divergence in `s_knownGaps` with its reason. Remaining gaps:
 
+* The `name` section isn't demangled the way wasm-ld's is.
 * TLS (`__tls_base`, TLS segments and relocations) is not supported.
 * Shared memory and atomics (`--shared-memory`, `0xFE` instructions) are not supported. Threaded builds can't be linked
   (Blazor-Playground/nesm#572).
 * `.debug_str` is not merged across inputs.
-* Linking against wasi-libc fails, which also blocks a real NativeAOT WASI app link (Blazor-Playground/nesm#573).
-  Causes: `R_WASM_TABLE_INDEX_REL_SLEB` is parsed with an addend; objects without a memory import (such as
-  wasi-libc's `component-type` object) are treated as complete modules; undefined symbols with explicit import names
-  aren't imported automatically; `__memory_base` isn't synthesized; and the output then has an out-of-range global
-  index. The `wasi-libc` parity scenario covers this.
 * Component output (`--component-type`, wasm-component-ld) is not implemented.
 
 ## Native tools in CoreCLR and NativeAOT WebAssembly app builds

@@ -61,6 +61,8 @@ public sealed class WasmLdCommandLine
         bool printGcSections = false;
         bool stripDebug = false;
         bool noNameSection = false;
+        bool stripAll = false;
+        bool compressRelocations = false;
         bool coalesceSegments = true;
         bool exportAll = false;
         bool importMemory = false;
@@ -188,8 +190,7 @@ public sealed class WasmLdCommandLine
                     break;
                 case "--strip-all":
                 case "-s":
-                    stripDebug = true;
-                    noNameSection = true;
+                    stripAll = true;
                     break;
                 case "--no-name-section":
                     noNameSection = true;
@@ -240,11 +241,14 @@ public sealed class WasmLdCommandLine
                     wholeArchive = false;
                     break;
 
+                case "--compress-relocations":
+                    compressRelocations = true;
+                    break;
+
                 // Accepted but without effect on a final (non-relocatable) link.
                 case "--error-limit":
                     _ = Value();
                     break;
-                case "--compress-relocations":
                 case "--fatal-warnings":
                 case "--no-fatal-warnings":
                 case "--color-diagnostics":
@@ -267,6 +271,8 @@ public sealed class WasmLdCommandLine
             PrintGcSections = printGcSections,
             StripDebug = stripDebug,
             NoNameSection = noNameSection,
+            StripAll = stripAll,
+            CompressRelocations = compressRelocations,
             CoalesceSegments = coalesceSegments,
             ImportMemory = importMemory,
             ExportMemory = exportMemory,
