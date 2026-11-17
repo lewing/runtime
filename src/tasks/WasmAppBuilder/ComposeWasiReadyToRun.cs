@@ -14,7 +14,7 @@ using Microsoft.NET.WebAssembly.Webcil;
 
 namespace Microsoft.WebAssembly.Build.Tasks;
 
-public sealed class ComposeWasiReadyToRun : Task
+public sealed partial class ComposeWasiReadyToRun : Task
 {
     [Required, NotNull]
     public string? CompositePath { get; set; }
@@ -35,6 +35,14 @@ public sealed class ComposeWasiReadyToRun : Task
     /// emitted; optimizing also needs several times more memory for large composites.
     /// </summary>
     public bool Optimize { get; set; }
+
+    /// <summary>
+    /// Experimental: unbundles the host, compiles the shim, merges and replaces the host module with the managed
+    /// toolchain (src/tools/WebAssembly) instead of wasm-tools and wasm-merge. wasm-tools still validates the final
+    /// component, and <see cref="Optimize"/> still runs wasm-opt. The merge drops the host's DWARF, which wasm-merge
+    /// rewrites. Requires MSBuild on .NET.
+    /// </summary>
+    public bool UseManagedTools { get; set; }
 
     [Output]
     public int FunctionCount { get; private set; }
@@ -70,10 +78,9 @@ public sealed class ComposeWasiReadyToRun : Task
             Directory.CreateDirectory(OutputDirectory!);
             DeleteUnbundledModules(OutputDirectory!);
 
-            string unbundleOutput = Path.Combine(OutputDirectory!, "unbundle-output.wasm");
-            Run(WasmToolsPath!, $"component unbundle {Quote(ComponentPath!)} --module-dir {Quote(OutputDirectory!)} -o {Quote(unbundleOutput)}");
-            string hostModule = Directory.GetFiles(OutputDirectory!, "*module0*.wasm").OrderBy(path => path, StringComparer.Ordinal).FirstOrDefault()
-                ?? throw new LogAsErrorException($"Unbundling {ComponentPath} produced no *module0*.wasm file in {OutputDirectory}.");
+            string hostModule = UseManagedTools
+                ? ExtractHostModuleManaged(ComponentPath!, OutputDirectory!)
+                : ExtractHostModule();
 
             WasiR2RComposition.InspectHost(
                 hostModule,
@@ -111,14 +118,22 @@ public sealed class ComposeWasiReadyToRun : Task
 
             string shimWatPath = Path.Combine(OutputDirectory!, "shim.wat");
             string shimPath = Path.Combine(OutputDirectory!, "shim.wasm");
-            File.WriteAllText(shimWatPath, CreateShimWat(imageBase, tableBase, PayloadSize, compositeNameBase, compositeNameBytes));
-            Run(WasmToolsPath!, $"parse {Quote(shimWatPath)} -o {Quote(shimPath)}");
-            Run(WasmToolsPath!, $"validate --features all {Quote(shimPath)}");
-
+            string shimWat = CreateShimWat(imageBase, tableBase, PayloadSize, compositeNameBase, compositeNameBytes);
+            File.WriteAllText(shimWatPath, shimWat);
             string mergedPath = Path.Combine(OutputDirectory!, "merged.wasm");
-            Run(WasmMergePath!,
-                $"-g --all-features --enable-gc {Quote(hostModule)} webcil {Quote(shimPath)} webcil " +
-                $"{Quote(CompositePath)} composite -o {Quote(mergedPath)}");
+            if (UseManagedTools)
+            {
+                CompileShimManaged(shimWat, shimPath);
+                MergeManaged([(hostModule, "webcil"), (shimPath, "webcil"), (CompositePath, "composite")], mergedPath);
+            }
+            else
+            {
+                Run(WasmToolsPath!, $"parse {Quote(shimWatPath)} -o {Quote(shimPath)}");
+                Run(WasmToolsPath!, $"validate --features all {Quote(shimPath)}");
+                Run(WasmMergePath!,
+                    $"-g --all-features --enable-gc {Quote(hostModule)} webcil {Quote(shimPath)} webcil " +
+                    $"{Quote(CompositePath)} composite -o {Quote(mergedPath)}");
+            }
 
             // Merging turns the composite's imported base globals into module-defined globals, which engines
             // only accept in constant expressions with the extended-const proposal. Fold them to constants.
@@ -133,7 +148,11 @@ public sealed class ComposeWasiReadyToRun : Task
                 WasiR2RComposition.FoldConstantGlobalReads(mergedPath, finalModulePath);
             }
 
-            WasiR2RComposition.ReplaceFirstCoreModule(ComponentPath!, finalModulePath, OutputPath!);
+            // wasm-opt can emit typed function references, which the managed replace doesn't read yet.
+            if (UseManagedTools && !Optimize)
+                ReplaceHostModuleManaged(ComponentPath!, finalModulePath, OutputPath!);
+            else
+                WasiR2RComposition.ReplaceFirstCoreModule(ComponentPath!, finalModulePath, OutputPath!);
             Run(WasmToolsPath!, $"validate --features all {Quote(OutputPath!)}");
 
             List<ITaskItem> fileWrites = new() { new TaskItem(OutputPath!) };
@@ -161,6 +180,14 @@ public sealed class ComposeWasiReadyToRun : Task
             Log.LogError(ex.Message);
             return false;
         }
+#if NET
+        catch (Exception ex) when (UseManagedTools && IsManagedToolchainException(ex))
+        {
+            DeleteFailedOutput();
+            Log.LogError($"WASI R2R composition failed in the managed WebAssembly toolchain: {ex.Message}");
+            return false;
+        }
+#endif
         catch (Exception ex)
         {
             DeleteFailedOutput();
@@ -173,7 +200,12 @@ public sealed class ComposeWasiReadyToRun : Task
     {
         RequireFile(ComponentPath, nameof(ComponentPath));
         RequireFile(WasmToolsPath, nameof(WasmToolsPath));
-        RequireFile(WasmMergePath, nameof(WasmMergePath));
+#if !NET
+        if (UseManagedTools)
+            throw new LogAsErrorException($"{nameof(UseManagedTools)} requires MSBuild running on .NET.");
+#endif
+        if (!UseManagedTools)
+            RequireFile(WasmMergePath, nameof(WasmMergePath));
         if (Optimize)
             RequireFile(WasmOptPath, nameof(WasmOptPath));
         if (string.IsNullOrEmpty(OutputDirectory))
@@ -197,11 +229,20 @@ public sealed class ComposeWasiReadyToRun : Task
         OutputDirectory = Path.GetFullPath(OutputDirectory!);
         OutputPath = Path.GetFullPath(OutputPath!);
         WasmToolsPath = Path.GetFullPath(WasmToolsPath!);
-        WasmMergePath = Path.GetFullPath(WasmMergePath!);
+        if (!UseManagedTools)
+            WasmMergePath = Path.GetFullPath(WasmMergePath!);
         if (Optimize)
             WasmOptPath = Path.GetFullPath(WasmOptPath!);
         if (StubOutputDirectory is not null)
             StubOutputDirectory = Path.GetFullPath(StubOutputDirectory);
+    }
+
+    private string ExtractHostModule()
+    {
+        string unbundleOutput = Path.Combine(OutputDirectory!, "unbundle-output.wasm");
+        Run(WasmToolsPath!, $"component unbundle {Quote(ComponentPath!)} --module-dir {Quote(OutputDirectory!)} -o {Quote(unbundleOutput)}");
+        return Directory.GetFiles(OutputDirectory!, "*module0*.wasm").OrderBy(path => path, StringComparer.Ordinal).FirstOrDefault()
+            ?? throw new LogAsErrorException($"Unbundling {ComponentPath} produced no *module0*.wasm file in {OutputDirectory}.");
     }
 
     private static void DeleteUnbundledModules(string outputDirectory)

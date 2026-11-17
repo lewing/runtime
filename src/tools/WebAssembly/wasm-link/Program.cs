@@ -24,12 +24,22 @@ if (args.Length == 0 || args is ["-h" or "--help"])
           --wasi-adapter <kind>       command|reactor|proxy|none (no built-in adapters; use --adapt)
           --skip-wit-component        emit the core module
           --wasm-ld-path <path>       accepted and ignored
+
+        Archives (llvm-ar compatible, GNU format, deterministic):
+          wasm-link ar [-]<r|q>[cSsDuv] <archive> <files...>
         """);
     return args.Length == 0 ? 1 : 0;
 }
 
 try
 {
+    if (args[0] == "ar")
+    {
+        foreach (string warning in WasmArCommandLine.Run(args[1..]))
+            Console.Error.WriteLine($"wasm-link: warning: {warning}");
+        return 0;
+    }
+
     WasmComponentLdCommandLine commandLine = WasmComponentLdCommandLine.Parse(args);
     commandLine.Run(
         log: commandLine.WasmLd.Verbose ? Console.WriteLine : null,
