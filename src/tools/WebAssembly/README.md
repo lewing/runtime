@@ -67,6 +67,23 @@ reason. Remaining gaps:
 * `.debug_str` is not merged across inputs.
 * Component output (`--component-type`, wasm-component-ld) is not implemented.
 
+## Native tools in WebAssembly SDK app builds
+
+| Tool | Where | Status |
+|------|-------|--------|
+| `llvm-size` (data section size of AOT objects for the initial heap size) | Mono, `WasmApp.Common.targets` | Replaced by `WasmGetDataSectionSizes` when `WasmUseManagedToolchain` is `true`, the default on .NET MSBuild. The output matches llvm-size. |
+| `wasm-opt --strip-dwarf` post-link pass (feature flags only, no `-O`) | Mono browser and WASI, `_RunWasmOptPostLink` | `WasmStripWithManagedToolchain=true` uses `WasmStripDebugInfo`. It removes the same sections (`name`, `.debug_*`) but doesn't re-encode code, so it's opt-in until code LEB compaction exists (Blazor-Playground/nesm#570). |
+| `wasm-ld` via `clang` | WASI Mono app link, WASI CoreCLR relink, NativeAOT WASI | `WasmLink` task / `wasm-link` are ready to evaluate behind a switch. Threads, TLS and component output are still missing (see the gaps above). |
+| `wasm-component-ld` / `--component-type` | WASI CoreCLR host, NativeAOT `wasm32-wasip2` | Not supported (Blazor-Playground/nesm#569). |
+| `llvm-ar` | NativeAOT `NativeLib=Static` | Needs an archive writer with a symbol index (Blazor-Playground/nesm#570). |
+| `wasm-tools parse` / `validate`, `wasm-merge`, `wasm-tools component unbundle` | WASI ReadyToRun composition (`ComposeWasiReadyToRun`) | WAT parsing and validation exist here. Module merge and component unbundle are needed (Blazor-Playground/nesm#570). The task is in WasmAppBuilder, which also targets .NET Framework. |
+| `wasm-opt -O*` | CoreCLR browser relink and ReadyToRun images | Optimizer; not a replacement target. |
+| `emcc` link | Browser (Mono and CoreCLR) | Also generates the JS glue, so wasm-ld can't be swapped out here. |
+| `emcc` / `clang -c` | Native compiles | C compiler; not a replacement target. |
+
+The managed tasks live in `WasmBuildTasks`, which targets .NET only, and are declared with `Runtime="NET"`.
+`WasmUseManagedToolchain` defaults to `false` on .NET Framework MSBuild until the .NET task host is validated there.
+
 ## Where native tools are used today
 
 * **Browser (Mono and CoreCLR):** `emcc` runs wasm-ld together with Emscripten's post-link and JS glue generation
