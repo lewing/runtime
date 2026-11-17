@@ -33,7 +33,7 @@ compare the managed linker's output with wasm-ld's. They are skipped when the wa
   (Blazor-Playground/nesm#571), so re-syncs don't need local fixes.
 * `runtime-local.patch` holds the remaining library edits. Today that is only the tool name recorded in the producers
   section.
-* `Binary/WasmSections.cs`, `Linker/WasmLdCommandLine.cs` and `Linker/WasmLdDriver.cs` exist only here.
+* `Linker/WasmLdCommandLine.cs` and `Linker/WasmLdDriver.cs` exist only here.
 * The tests in `nesm-test-files.txt` come from nesm's `tests/Nesm.Tests`. `runtime-local-tests.patch` adapts them to
   run without nesm's interpreter: tests that executed modules assert structure instead (exports and signatures,
   identical function bodies after a round trip, validation), and tests that need the interpreter, the spec
@@ -65,34 +65,18 @@ tests (`WasmLdParityTests`) record any future divergence in `s_knownGaps` with i
 * `.debug_str` is not merged across inputs.
 * Component output (`--component-type`, wasm-component-ld) is not implemented.
 
-## Native tools in WebAssembly SDK app builds
+## Native tools in CoreCLR and NativeAOT WebAssembly app builds
+
+Mono is out of scope. It is being removed.
 
 | Tool | Where | Status |
 |------|-------|--------|
-| `llvm-size` (data section size of AOT objects for the initial heap size) | Mono, `WasmApp.Common.targets` | Replaced by `WasmGetDataSectionSizes` when `WasmUseManagedToolchain` is `true`, the default on .NET MSBuild. The output matches llvm-size. |
-| `wasm-opt --strip-dwarf` post-link pass (feature flags only, no `-O`) | Mono browser and WASI, `_RunWasmOptPostLink` | `WasmStripWithManagedToolchain=true` uses `WasmStripDebugInfo`. It removes the same sections (`name`, `.debug_*`) but doesn't re-encode code, so it's opt-in until code LEB compaction exists (Blazor-Playground/nesm#570). |
-| `wasm-ld` via `clang` | WASI Mono app link, WASI CoreCLR relink, NativeAOT WASI | `WasmLink` task / `wasm-link` are ready to evaluate behind a switch. Threads, TLS and component output are still missing (see the gaps above). |
-| `wasm-component-ld` / `--component-type` | WASI CoreCLR host, NativeAOT `wasm32-wasip2` | Not supported (Blazor-Playground/nesm#569). |
-| `llvm-ar` | NativeAOT `NativeLib=Static` | Needs an archive writer with a symbol index (Blazor-Playground/nesm#570). |
-| `wasm-tools parse` / `validate`, `wasm-merge`, `wasm-tools component unbundle` | WASI ReadyToRun composition (`ComposeWasiReadyToRun`) | WAT parsing and validation exist here. Module merge and component unbundle are needed (Blazor-Playground/nesm#570). The task is in WasmAppBuilder, which also targets .NET Framework. |
-| `wasm-opt -O*` | CoreCLR browser relink and ReadyToRun images | Optimizer; not a replacement target. |
-| `emcc` link | Browser (Mono and CoreCLR) | Also generates the JS glue, so wasm-ld can't be swapped out here. |
+| `wasm-ld`, driven by `clang` (NativeAOT also runs `llvm-ar` for `NativeLib=Static`) | NativeAOT WASI (`src/coreclr/nativeaot/BuildIntegration/Microsoft.NETCore.Native.Wasm.targets`) | Most direct target for `WasmLink`/`wasm-link`. Its `wasm32-wasip2` output is a component, so component output is needed (Blazor-Playground/nesm#569). `llvm-ar` needs an archive writer (Blazor-Playground/nesm#570). |
+| `wasm-component-ld`, driven by `clang++` | WASI CoreCLR per-app host relink (`src/mono/wasi/build/WasiApp.CoreCLR.targets`) | Needs component output and C++ exception-handling inputs to work at full-runtime scale. |
+| `wasm-tools parse`/`validate`, `wasm-merge`, `wasm-tools component unbundle`, optional `wasm-opt --simplify-globals` | WASI ReadyToRun composition (`src/tasks/WasmAppBuilder/ComposeWasiReadyToRun.cs`) | WAT parsing and validation exist here. A C# fallback already replaces `--simplify-globals`. Module merge and component unbundle are still needed (Blazor-Playground/nesm#570). |
+| `emcc` link | Browser CoreCLR relink (`src/mono/browser/build/BrowserWasmApp.CoreCLR.targets`) | Also generates the JS glue, so wasm-ld can't be swapped out here. |
+| `wasm-opt -Oz`/`-O2` (opt-in) | Browser CoreCLR relink and ReadyToRun images | Optimizer; not a replacement target. |
 | `emcc` / `clang -c` | Native compiles | C compiler; not a replacement target. |
-
-The managed tasks live in `WasmBuildTasks`, which targets .NET only, and are declared with `Runtime="NET"`.
-`WasmUseManagedToolchain` defaults to `false` on .NET Framework MSBuild until the .NET task host is validated there.
-
-## Where native tools are used today
-
-* **Browser (Mono and CoreCLR):** `emcc` runs wasm-ld together with Emscripten's post-link and JS glue generation
-  (`dotnet.native.js`). See `src/mono/browser/build/BrowserWasmApp*.targets` and
-  `src/mono/browser/runtime/CMakeLists.txt`. Replacing wasm-ld there would also require reproducing that post-link.
-* **WASI NativeAOT:** clang drives wasm-ld (`src/coreclr/nativeaot/BuildIntegration/Microsoft.NETCore.Native.Wasm.targets`).
-  This is the most direct replacement target.
-* **WASI CoreCLR:** corerun links with wasm-component-ld (`src/coreclr/hosts/corerun/CMakeLists.txt`,
-  `src/mono/wasi/build/WasiApp.CoreCLR.targets`). ReadyToRun composition uses binaryen's wasm-merge
-  (`src/tasks/WasmAppBuilder/ComposeWasiReadyToRun.cs`).
-* **WASI Mono:** clang link in `src/mono/wasi/build/WasiApp.targets`.
 
 ## Overlap with ILCompiler's ObjectWriter
 

@@ -23,7 +23,6 @@
   <ItemGroup>
     <RuntimeHostConfigurationOption Include="Microsoft.NET.WebAssembly.Toolchain.Tests.WasiSdkPath" Value="$(WasiSdkCacheDir)" />
     <RuntimeHostConfigurationOption Include="Microsoft.NET.WebAssembly.Toolchain.Tests.WasmToolsPath" Value="$(WasmToolsCacheDir)" />
-    <RuntimeHostConfigurationOption Include="Microsoft.NET.WebAssembly.Toolchain.Tests.BinaryenPath" Value="$(BinaryenCacheDir)" />
   </ItemGroup>
 
   <ItemGroup>
