@@ -120,6 +120,9 @@
   <UsingTask TaskName="Microsoft.WebAssembly.Build.Tasks.Mono.ManagedToNativeGenerator" AssemblyFile="$(WasmAppBuilderTasksAssemblyPath)" TaskFactory="TaskHostFactory" Condition="'$(WasmAppRuntimeFlavor)' == 'Mono'" />
   <UsingTask TaskName="Microsoft.WebAssembly.Build.Tasks.EmccCompile" AssemblyFile="$(WasmAppBuilderTasksAssemblyPath)" TaskFactory="TaskHostFactory" />
   <UsingTask TaskName="Microsoft.WebAssembly.Build.Tasks.WasmCalculateInitialHeapSize" AssemblyFile="$(WasmAppBuilderTasksAssemblyPath)" TaskFactory="TaskHostFactory" />
+  <!-- Managed replacements for native wasm tools (src/tools/WebAssembly). WasmBuildTasks targets .NET only. -->
+  <UsingTask TaskName="Microsoft.WebAssembly.Build.Tasks.WasmGetDataSectionSizes" AssemblyFile="$(WasmBuildTasksAssemblyPath)" Runtime="NET" TaskFactory="TaskHostFactory" Condition="'$(WasmBuildTasksAssemblyPath)' != ''" />
+  <UsingTask TaskName="Microsoft.WebAssembly.Build.Tasks.WasmStripDebugInfo" AssemblyFile="$(WasmBuildTasksAssemblyPath)" Runtime="NET" TaskFactory="TaskHostFactory" Condition="'$(WasmBuildTasksAssemblyPath)' != ''" />
   <UsingTask TaskName="MonoTargetsTasks.MarshalingPInvokeScanner" AssemblyFile="$(MonoTargetsTasksAssemblyPath)" TaskFactory="TaskHostFactory" />
   <UsingTask TaskName="EmitBundleObjectFiles" AssemblyFile="$(MonoTargetsTasksAssemblyPath)" TaskFactory="TaskHostFactory" />
 
@@ -162,6 +165,13 @@
     </WasmLinkDotNetDependsOn>
 
     <WasmDedup Condition="'$(WasmDedup)' == ''">true</WasmDedup>
+    <!-- Use C# implementations (src/tools/WebAssembly) instead of native tools where they produce the same result.
+         Off for .NET Framework MSBuild until the .NET task host is validated there. -->
+    <WasmUseManagedToolchain Condition="'$(WasmUseManagedToolchain)' == '' and '$(MSBuildRuntimeType)' == 'Core' and '$(WasmBuildTasksAssemblyPath)' != ''">true</WasmUseManagedToolchain>
+    <WasmUseManagedToolchain Condition="'$(WasmUseManagedToolchain)' == ''">false</WasmUseManagedToolchain>
+    <!-- Opt-in: replace a strip-only post-link wasm-opt with a managed section strip. Unlike wasm-opt it does not
+         re-encode code, so padded relocation LEBs are kept and code is slightly larger. -->
+    <WasmStripWithManagedToolchain Condition="'$(WasmStripWithManagedToolchain)' == ''">false</WasmStripWithManagedToolchain>
     <_IsLibraryMode Condition="'$(OutputType)' == 'Library' and '$(UsingMicrosoftNETSdkWebAssembly)' == 'true'">true</_IsLibraryMode>
     <IsWasiProject Condition="'$(IsWasiProject)' == '' and '$(RuntimeIdentifier)' == 'wasi-wasm' and ('$(OutputType)' != 'Library' or '$(_IsLibraryMode)' == 'true')">true</IsWasiProject>
     <IsBrowserWasmProject Condition="'$(IsBrowserWasmProject)' == '' and '$(RuntimeIdentifier)' == 'browser-wasm' and ('$(OutputType)' != 'Library' or '$(_IsLibraryMode)' == 'true')">true</IsBrowserWasmProject>
@@ -548,19 +558,25 @@
       <_AOTObjectFile Include="%(_BitcodeFile.ObjectFile)" />
     </ItemGroup>
 
-    <!-- for AOT builds we use llvm-size tool to collect size of the DATA segment in each object file -->
+    <!-- for AOT builds we collect the size of the DATA section in each object file, in C# or with llvm-size -->
+    <WasmGetDataSectionSizes
+        Condition="'$(_WasmShouldAOT)' == 'true' and '$(WasmUseManagedToolchain)' == 'true'"
+        ObjectFiles="@(_AOTObjectFile)">
+      <Output TaskParameter="DataSectionSizes" ItemName="_AOTDataSegmentSize" />
+    </WasmGetDataSectionSizes>
+
     <WriteLinesToFile
-        Condition="'$(_WasmShouldAOT)' == 'true'"
+        Condition="'$(_WasmShouldAOT)' == 'true' and '$(WasmUseManagedToolchain)' != 'true'"
         Lines="@(_AOTObjectFile->'&quot;%(Identity)&quot;')"
         File="$(_WasmLlvmSizeRsp)"
         Overwrite="true"
         WriteOnlyWhenDifferent="true"
         />
-    <ItemGroup Condition="'$(_WasmShouldAOT)' == 'true'">
+    <ItemGroup Condition="'$(_WasmShouldAOT)' == 'true' and '$(WasmUseManagedToolchain)' != 'true'">
       <FileWrites Include="$(_WasmLlvmSizeRsp)" />
     </ItemGroup>
     <Exec Command='llvm-size$(_ExeExt) -d --format=sysv "@$(_WasmLlvmSizeRsp)"'
-          Condition="'$(_WasmShouldAOT)' == 'true'"
+          Condition="'$(_WasmShouldAOT)' == 'true' and '$(WasmUseManagedToolchain)' != 'true'"
           IgnoreStandardErrorWarningFormat="true"
           ConsoleToMsBuild="true"
           StandardOutputImportance="low"
@@ -568,7 +584,7 @@
           EnvironmentVariables="@(WasmToolchainEnvVars)" >
       <Output TaskParameter="ConsoleOutput" ItemName="LlvmAotSizeOutput" />
     </Exec>
-    <ItemGroup Condition="'$(_WasmShouldAOT)' == 'true'">
+    <ItemGroup Condition="'$(_WasmShouldAOT)' == 'true' and '$(WasmUseManagedToolchain)' != 'true'">
       <_AOTDataSegmentSize Condition="$([System.String]::Copy('%(LlvmAotSizeOutput.Identity)').StartsWith('DATA '))"
         Include="$([System.String]::Copy('%(LlvmAotSizeOutput.Identity)').Replace(&quot;DATA &quot;, &quot;&quot;).Replace(&quot; 0&quot;, &quot;&quot;).Trim())" />
     </ItemGroup>
@@ -922,8 +938,28 @@
       <_WasmOptPostLinkFileName Condition="'$([System.IO.Path]::IsPathRooted($(_WasmOptPostLinkFileName)))' != 'true'">$([System.IO.Path]::Combine($(_WasmIntermediateOutputPath), $(_WasmOptPostLinkFileName)))</_WasmOptPostLinkFileName>
     </PropertyGroup>
 
-    <Message Text="Running wasm-opt with --enable-simd --enable-exception-handling --enable-reference-types --enable-multivalue --enable-bulk-memory --enable-nontrapping-float-to-int @(WasmOptConfigurationFlags, ' ')" Importance="High" />
-    <Exec Command="wasm-opt$(_ExeExt) --enable-simd --enable-exception-handling --enable-reference-types --enable-multivalue --enable-bulk-memory --enable-nontrapping-float-to-int @(WasmOptConfigurationFlags, ' ') &quot;$(_WasmOptPostLinkFileName)&quot; -o &quot;$(_WasmOptPostLinkFileName)&quot;"
+    <!-- A pass with only feature flags and strip-dwarf runs no optimizations: it just drops DWARF and the name section. -->
+    <ItemGroup>
+      <_WasmOptNonStripFlag Remove="@(_WasmOptNonStripFlag)" />
+      <_WasmOptNonStripFlag Include="@(WasmOptConfigurationFlags)"
+                            Condition="!$([System.String]::Copy('%(WasmOptConfigurationFlags.Identity)').StartsWith('--enable-')) and '%(WasmOptConfigurationFlags.Identity)' != '--strip-dwarf'" />
+      <_WasmOptStripDwarf Remove="@(_WasmOptStripDwarf)" />
+      <_WasmOptStripDwarf Include="@(WasmOptConfigurationFlags)" Condition="'%(WasmOptConfigurationFlags.Identity)' == '--strip-dwarf'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_WasmStripWithManagedToolchain>false</_WasmStripWithManagedToolchain>
+      <_WasmStripWithManagedToolchain Condition="'$(WasmStripWithManagedToolchain)' == 'true' and @(_WasmOptNonStripFlag->Count()) == 0">true</_WasmStripWithManagedToolchain>
+      <_WasmOptStripsDwarf>false</_WasmOptStripsDwarf>
+      <_WasmOptStripsDwarf Condition="@(_WasmOptStripDwarf->Count()) > 0">true</_WasmOptStripsDwarf>
+    </PropertyGroup>
+
+    <WasmStripDebugInfo Condition="'$(_WasmStripWithManagedToolchain)' == 'true'"
+                        InputFile="$(_WasmOptPostLinkFileName)"
+                        StripDwarf="$(_WasmOptStripsDwarf)"
+                        StripNames="true" />
+
+    <Message Condition="'$(_WasmStripWithManagedToolchain)' != 'true'" Text="Running wasm-opt with --enable-simd --enable-exception-handling --enable-reference-types --enable-multivalue --enable-bulk-memory --enable-nontrapping-float-to-int @(WasmOptConfigurationFlags, ' ')" Importance="High" />
+    <Exec Condition="'$(_WasmStripWithManagedToolchain)' != 'true'" Command="wasm-opt$(_ExeExt) --enable-simd --enable-exception-handling --enable-reference-types --enable-multivalue --enable-bulk-memory --enable-nontrapping-float-to-int @(WasmOptConfigurationFlags, ' ') &quot;$(_WasmOptPostLinkFileName)&quot; -o &quot;$(_WasmOptPostLinkFileName)&quot;"
           IgnoreStandardErrorWarningFormat="true"
           EnvironmentVariables="@(WasmToolchainEnvVars)" />
   </Target>
