@@ -8,7 +8,8 @@ namespace Microsoft.NET.WebAssembly.Linker;
 
 /// <summary>
 /// Parses a wasm-ld compatible command line into <see cref="LinkerOptions"/> plus the input and output paths.
-/// Shared by the <c>wasm-link</c> tool and the <c>WasmLink</c> MSBuild task so both accept exactly the same flags.
+/// Used by dotnet/runtime's <c>wasm-link</c> tool and <c>WasmLink</c> task; <c>nesm link</c> uses its response-file
+/// expansion (<see cref="ExpandResponseFiles"/>).
 /// </summary>
 /// <remarks>
 /// Options accept both the <c>--name=value</c> and <c>--name value</c> spellings. Options that wasm-ld accepts but that
@@ -300,22 +301,31 @@ public sealed class WasmLdCommandLine
     {
         List<string> argList = args.ToList();
         bool windowsQuoting = OperatingSystem.IsWindows();
-        foreach (string arg in argList)
+        for (int i = 0; i < argList.Count; i++)
         {
-            if (arg.StartsWith("--rsp-quoting=", StringComparison.Ordinal) || arg.StartsWith("-rsp-quoting=", StringComparison.Ordinal))
+            string arg = argList[i];
+            string? style = arg.StartsWith("--rsp-quoting=", StringComparison.Ordinal) || arg.StartsWith("-rsp-quoting=", StringComparison.Ordinal)
+                ? arg[(arg.IndexOf('=') + 1)..]
+                : arg is "--rsp-quoting" or "-rsp-quoting" && i + 1 < argList.Count ? argList[++i] : null;
+            if (style is not null)
             {
-                windowsQuoting = arg[(arg.IndexOf('=') + 1)..] switch
+                windowsQuoting = style switch
                 {
                     "windows" => true,
                     "posix" => false,
-                    _ => throw new WasmLdArgumentException($"Invalid response file quoting style in '{arg}'."),
+                    _ => throw new WasmLdArgumentException($"Invalid response file quoting style '{style}'."),
                 };
             }
         }
 
-        return Expand(argList, windowsQuoting);
+        var expanded = new List<string>(argList.Count);
+        Expand(argList, windowsQuoting, [], expanded);
+        return expanded;
 
-        static IEnumerable<string> Expand(IEnumerable<string> args, bool windowsQuoting)
+        // `active` holds the response files being expanded, so a file that includes itself, directly or indirectly,
+        // is reported (as LLVM's "recursive expansion") instead of overflowing the stack. A file may still appear
+        // more than once side by side.
+        static void Expand(IEnumerable<string> args, bool windowsQuoting, HashSet<string> active, List<string> expanded)
         {
             foreach (string arg in args)
             {
@@ -324,15 +334,18 @@ public sealed class WasmLdCommandLine
                     string path = arg[1..];
                     if (!File.Exists(path))
                         throw new WasmLdArgumentException($"Response file not found: {path}");
+                    string fullPath = Path.GetFullPath(path);
+                    if (!active.Add(fullPath))
+                        throw new WasmLdArgumentException($"recursive expansion of response file '{path}'.");
 
                     string text = File.ReadAllText(path);
                     List<string> tokens = windowsQuoting ? TokenizeWindowsResponseFile(text) : TokenizeResponseFile(text);
-                    foreach (string expanded in Expand(tokens, windowsQuoting))
-                        yield return expanded;
+                    Expand(tokens, windowsQuoting, active, expanded);
+                    active.Remove(fullPath);
                 }
                 else
                 {
-                    yield return arg;
+                    expanded.Add(arg);
                 }
             }
         }

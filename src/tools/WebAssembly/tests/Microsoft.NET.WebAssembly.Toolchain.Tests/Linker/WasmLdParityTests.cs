@@ -90,7 +90,7 @@ public class WasmLdParityTests
         from facet in Enum.GetValues<Facet>()
         select new object[] { scenario, facet };
 
-    private static string? WasiSdkBin => ToolDirectory("WasiSdkPath", "bin");
+    internal static string? WasiSdkBin => ToolDirectory("WasiSdkPath", "bin");
 
     public static bool IsWasiSdkAvailable => WasiSdkBin is not null;
 
@@ -207,7 +207,7 @@ public class WasmLdParityTests
     private static string Signature(FuncType type) =>
         $"({string.Join(",", type.Parameters)})->({string.Join(",", type.Results)})";
 
-    private static string? ToolDirectory(string key, string? subdirectory)
+    internal static string? ToolDirectory(string key, string? subdirectory)
     {
         if (AppContext.GetData($"Microsoft.NET.WebAssembly.Toolchain.Tests.{key}") is not string root || root.Length == 0)
             return null;
@@ -215,16 +215,17 @@ public class WasmLdParityTests
         return Directory.Exists(dir) ? dir : null;
     }
 
-    private static void Run(string fileName, string[] args)
+    internal static string Run(string fileName, string[] args)
     {
         var startInfo = new ProcessStartInfo(fileName) { RedirectStandardError = true, RedirectStandardOutput = true };
         foreach (string arg in args)
             startInfo.ArgumentList.Add(arg);
 
         using Process process = Process.Start(startInfo)!;
+        System.Threading.Tasks.Task<string> stdout = process.StandardOutput.ReadToEndAsync();
         string stderr = process.StandardError.ReadToEnd();
-        process.StandardOutput.ReadToEnd();
         process.WaitForExit();
         Assert.True(process.ExitCode == 0, $"{Path.GetFileName(fileName)} {string.Join(" ", args)} failed with exit code {process.ExitCode}:{Environment.NewLine}{stderr}");
+        return stdout.Result;
     }
 }

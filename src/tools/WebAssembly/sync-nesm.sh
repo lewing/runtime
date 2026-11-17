@@ -11,7 +11,7 @@
 #                                             import of the commit in nesm-commit.txt and the current sources.
 #
 # runtime-local.patch holds edits made in this repo. Upstream them to nesm when possible so the patch shrinks.
-# Files that exist only here (for example Linker/WasmLd*.cs) are never touched.
+# Files that exist only here are never touched.
 #
 # Tests listed in nesm-test-files.txt (paths under nesm's tests/Nesm.Tests) are synchronized the same way, with
 # runtime-local-tests.patch holding the edits that let them run without nesm's interpreter.

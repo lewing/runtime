@@ -67,12 +67,21 @@ public class WasmLink : Task
     /// <summary>Additional raw wasm-ld arguments, including <c>@response</c> files.</summary>
     public string[] ExtraArguments { get; set; } = [];
 
+    /// <summary>Wrap the linked core module into a component, as wasm-component-ld does.</summary>
+    public bool Component { get; set; }
+
+    /// <summary>Extra <c>component-type</c> (WIT world) payloads (<c>--component-type</c>).</summary>
+    public ITaskItem[] ComponentTypes { get; set; } = [];
+
+    /// <summary>Adapter modules (<c>--adapt</c>); <c>Name</c> metadata overrides the import module name.</summary>
+    public ITaskItem[] ComponentAdapters { get; set; } = [];
+
     public override bool Execute()
     {
-        WasmLdCommandLine commandLine;
+        WasmComponentLdCommandLine commandLine;
         try
         {
-            commandLine = WasmLdCommandLine.Parse(BuildArguments());
+            commandLine = WasmComponentLdCommandLine.Parse(BuildArguments());
         }
         catch (WasmLdArgumentException ex)
         {
@@ -82,12 +91,11 @@ public class WasmLink : Task
 
         try
         {
-            WasmLdDriver.Run(
-                commandLine,
+            commandLine.Run(
                 log: message => Log.LogMessage(MessageImportance.Normal, message),
                 warn: message => Log.LogWarning(message));
         }
-        catch (Exception ex) when (ex is WasmLdArgumentException or LinkerException or WasmFormatException or WasmValidationException or IOException or InvalidDataException)
+        catch (Exception ex) when (ex is WasmLdArgumentException or LinkerException or WasmFormatException or WasmValidationException or IOException or InvalidDataException or NotSupportedException or FormatException)
         {
             Log.LogError($"Linking '{OutputFile}' failed: {ex.Message}");
         }
@@ -126,6 +134,15 @@ public class WasmLink : Task
         AddValue(args, TableBase, "--table-base");
         if (!string.IsNullOrEmpty(StackSize))
             args.Add($"-zstack-size={StackSize}");
+
+        AddFlag(args, Component, "--component");
+        foreach (ITaskItem item in ComponentTypes)
+            args.Add($"--component-type={item.ItemSpec}");
+        foreach (ITaskItem item in ComponentAdapters)
+        {
+            string name = item.GetMetadata("Name");
+            args.Add(string.IsNullOrEmpty(name) ? $"--adapt={item.ItemSpec}" : $"--adapt={name}={item.ItemSpec}");
+        }
 
         args.AddRange(ExtraArguments);
 
