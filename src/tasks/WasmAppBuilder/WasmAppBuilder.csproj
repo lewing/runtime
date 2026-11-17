@@ -35,6 +35,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Microsoft.NET.WebAssembly.Webcil\Microsoft.NET.WebAssembly.Webcil.csproj" />
+    <!-- .NET only: used by ComposeWasiReadyToRun's opt-in managed tools. WasmBuildTasks already packages the
+         assembly into tasks\net alongside this one. -->
+    <ProjectReference Include="$(RepoRoot)src\tools\WebAssembly\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj"
+                      Condition="'$(TargetFrameworkIdentifier)' == '.NETCoreApp'" />
 
     <!-- Reference Microsoft.Build.Tasks.Core directly to avoid bringing in it's package closure.
          This assembly is provided by MSBuild.  -->

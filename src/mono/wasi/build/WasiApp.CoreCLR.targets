@@ -93,6 +93,10 @@
     <!-- Run wasm-opt over the composed module. Off by default so codegen problems surface in crossgen2's
          output instead of being optimized away. -->
     <WasiR2ROptimizeComposite Condition="'$(WasiR2ROptimizeComposite)' == ''">false</WasiR2ROptimizeComposite>
+    <!-- Experimental: compose with the managed WebAssembly toolchain (src/tools/WebAssembly) instead of
+         wasm-tools unbundle/parse and wasm-merge. wasm-tools still validates the final component, and
+         WasiR2ROptimizeComposite still runs wasm-opt. -->
+    <WasiR2RUseManagedTools Condition="'$(WasiR2RUseManagedTools)' == ''">false</WasiR2RUseManagedTools>
   </PropertyGroup>
 
   <Target Name="_WasiCoreCLRValidateReadyToRun"
@@ -543,7 +547,8 @@
                            WasmOptPath="$(BinaryenCacheDir)bin/wasm-opt$(_ExeExt)"
                            ComponentStubs="@(_WasiR2RComponentStub)"
                            StubOutputDirectory="$(_WasiR2RStubDir)"
-                           Optimize="$(WasiR2ROptimizeComposite)">
+                           Optimize="$(WasiR2ROptimizeComposite)"
+                           UseManagedTools="$(WasiR2RUseManagedTools)">
       <Output TaskParameter="FileWrites" ItemName="_WasiR2RCompositionWrites" />
     </ComposeWasiReadyToRun>
     <ItemGroup>

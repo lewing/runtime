@@ -162,6 +162,7 @@
       <GroupBuildCmd Condition="'$(IlcMultiModule)' == 'true'">$(GroupBuildCmd) "/p:IlcMultiModule=true"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(IlcUseServerGc)' == 'false'">$(GroupBuildCmd) "/p:IlcUseServerGc=false"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(IlcUseManagedWasmLinker)' == 'true'">$(GroupBuildCmd) "/p:IlcUseManagedWasmLinker=true"</GroupBuildCmd>
+      <GroupBuildCmd Condition="'$(IlcUseManagedWasmArchiver)' != ''">$(GroupBuildCmd) "/p:IlcUseManagedWasmArchiver=$(IlcUseManagedWasmArchiver)"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(IlcManagedWasmLinkerPath)' != ''">$(GroupBuildCmd) "/p:IlcManagedWasmLinkerPath=$(IlcManagedWasmLinkerPath)"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(BuildNativeAotFrameworkObjects)' == 'true'">$(GroupBuildCmd) "/p:BuildNativeAotFrameworkObjects=true"</GroupBuildCmd>
       <GroupBuildCmd Condition="'$(ContinuousIntegrationBuild)' == 'true'">$(GroupBuildCmd) /p:ContinuousIntegrationBuild=true</GroupBuildCmd>
