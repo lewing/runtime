@@ -17,11 +17,12 @@ namespace Microsoft.NET.WebAssembly.Linker;
 /// </remarks>
 public sealed class WasmLdCommandLine
 {
-    private WasmLdCommandLine(LinkerOptions options, string? outputPath, List<string> inputFiles, List<string> warnings, bool verbose)
+    private WasmLdCommandLine(LinkerOptions options, string? outputPath, List<WasmLdInputFile> inputs, List<string> warnings, bool verbose)
     {
         Options = options;
         OutputPath = outputPath;
-        InputFiles = inputFiles;
+        Inputs = inputs;
+        InputFiles = inputs.ConvertAll(static i => i.Path);
         Warnings = warnings;
         Verbose = verbose;
     }
@@ -34,6 +35,9 @@ public sealed class WasmLdCommandLine
 
     /// <summary>Resolved input files (<c>.o</c>, <c>.wasm</c>, <c>.a</c>) in command-line order, including <c>-l</c> libraries.</summary>
     public IReadOnlyList<string> InputFiles { get; }
+
+    /// <summary><see cref="InputFiles"/> with whether each appeared inside a <c>--whole-archive</c> region.</summary>
+    public IReadOnlyList<WasmLdInputFile> Inputs { get; }
 
     /// <summary>Accepted options that were ignored or only approximated.</summary>
     public IReadOnlyList<string> Warnings { get; }
@@ -65,7 +69,9 @@ public sealed class WasmLdCommandLine
         long? initialMemory = null;
         long? maxMemory = null;
         uint? globalBase = null;
-        bool stackFirst = false;
+        // null selects the linker's default (stack first for object files, as in LLD 22).
+        bool? stackFirst = null;
+        bool wholeArchive = false;
         uint stackSize = 65536;
         bool exportTable = false;
         bool growableTable = false;
@@ -73,7 +79,7 @@ public sealed class WasmLdCommandLine
         uint? tableBase = null;
         var exports = new List<string>();
         var exportIfDefined = new List<string>();
-        var inputs = new List<string>();
+        var inputs = new List<WasmLdInputFile>();
         var libraryPaths = new List<string>();
         var warnings = new List<string>();
 
@@ -86,7 +92,7 @@ public sealed class WasmLdCommandLine
 
             if (arg[0] != '-' || arg == "-")
             {
-                inputs.Add(arg);
+                inputs.Add(new WasmLdInputFile(arg, wholeArchive));
                 continue;
             }
 
@@ -104,7 +110,7 @@ public sealed class WasmLdCommandLine
                         libraryPaths.Add(value);
                         break;
                     case 'l':
-                        inputs.Add(ResolveLibrary(value, libraryPaths));
+                        inputs.Add(new WasmLdInputFile(ResolveLibrary(value, libraryPaths), wholeArchive));
                         break;
                     case 'm':
                         if (value != "wasm32")
@@ -215,6 +221,9 @@ public sealed class WasmLdCommandLine
                 case "--stack-first":
                     stackFirst = true;
                     break;
+                case "--no-stack-first":
+                    stackFirst = false;
+                    break;
                 case "--stack-size":
                     stackSize = ParseUInt32(name, Value());
                     break;
@@ -224,9 +233,11 @@ public sealed class WasmLdCommandLine
                     _ = Value();
                     break;
 
-                // Accepted; this linker always loads every archive member, which is what --whole-archive requests.
                 case "--whole-archive":
+                    wholeArchive = true;
+                    break;
                 case "--no-whole-archive":
+                    wholeArchive = false;
                     break;
 
                 // Accepted but without effect on a final (non-relocatable) link.
@@ -494,6 +505,9 @@ public sealed class WasmLdCommandLine
         return result;
     }
 }
+
+/// <summary>An input file and whether it appeared inside a <c>--whole-archive</c> region.</summary>
+public readonly record struct WasmLdInputFile(string Path, bool WholeArchive);
 
 /// <summary>A wasm-ld command line could not be parsed.</summary>
 public sealed class WasmLdArgumentException : Exception

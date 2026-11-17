@@ -6,6 +6,10 @@ namespace Microsoft.NET.WebAssembly.Types;
 /// <summary>Table type (§2.3.7) — currently only funcref is supported</summary>
 public sealed record TableType(RefType ElementType, Limits Limits)
 {
+    internal string ElementTypeKey { get; init; } = "";
+    public ValueType? ExactElementType { get; init; }
+    public byte[] InitExpr { get; init; } = [];
+
     /// <summary>True for a table64 table (i64 index type).</summary>
     public bool Is64 => Limits.Is64;
 }

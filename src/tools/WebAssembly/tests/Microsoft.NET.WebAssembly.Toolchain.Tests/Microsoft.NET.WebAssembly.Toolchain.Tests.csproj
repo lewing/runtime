@@ -32,6 +32,9 @@
     <EmbeddedResource Include="TestAssets\sorting.wasm" LogicalName="sorting.wasm" />
     <EmbeddedResource Include="TestAssets\dwarf\add_probe_O0.wasm" LogicalName="dwarf/add_probe_O0.wasm" />
     <EmbeddedResource Include="TestAssets\dwarf\add_probe_O1.wasm" LogicalName="dwarf/add_probe_O1.wasm" />
+    <EmbeddedResource Include="TestAssets\dwarf\sq_O0.wasm" LogicalName="dwarf/sq_O0.wasm" />
+    <EmbeddedResource Include="TestAssets\dwarf\sq_O0_dwarf5_noname.wasm" LogicalName="dwarf/sq_O0_dwarf5_noname.wasm" />
+    <EmbeddedResource Include="TestAssets\dwarf\sq_O1_wasmopt.wasm" LogicalName="dwarf/sq_O1_wasmopt.wasm" />
   </ItemGroup>
 
 </Project>

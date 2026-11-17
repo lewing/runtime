@@ -53,6 +53,7 @@ public static class DwarfVariableReader
         var debugStrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_str");
         var debugLineStrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_line_str");
         var debugStrOffsetsSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_str_offsets");
+        var debugAddrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_addr");
 
         // Build address-range → absolute function index mapping
         // DW_AT_low_pc in LLVM wasm DWARF is a code section byte offset
@@ -78,7 +79,8 @@ public static class DwarfVariableReader
             debugLineStrSection?.Content,
             debugStrOffsetsSection?.Content,
             funcIndex,
-            funcRanges);
+            funcRanges,
+            debugAddrSection?.Content);
     }
 
     /// <summary>Core parsing entry point operating on raw section bytes.</summary>
@@ -92,6 +94,7 @@ public static class DwarfVariableReader
     /// Maps DW_AT_low_pc address ranges to absolute function indices.
     /// When null, DW_AT_low_pc is treated directly as a function index (synthetic DWARF).
     /// </param>
+    /// <param name="addrData">Optional .debug_addr section bytes (DWARF 5 <c>DW_FORM_addrx</c>).</param>
     internal static IReadOnlyList<DwarfVariable> ParseVariables(
         byte[] infoData,
         byte[] abbrevData,
@@ -99,7 +102,8 @@ public static class DwarfVariableReader
         byte[]? lineStrData,
         byte[]? strOffsetsData,
         int funcIndex,
-        List<(long startOffset, long endOffset, int absIndex)>? funcRanges = null)
+        List<(long startOffset, long endOffset, int absIndex)>? funcRanges = null,
+        byte[]? addrData = null)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
         int pos = 0;
@@ -112,6 +116,7 @@ public static class DwarfVariableReader
         // is only remembered here and returned after the whole loop confirms that no
         // subprogram range-matched anywhere.
         List<DwarfVariable>? fallbackResult = null;
+        int fallbackCandidates = 0;
 
         while (pos < infoData.Length)
         {
@@ -155,26 +160,10 @@ public static class DwarfVariableReader
                 continue;
             }
 
-            // Parse str_offsets_base for DWARF 5
-            int strOffsetsBase = 0;
-            if (version >= 5 && diePos < cuEnd)
-            {
-                int peekPos = diePos;
-                uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(infoData, ref peekPos);
-                if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
-                    && cuEntry.Tag == 0x11 /* DW_TAG_compile_unit */)
-                {
-                    foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
-                    {
-                        if (attrName == 0x72 /* DW_AT_str_offsets_base */)
-                            strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(infoData, ref peekPos, attrForm, addrSize);
-                        else
-                            DwarfReaderHelpers.SkipFormValue(infoData, ref peekPos, attrForm, addrSize);
-                    }
-                }
-            }
-
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
+            // DWARF 5 per-unit bases: string offsets and indexed (DW_FORM_addrx) addresses.
+            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(infoData, diePos, cuEnd, version, abbrevTable, addrSize);
+            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
+                addrData, addrBase, resolveAddrx: true);
             var dies = DwarfReaderHelpers.ParseDIEs(infoData, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
 
             // Primary pass for this CU. A range-match (or, when funcRanges is null,
@@ -189,18 +178,24 @@ public static class DwarfVariableReader
             // Only remembered (never returned early) so the primary pass can complete
             // across all CUs first. Guarded to low_pc values that lie OUTSIDE every
             // known code range, so a low_pc that numerically collides with a real
-            // function index cannot masquerade as that function.
-            if (funcRanges is not null && fallbackResult is null)
+            // function index cannot masquerade as that function — and only returned when
+            // exactly one subprogram claims the index (see CountIndexFallbackCandidates):
+            // wasm-opt-zeroed DWARF puts every subprogram at 0 (#530).
+            if (funcRanges is not null)
             {
-                var fb = ExtractVariablesForFunction(dies, funcIndex, funcRanges, fallback: true);
-                if (fb is not null)
-                    fallbackResult = fb;
+                fallbackCandidates += CountIndexFallbackCandidates(dies, funcIndex, funcRanges);
+                if (fallbackResult is null)
+                {
+                    var fb = ExtractVariablesForFunction(dies, funcIndex, funcRanges, fallback: true);
+                    if (fb is not null)
+                        fallbackResult = fb;
+                }
             }
 
             pos = cuEnd;
         }
 
-        return fallbackResult ?? [];
+        return fallbackCandidates == 1 ? fallbackResult ?? [] : [];
     }
 
     /// <summary>
@@ -330,6 +325,28 @@ public static class DwarfVariableReader
         return new SubprogramMatch(true, IsFallback: true, codeStart);
     }
 
+    /// <summary>
+    /// How many subprograms in a CU claim <paramref name="funcIndex"/> through the unrelocated
+    /// low_pc-as-index fallback (low_pc == index, outside every code range). The fallback is only
+    /// trusted when exactly ONE subprogram in the whole DWARF does: if several share the value it is
+    /// not an index at all — it is the tombstone wasm-opt leaves when it zeroes every code address
+    /// (#530), and taking the first would attach an arbitrary function's variables to function 0.
+    /// </summary>
+    private static int CountIndexFallbackCandidates(
+        List<DwarfReaderHelpers.DwarfDIE> dies, int funcIndex,
+        List<(long startOffset, long endOffset, int absIndex)> funcRanges)
+    {
+        int count = 0;
+        foreach (var die in dies)
+        {
+            if (die.Tag != DW_TAG_subprogram) continue;
+            if (!die.Attributes.TryGetValue(DW_AT_low_pc, out var lowPcObj) || lowPcObj is not long lowPc) continue;
+            if (SubprogramMatches(lowPc, funcIndex, funcRanges, fallback: true).Matched)
+                count++;
+        }
+        return count;
+    }
+
     // ── Additive: richer variable-location resolution ────────────────────────
     // The legacy ReadVariables path only surfaces variables whose DW_AT_location
     // is an inline DW_OP_WASM_location(Local) expression (register-allocated wasm
@@ -420,6 +437,7 @@ public static class DwarfVariableReader
         // uses .debug_loclists instead — not yet implemented; such references fall
         // through to Unknown, matching pre-change behavior.
         var debugLocSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_loc");
+        var debugAddrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_addr");
 
         int importedFuncCount = module.Imports.Count(i => i.Descriptor is Microsoft.NET.WebAssembly.Module.ImportDescriptor.Func);
         var funcRanges = new List<(long startOffset, long endOffset, int absIndex)>();
@@ -443,14 +461,15 @@ public static class DwarfVariableReader
             funcIndex,
             funcRanges,
             debugLocSection?.Content,
-            queryCodeOffset);
+            queryCodeOffset,
+            debugAddrSection?.Content);
     }
 
     internal static DwarfFunctionVariables ParseVariableInfos(
         byte[] infoData, byte[] abbrevData,
         byte[]? strData, byte[]? lineStrData, byte[]? strOffsetsData,
         int funcIndex, List<(long startOffset, long endOffset, int absIndex)>? funcRanges = null,
-        byte[]? locData = null, long? queryCodeOffset = null)
+        byte[]? locData = null, long? queryCodeOffset = null, byte[]? addrData = null)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
         int pos = 0;
@@ -460,6 +479,7 @@ public static class DwarfVariableReader
         // the low_pc-as-index fallback is only accepted after a complete primary pass
         // over every CU confirms no range match anywhere.
         DwarfFunctionVariables? fallbackResult = null;
+        int fallbackCandidates = 0;
 
         while (pos < infoData.Length)
         {
@@ -501,25 +521,10 @@ public static class DwarfVariableReader
                 continue;
             }
 
-            int strOffsetsBase = 0;
-            if (version >= 5 && diePos < cuEnd)
-            {
-                int peekPos = diePos;
-                uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(infoData, ref peekPos);
-                if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
-                    && cuEntry.Tag == 0x11)
-                {
-                    foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
-                    {
-                        if (attrName == 0x72)
-                            strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(infoData, ref peekPos, attrForm, addrSize);
-                        else
-                            DwarfReaderHelpers.SkipFormValue(infoData, ref peekPos, attrForm, addrSize);
-                    }
-                }
-            }
-
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
+            // DWARF 5 per-unit bases: string offsets and indexed (DW_FORM_addrx) addresses.
+            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(infoData, diePos, cuEnd, version, abbrevTable, addrSize);
+            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
+                addrData, addrBase, resolveAddrx: true);
             var dies = DwarfReaderHelpers.ParseDIEs(infoData, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
 
             // Default base address for this CU's location lists: the compile_unit's
@@ -539,18 +544,24 @@ public static class DwarfVariableReader
             if (primary is not null)
                 return primary;
 
-            if (funcRanges is not null && fallbackResult is null)
+            if (funcRanges is not null)
             {
-                var fb = ExtractVariableInfosForFunction(
-                    dies, funcIndex, funcRanges, addrSize, fallback: true, locData, cuBaseLowPc, queryCodeOffset);
-                if (fb is not null)
-                    fallbackResult = fb;
+                fallbackCandidates += CountIndexFallbackCandidates(dies, funcIndex, funcRanges);
+                if (fallbackResult is null)
+                {
+                    var fb = ExtractVariableInfosForFunction(
+                        dies, funcIndex, funcRanges, addrSize, fallback: true, locData, cuBaseLowPc, queryCodeOffset);
+                    if (fb is not null)
+                        fallbackResult = fb;
+                }
             }
 
             pos = cuEnd;
         }
 
-        return fallbackResult ?? new DwarfFunctionVariables(-1, []);
+        return fallbackCandidates == 1 && fallbackResult is not null
+            ? fallbackResult
+            : new DwarfFunctionVariables(-1, []);
     }
 
     private static DwarfFunctionVariables? ExtractVariableInfosForFunction(

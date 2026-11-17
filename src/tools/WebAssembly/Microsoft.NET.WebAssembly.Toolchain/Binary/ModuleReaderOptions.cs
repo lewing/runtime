@@ -18,8 +18,23 @@ public sealed class ModuleReaderOptions
     public WasmFeatures Features { get; init; } = WasmFeatures.Default;
 
     /// <summary>
+    /// Controls handling of recognized custom metadata. Tolerant mode preserves the raw custom
+    /// section and records diagnostics without rejecting the core module. Strict mode throws a
+    /// <see cref="WasmMetadataException"/> for the first metadata error.
+    /// </summary>
+    public WasmMetadataValidationMode MetadataValidation { get; init; } =
+        WasmMetadataValidationMode.Tolerant;
+
+    /// <summary>
     /// Capacity of the bounded channel used by the streaming read path.
     /// Defaults to 16.
     /// </summary>
     public int FunctionBodyChannelCapacity { get; init; } = 16;
+}
+
+/// <summary>Controls whether recognized custom metadata errors are fatal.</summary>
+public enum WasmMetadataValidationMode
+{
+    Tolerant,
+    Strict,
 }

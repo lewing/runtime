@@ -3,6 +3,7 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
 
+using Microsoft.DotNet.XUnitExtensions;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Linker;
@@ -278,7 +279,7 @@ public class DebugAndNameSectionTests
             ],
             LinkingSection = linking,
             RelocationSections = [reloc],
-            CustomSections = [new CustomSection(".debug_info", debugBytes)],
+            CustomSections = { new CustomSection(".debug_info", debugBytes) },
         };
         module.CustomSections.Clear();
         module.CustomSections.Add(new CustomSection(".debug_info", debugBytes));
@@ -298,7 +299,7 @@ public class DebugAndNameSectionTests
 
     // ── libSystem.Native.a integration test ─────────────────────────────────────
 
-    [Fact]
+    [ConditionalFact]
     [Trait("Category", "Integration")]
     public void Link_LibSystemNative_ProducesDebugAndNameSections()
     {
@@ -310,8 +311,9 @@ public class DebugAndNameSectionTests
 
         if (!System.IO.File.Exists(libPath))
         {
-            // Skip if the runtime pack is not installed on this machine.
-            return;
+            throw new SkipTestException(
+                $"Mono browser-wasm runtime fixture is missing at {libPath}; "
+                + "install Microsoft.NETCore.App.Runtime.Mono.browser-wasm 10.0.5.");
         }
 
         using var archiveStream = System.IO.File.OpenRead(libPath);

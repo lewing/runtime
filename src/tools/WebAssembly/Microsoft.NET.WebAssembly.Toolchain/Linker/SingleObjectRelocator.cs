@@ -74,10 +74,13 @@ public static class SingleObjectRelocator
             var (payloadStart, payloadLength) = sectionPayloads[(int)sectionIdx];
             var span = outputBytes.AsSpan((int)payloadStart, (int)payloadLength);
 
+            Func<uint, uint>? siteAddress = relocSection.Name == "reloc.DATA"
+                ? offset => DataSiteAddress(module, segmentBases, offset)
+                : null;
             foreach (var reloc in relocSection.Entries)
             {
                 verboseLog?.Invoke(FormatRelocLog(reloc, symbols));
-                RelocationEngine.ApplyRelocation(span, reloc, indexMap, symbols, segmentBases);
+                RelocationEngine.ApplyRelocation(span, reloc, indexMap, symbols, segmentBases, siteAddress);
             }
         }
 
@@ -175,6 +178,20 @@ public static class SingleObjectRelocator
         }
 
         return bases;
+    }
+
+    /// <summary>Linear-memory address of the byte at <paramref name="offset"/> in the data section payload.</summary>
+    private static uint DataSiteAddress(WasmModule module, Dictionary<uint, uint> segmentBases, uint offset)
+    {
+        for (int i = 0; i < module.DataSegments.Count; i++)
+        {
+            var segment = module.DataSegments[i];
+            uint start = segment.SectionPayloadOffset;
+            if (offset >= start && offset < start + (uint)segment.InitData.Length && segmentBases.TryGetValue((uint)i, out uint baseAddress))
+                return baseAddress + (offset - start);
+        }
+
+        throw new InvalidOperationException($"Data relocation offset {offset} is not inside an active data segment.");
     }
 
     private static uint GetSegmentAlignment(WasmModule module, int segmentIndex)

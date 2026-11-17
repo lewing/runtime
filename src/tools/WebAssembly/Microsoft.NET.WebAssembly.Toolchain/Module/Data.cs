@@ -22,4 +22,10 @@ public sealed class Data
     /// Used by the coalescer to keep ro and rw segments in separate output groups.
     /// </summary>
     public bool IsReadOnly { get; init; }
+
+    /// <summary>
+    /// Byte offset of <see cref="InitData"/>[0] within the data section payload when read from a binary.
+    /// <c>reloc.DATA</c> offsets in relocatable objects are relative to the same payload.
+    /// </summary>
+    internal uint SectionPayloadOffset { get; init; }
 }

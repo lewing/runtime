@@ -3,11 +3,13 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
 
+using System.Reflection;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Linker;
 using Microsoft.NET.WebAssembly.Module;
+using Microsoft.NET.WebAssembly.Validation;
 
 /// <summary>
 /// Tests for <see cref="SingleObjectRelocator"/> — single-object self-resolution of
@@ -246,10 +248,44 @@ public class SingleObjectRelocatorTests
     // ── Tests ────────────────────────────────────────────────────────────────────
 
     [Fact]
+    public void ParseModuleForAnalysis_AllowsTransformAndEmitButRuntimeLoadStillRejectsIt()
+    {
+        byte[] objBytes = BuildRelocatableObject();
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+
+        Assert.NotNull(typeof(ModuleReader).GetMethod(
+            nameof(ModuleReader.ParseModuleForAnalysis),
+            BindingFlags.Public | BindingFlags.Static));
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
+
+        Assert.NotNull(module.LinkingSection);
+
+        var data = module.DataSegments[0];
+        module.DataSegments[0] = new Data
+        {
+            IsPassive = data.IsPassive,
+            MemoryIndex = data.MemoryIndex,
+            OffsetExpr = data.OffsetExpr,
+            InitData = [.. data.InitData, 0xFF],
+            IsReadOnly = data.IsReadOnly,
+        };
+        byte[] transformedBytes = new SectionMerger().EmitBinary(module);
+        Assert.NotEmpty(transformedBytes);
+
+        using var loadStream = new MemoryStream(transformedBytes, writable: false);
+        var loadException = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(loadStream));
+        Assert.Contains(
+            loadException.Diagnostics,
+            static diagnostic => diagnostic.Code == WasmValidationCode.FunctionBodyTypeMismatch);
+    }
+
+    [Fact]
     public void Relocate_GlobalIndexLeb_PatchesCorrectlyAndPreservesFiveByteWidth()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         // globalBase=0, tableBase=0 → global[0] → index 0 (identity, padded LEB stays 0x80 0x80 0x80 0x80 0x00)
         byte[] result = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 0);
@@ -273,7 +309,8 @@ public class SingleObjectRelocatorTests
     public void Relocate_MemoryAddrLeb_ResolvesToGlobalBasePlusOffset()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         const uint globalBase = 1024;
         byte[] result = SingleObjectRelocator.Relocate(objBytes, module, globalBase: globalBase);
@@ -299,7 +336,8 @@ public class SingleObjectRelocatorTests
     public void Relocate_Deterministic_IdenticalInputProducesIdenticalOutput()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         byte[] result1 = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 512);
         byte[] result2 = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 512);
@@ -311,7 +349,8 @@ public class SingleObjectRelocatorTests
     public void Relocate_DifferentGlobalBases_ProduceDifferentAddressValues()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         byte[] result1024 = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 1024);
         byte[] result2048 = SingleObjectRelocator.Relocate(objBytes, module, globalBase: 2048);
@@ -329,7 +368,8 @@ public class SingleObjectRelocatorTests
             Section(3, [0x01, 0x00]),                 // function: type 0
             Section(10, [0x01, 0x02, 0x00, 0x0B])    // code: count=1, body=2, locals=0, end
         );
-        var module = ModuleReader.ReadModule(new MemoryStream(plainModuleBytes));
+        using var objectStream = new MemoryStream(plainModuleBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         var ex = Assert.Throws<InvalidOperationException>(
             () => SingleObjectRelocator.Relocate(plainModuleBytes, module));
@@ -354,7 +394,8 @@ public class SingleObjectRelocatorTests
             Section(10, [0x01, 0x02, 0x00, 0x0B]),
             CustomSection("linking", linkingPayload)
         );
-        var module = ModuleReader.ReadModule(new MemoryStream(noRelocBytes));
+        using var objectStream = new MemoryStream(noRelocBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         byte[] result = SingleObjectRelocator.Relocate(noRelocBytes, module);
 
@@ -383,7 +424,8 @@ public class SingleObjectRelocatorTests
     public void BuildIdentityIndexMap_AllIndicesMapToThemselves()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
         var sectionPayloads = SingleObjectRelocator.ScanSectionPayloads(objBytes);
 
         var map = SingleObjectRelocator.BuildIdentityIndexMap(module, sectionPayloads);
@@ -405,7 +447,8 @@ public class SingleObjectRelocatorTests
     public void ComputeSegmentBases_GlobalBase_SegmentPlacedAtGlobalBase()
     {
         byte[] objBytes = BuildRelocatableObject();
-        var module = ModuleReader.ReadModule(new MemoryStream(objBytes));
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
 
         var bases = SingleObjectRelocator.ComputeSegmentBases(module, globalBase: 512);
 

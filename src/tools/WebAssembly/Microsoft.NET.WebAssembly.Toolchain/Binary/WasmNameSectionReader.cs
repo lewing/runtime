@@ -7,7 +7,7 @@ using Microsoft.NET.WebAssembly.Module;
 namespace Microsoft.NET.WebAssembly.Binary;
 
 /// <summary>
-/// Parses the wasm <c>name</c> custom section into a function-index → name dictionary.
+/// Parses function and local names from the wasm <c>name</c> custom section.
 /// Spec: https://webassembly.github.io/spec/core/appendix/custom.html#binary-namesec
 /// </summary>
 /// <remarks>
@@ -17,56 +17,192 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// </remarks>
 internal static class WasmNameSectionReader
 {
+    private static readonly UTF8Encoding StrictUtf8 =
+        new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     /// <summary>
     /// Returns a dictionary of absolute function index → name from the module's
     /// <c>name</c> custom section (subsection id = 1, function names).
     /// Returns an empty dictionary when the section is absent or contains no
     /// function-name subsection (stripped module).
     /// </summary>
-    public static Dictionary<int, string> ParseFunctionNames(WasmModule module)
-    {
-        var result = new Dictionary<int, string>();
-        var nameSection = module.CustomSections.FirstOrDefault(cs => cs.Name == "name");
-        if (nameSection is null) return result;
+    public static Dictionary<int, string> ParseFunctionNames(WasmModule module) =>
+        ParseNames(module).FunctionNames;
 
-        var data = nameSection.Content;
+    /// <summary>
+    /// Returns an indirect name map of absolute function index → local index → name
+    /// from the module's <c>name</c> custom section (subsection id = 2, local names).
+    /// Parameters and locals occupy the same local-index space. Returns an empty
+    /// dictionary when the section or subsection is absent.
+    /// </summary>
+    public static Dictionary<int, Dictionary<int, string>> ParseLocalNames(WasmModule module) =>
+        ParseNames(module).LocalNames;
+
+    /// <summary>
+    /// Everything the shared symbol layer needs from one <c>name</c> section: the module name
+    /// (subsection 0), function names in section order (subsection 1), local names (subsection 2)
+    /// and, when the data is malformed, where parsing stopped. Parsing is strict (names must be
+    /// valid UTF-8) and never throws: whatever was read before a malformation is kept.
+    /// </summary>
+    internal sealed record NameSectionContents(
+        bool Present,
+        string? ModuleName,
+        bool HasFunctionNamesSubsection,
+        IReadOnlyList<(int Index, string Name)> FunctionNameList,
+        Dictionary<int, string> FunctionNames,
+        Dictionary<int, Dictionary<int, string>> LocalNames,
+        string? Malformation);
+
+    /// <summary>Parses the module's first <c>name</c> custom section (see <see cref="NameSectionContents"/>).</summary>
+    public static NameSectionContents Read(WasmModule module)
+    {
+        var nameSection = module.CustomSections.FirstOrDefault(cs => cs.Name == "name");
+        return nameSection is null
+            ? new NameSectionContents(false, null, false, [], [], [], null)
+            : Read(nameSection.Content);
+    }
+
+    /// <summary>Parses raw <c>name</c> custom-section content.</summary>
+    public static NameSectionContents Read(byte[] data)
+    {
+        var functionNames = new Dictionary<int, string>();
+        var functionNameList = new List<(int, string)>();
+        var localNames = new Dictionary<int, Dictionary<int, string>>();
+        string? moduleName = null;
+        bool hasFunctionNames = false;
+        string? malformation = null;
+
         int pos = 0;
         while (pos < data.Length)
         {
+            int subStart = pos;
             byte subId = data[pos++];
-            uint subLen = ReadULEB128(data, ref pos);
-            int subEnd = pos + (int)subLen;
-            if (subEnd > data.Length) break;
-
-            if (subId == 1) // function-names subsection
+            if (!TryReadULEB128(data, ref pos, data.Length, out uint subLen)
+                || subLen > data.Length - pos)
             {
-                uint count = ReadULEB128(data, ref pos);
-                for (uint i = 0; i < count && pos < subEnd; i++)
+                malformation ??= $"subsection {subId} at offset {subStart} has a truncated or oversized length";
+                break;
+            }
+
+            int subEnd = pos + (int)subLen;
+            if (subId == 0)
+            {
+                if (TryReadName(data, ref pos, subEnd, out string? name))
+                    moduleName = name;
+                else
+                    malformation ??= $"module-name subsection at offset {subStart} is malformed";
+            }
+            else if (subId == 1)
+            {
+                hasFunctionNames = true;
+                if (!TryReadULEB128(data, ref pos, subEnd, out uint count))
                 {
-                    uint funcIndex = ReadULEB128(data, ref pos);
-                    uint nameLen = ReadULEB128(data, ref pos);
-                    if (pos + (int)nameLen <= subEnd)
-                        result[(int)funcIndex] = Encoding.UTF8.GetString(data, pos, (int)nameLen);
-                    pos += (int)nameLen;
+                    malformation ??= $"function-names subsection at offset {subStart} has a malformed count";
+                }
+                else
+                {
+                    for (uint i = 0; i < count; i++)
+                    {
+                        int entryStart = pos;
+                        if (!TryReadULEB128(data, ref pos, subEnd, out uint funcIndex)
+                            || !TryReadName(data, ref pos, subEnd, out string? name))
+                        {
+                            malformation ??= $"function-names entry {i} of {count} at offset {entryStart} is malformed";
+                            break;
+                        }
+
+                        if (funcIndex <= int.MaxValue)
+                        {
+                            functionNames[(int)funcIndex] = name;
+                            functionNameList.Add(((int)funcIndex, name));
+                        }
+                    }
+                }
+            }
+            else if (subId == 2)
+            {
+                if (!TryReadULEB128(data, ref pos, subEnd, out uint functionCount))
+                {
+                    pos = subEnd;
+                    continue;
+                }
+
+                for (uint i = 0; i < functionCount && pos < subEnd; i++)
+                {
+                    if (!TryReadULEB128(data, ref pos, subEnd, out uint funcIndex)
+                        || !TryReadULEB128(data, ref pos, subEnd, out uint localCount))
+                        break;
+
+                    var locals = new Dictionary<int, string>();
+                    bool complete = true;
+                    for (uint j = 0; j < localCount; j++)
+                    {
+                        if (!TryReadULEB128(data, ref pos, subEnd, out uint localIndex)
+                            || !TryReadName(data, ref pos, subEnd, out string? name))
+                        {
+                            complete = false;
+                            break;
+                        }
+
+                        if (localIndex <= int.MaxValue)
+                            locals[(int)localIndex] = name;
+                    }
+
+                    if (!complete) break;
+                    if (funcIndex <= int.MaxValue)
+                        localNames[(int)funcIndex] = locals;
                 }
             }
 
             pos = subEnd; // skip to next subsection regardless of id
         }
-        return result;
+        return new NameSectionContents(true, moduleName, hasFunctionNames, functionNameList,
+            functionNames, localNames, malformation);
     }
 
-    private static uint ReadULEB128(byte[] data, ref int pos)
+    private static (
+        Dictionary<int, string> FunctionNames,
+        Dictionary<int, Dictionary<int, string>> LocalNames) ParseNames(WasmModule module)
     {
-        uint result = 0;
+        var contents = Read(module);
+        return (contents.FunctionNames, contents.LocalNames);
+    }
+
+    private static bool TryReadName(
+        byte[] data,
+        ref int pos,
+        int end,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? name)
+    {
+        name = null;
+        if (!TryReadULEB128(data, ref pos, end, out uint nameLen)
+            || nameLen > end - pos)
+            return false;
+
+        try
+        {
+            name = StrictUtf8.GetString(data, pos, (int)nameLen);
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+        pos += (int)nameLen;
+        return true;
+    }
+
+    private static bool TryReadULEB128(byte[] data, ref int pos, int end, out uint value)
+    {
+        value = 0;
         int shift = 0;
-        while (pos < data.Length)
+        while (pos < end && shift < 35)
         {
             byte b = data[pos++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
+            value |= (uint)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                return shift < 32 || (b & 0x70) == 0;
             shift += 7;
         }
-        return result;
+        return false;
     }
 }

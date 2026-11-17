@@ -43,12 +43,22 @@ public sealed class RelocSymbolTable
 
 public static class RelocationEngine
 {
+    /// <param name="sectionBytes">Payload of the section the relocations target.</param>
+    /// <param name="relocations">Relocations whose offsets are relative to <paramref name="sectionBytes"/>.</param>
+    /// <param name="indexMap">Maps object-local indices to output indices.</param>
+    /// <param name="symbols">The object's symbol table.</param>
+    /// <param name="segmentBaseAddresses">Linear-memory address of each data segment.</param>
+    /// <param name="siteAddress">
+    /// Maps a section offset to the linear-memory address of those bytes. Required only for
+    /// <c>R_WASM_MEMORY_ADDR_LOCREL_I32</c>, which is relative to its own location.
+    /// </param>
     public static void ApplyRelocations(
         byte[] sectionBytes,
         IReadOnlyList<Relocation> relocations,
         IndexMap indexMap,
         RelocSymbolTable symbols,
-        IReadOnlyDictionary<uint, uint> segmentBaseAddresses)
+        IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
+        Func<uint, uint>? siteAddress = null)
     {
         ArgumentNullException.ThrowIfNull(sectionBytes);
         ArgumentNullException.ThrowIfNull(relocations);
@@ -60,7 +70,7 @@ public static class RelocationEngine
 
         foreach (var reloc in relocations)
         {
-            uint resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses);
+            ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress);
             PatchAt(buffer, checked((int)reloc.Offset), reloc.Type, resolvedValue);
         }
     }
@@ -75,9 +85,10 @@ public static class RelocationEngine
         Relocation reloc,
         IndexMap indexMap,
         RelocSymbolTable symbols,
-        IReadOnlyDictionary<uint, uint> segmentBaseAddresses)
+        IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
+        Func<uint, uint>? siteAddress = null)
     {
-        uint resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses);
+        ulong resolvedValue = ResolveRelocation(reloc, indexMap, symbols, segmentBaseAddresses, siteAddress);
         PatchAt(sectionBytes, checked((int)reloc.Offset), reloc.Type, resolvedValue);
     }
 
@@ -134,20 +145,27 @@ public static class RelocationEngine
         buf[offset + 4] = (byte)(value & 0x7F);
     }
 
-    private static uint ResolveRelocation(
+    private static ulong ResolveRelocation(
         Relocation reloc,
         IndexMap indexMap,
         RelocSymbolTable symbols,
-        IReadOnlyDictionary<uint, uint> segmentBaseAddresses) => reloc.Type switch
+        IReadOnlyDictionary<uint, uint> segmentBaseAddresses,
+        Func<uint, uint>? siteAddress) => reloc.Type switch
         {
             RelocationType.R_WASM_FUNCTION_INDEX_LEB or RelocationType.R_WASM_FUNCTION_INDEX_I32
                 => ResolveMappedSymbolIndex(reloc.Index, indexMap.Functions, symbols, SymbolType.Function, "function"),
 
-            RelocationType.R_WASM_TABLE_INDEX_SLEB or RelocationType.R_WASM_TABLE_INDEX_I32
+            RelocationType.R_WASM_TABLE_INDEX_SLEB or RelocationType.R_WASM_TABLE_INDEX_I32 or RelocationType.R_WASM_TABLE_INDEX_I64
                 => ResolveTableIndex(reloc.Index, indexMap.Tables, symbols),
 
+            // In a non-PIC link __memory_base is 0, so the base-relative form is the absolute address.
             RelocationType.R_WASM_MEMORY_ADDR_LEB or RelocationType.R_WASM_MEMORY_ADDR_SLEB or RelocationType.R_WASM_MEMORY_ADDR_I32
+                or RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or RelocationType.R_WASM_MEMORY_ADDR_I64
                 => ResolveMemoryAddress(reloc, symbols, segmentBaseAddresses),
+
+            RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32
+                => unchecked(ResolveMemoryAddress(reloc, symbols, segmentBaseAddresses) - (siteAddress ?? throw new InvalidOperationException(
+                    "R_WASM_MEMORY_ADDR_LOCREL_I32 is relative to its own address; a site-address mapping is required."))(reloc.Offset)),
 
             RelocationType.R_WASM_TYPE_INDEX_LEB
                 => ResolveMappedIndex(reloc.Index, indexMap.Types, "type"),
@@ -167,8 +185,18 @@ public static class RelocationEngine
             _ => throw new NotSupportedException($"Relocation type '{reloc.Type}' is not yet supported by the relocation engine."),
         };
 
-    private static void PatchAt(Span<byte> sectionBytes, int offset, RelocationType type, uint resolvedValue)
+    private static void PatchAt(Span<byte> sectionBytes, int offset, RelocationType type, ulong resolvedValue)
     {
+        switch (type)
+        {
+            case RelocationType.R_WASM_TABLE_INDEX_I64:
+            case RelocationType.R_WASM_MEMORY_ADDR_I64:
+                EnsureWritable(sectionBytes, offset, sizeof(ulong));
+                BinaryPrimitives.WriteUInt64LittleEndian(sectionBytes[offset..(offset + sizeof(ulong))], resolvedValue);
+                return;
+        }
+
+        uint value32 = unchecked((uint)resolvedValue);
         switch (type)
         {
             case RelocationType.R_WASM_FUNCTION_INDEX_LEB:
@@ -176,12 +204,13 @@ public static class RelocationEngine
             case RelocationType.R_WASM_TYPE_INDEX_LEB:
             case RelocationType.R_WASM_GLOBAL_INDEX_LEB:
             case RelocationType.R_WASM_TAG_INDEX_LEB:
-                WritePaddedLeb128U32(sectionBytes, offset, resolvedValue);
+                WritePaddedLeb128U32(sectionBytes, offset, value32);
                 break;
 
             case RelocationType.R_WASM_TABLE_INDEX_SLEB:
             case RelocationType.R_WASM_MEMORY_ADDR_SLEB:
-                WritePaddedLeb128S32(sectionBytes, offset, unchecked((int)resolvedValue));
+            case RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB:
+                WritePaddedLeb128S32(sectionBytes, offset, unchecked((int)value32));
                 break;
 
             case RelocationType.R_WASM_TABLE_INDEX_I32:
@@ -190,8 +219,9 @@ public static class RelocationEngine
             case RelocationType.R_WASM_FUNCTION_OFFSET_I32:
             case RelocationType.R_WASM_SECTION_OFFSET_I32:
             case RelocationType.R_WASM_FUNCTION_INDEX_I32:
+            case RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32:
                 EnsureWritable(sectionBytes, offset, sizeof(uint));
-                BinaryPrimitives.WriteUInt32LittleEndian(sectionBytes[offset..(offset + sizeof(uint))], resolvedValue);
+                BinaryPrimitives.WriteUInt32LittleEndian(sectionBytes[offset..(offset + sizeof(uint))], value32);
                 break;
 
             default:
@@ -319,11 +349,14 @@ public static class RelocationEngine
 
             case RelocationType.R_WASM_TABLE_INDEX_SLEB:
             case RelocationType.R_WASM_TABLE_INDEX_I32:
+            case RelocationType.R_WASM_TABLE_INDEX_I64:
                 return TryResolveTableIndex(reloc.Index, indexMap.Tables, symbols, out result);
 
             case RelocationType.R_WASM_MEMORY_ADDR_LEB:
             case RelocationType.R_WASM_MEMORY_ADDR_SLEB:
             case RelocationType.R_WASM_MEMORY_ADDR_I32:
+            case RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB:
+            case RelocationType.R_WASM_MEMORY_ADDR_I64:
                 return TryResolveMemoryAddress(reloc, symbols, segmentBaseAddresses, out result);
 
             case RelocationType.R_WASM_TYPE_INDEX_LEB:

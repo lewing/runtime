@@ -4,16 +4,18 @@
 namespace Microsoft.NET.WebAssembly.Wat;
 
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 
 /// <summary>
 /// Emits a valid WebAssembly binary module from a resolved WAT AST.
-/// Section order: type(1), import(2), function(3), table(4), memory(5), global(6), export(7), element(9), code(10), data(11).
+/// Section order: type(1), import(2), function(3), table(4), memory(5), global(6), export(7), start(8), element(9), code(10), data(11).
 /// </summary>
 public sealed class WasmEncoder
 {
     private readonly ResolvedModule _module;
     private List<DwarfLineEntry>? _debugLineEntries;
+    private List<(uint Offset, BranchHintKind Kind)>? _currentBranchHints;
     private string _sourceFile = "<wat>";
 
     public WasmEncoder(ResolvedModule module)
@@ -71,13 +73,28 @@ public sealed class WasmEncoder
         if (_module.Exports.Count > 0)
             WriteSection(output, 7, WriteExportSection);
 
+        // Section 8: Start
+        if (_module.StartFunction.HasValue)
+            WriteSection(output, 8, s => WriteU32Leb(s, (uint)_module.StartFunction.Value));
+
         // Section 9: Element
         if (_module.Elements.Count > 0)
             WriteSection(output, 9, WriteElementSection);
 
-        // Section 10: Code
+        // Branch metadata is canonically emitted immediately before code. Function bodies are
+        // encoded once into temporary buffers so metadata offsets describe the exact bytes written.
         if (_module.Funcs.Count > 0)
-            WriteSection(output, 10, WriteCodeSection);
+        {
+            IReadOnlyList<EncodedWatFunction> encodedFunctions = EncodeFunctionBodies();
+            if (encodedFunctions.Any(static function => function.BranchHints.Count != 0))
+            {
+                WriteCustomSection(
+                    output,
+                    BranchHintMetadataReader.SectionName,
+                    BuildBranchHintSection(encodedFunctions));
+            }
+            WriteSection(output, 10, s => WriteCodeSection(s, encodedFunctions));
+        }
 
         // Section 11: Data
         if (_module.DataSegments.Count > 0)
@@ -90,7 +107,87 @@ public sealed class WasmEncoder
             WriteCustomSection(output, ".debug_line", debugBytes);
         }
 
+        // Custom section: "name" — emitted when any $id or @name is present
+        var nameSection = BuildNameSection();
+        if (nameSection.Length > 0)
+            WriteCustomSection(output, "name", nameSection);
+
         _debugLineEntries = null;
+    }
+
+    /// <summary>
+    /// Builds the "name" custom section content (subsections 0/1/2/4 in ascending order).
+    /// Returns an empty array if there are no names to emit — no-name modules encode identically to before.
+    /// </summary>
+    private byte[] BuildNameSection()
+    {
+        var ms = new MemoryStream();
+
+        // Subsection 0: module name
+        if (_module.ModuleName is { } moduleName)
+        {
+            var sub = new MemoryStream();
+            WriteName(sub, moduleName);
+            ms.WriteByte(0);
+            WriteU32Leb(ms, (uint)sub.Length);
+            sub.WriteTo(ms);
+        }
+
+        // Subsection 1: function names namemap
+        if (_module.FuncNameMap.Count > 0)
+        {
+            var sub = new MemoryStream();
+            var sorted = _module.FuncNameMap.OrderBy(kv => kv.Key).ToList();
+            WriteU32Leb(sub, (uint)sorted.Count);
+            foreach (var (idx, name) in sorted)
+            {
+                WriteU32Leb(sub, (uint)idx);
+                WriteName(sub, name);
+            }
+            ms.WriteByte(1);
+            WriteU32Leb(ms, (uint)sub.Length);
+            sub.WriteTo(ms);
+        }
+
+        // Subsection 2: local names indirect-namemap
+        if (_module.LocalNameMap.Count > 0)
+        {
+            var sub = new MemoryStream();
+            var sortedFuncs = _module.LocalNameMap.OrderBy(kv => kv.Key).ToList();
+            WriteU32Leb(sub, (uint)sortedFuncs.Count);
+            foreach (var (funcIdx, localMap) in sortedFuncs)
+            {
+                WriteU32Leb(sub, (uint)funcIdx);
+                var sortedLocals = localMap.OrderBy(kv => kv.Key).ToList();
+                WriteU32Leb(sub, (uint)sortedLocals.Count);
+                foreach (var (localIdx, name) in sortedLocals)
+                {
+                    WriteU32Leb(sub, (uint)localIdx);
+                    WriteName(sub, name);
+                }
+            }
+            ms.WriteByte(2);
+            WriteU32Leb(ms, (uint)sub.Length);
+            sub.WriteTo(ms);
+        }
+
+        // Subsection 4: type names.
+        if (_module.TypeNameMap.Count > 0)
+        {
+            var sub = new MemoryStream();
+            var sorted = _module.TypeNameMap.OrderBy(kv => kv.Key).ToList();
+            WriteU32Leb(sub, (uint)sorted.Count);
+            foreach (var (idx, name) in sorted)
+            {
+                WriteU32Leb(sub, (uint)idx);
+                WriteName(sub, name);
+            }
+            ms.WriteByte(4);
+            WriteU32Leb(ms, (uint)sub.Length);
+            sub.WriteTo(ms);
+        }
+
+        return ms.ToArray();
     }
 
     private static void WriteCustomSection(Stream output, string name, byte[] content)
@@ -151,6 +248,11 @@ public sealed class WasmEncoder
             {
                 WriteU32Leb(s, (uint)imp.TypeIndex);
             }
+            else if (imp.Kind == ImportKind.Table)
+            {
+                WriteReferenceType(s, imp.TableElementType);
+                WriteLimits(s, imp.TableMin, imp.TableMax);
+            }
             else if (imp.Kind == ImportKind.Memory)
             {
                 if (imp.MemMax.HasValue)
@@ -185,24 +287,72 @@ public sealed class WasmEncoder
             WriteU32Leb(s, (uint)f.TypeIndex);
     }
 
+    /// <summary>
+    /// Writes the table section, using the extended encoding <c>0x40 0x00 reftype limits expr</c>
+    /// for any table that carries an initializer.
+    /// </summary>
+    /// <remarks>
+    /// The element type used to be hard-coded to <c>0x70</c> here, which silently retyped an
+    /// <c>externref</c> table as <c>funcref</c>. It is written from the parsed type now, which the
+    /// initializer form requires anyway: the reftype precedes the limits inside the <c>0x40</c> form,
+    /// and a mistyped element would reject the module's own initializer at validation (GitHub #383).
+    /// </remarks>
     private void WriteTableSection(Stream s)
     {
         WriteU32Leb(s, (uint)_module.Tables.Count);
         foreach (var t in _module.Tables)
         {
-            s.WriteByte(0x70); // funcref element type
-            if (t.Max.HasValue)
+            if (t.Init is not null)
             {
-                s.WriteByte(0x01); // has max
-                WriteU32Leb(s, t.Min);
-                WriteU32Leb(s, t.Max.Value);
+                s.WriteByte(0x40);
+                s.WriteByte(0x00);
+                WriteReferenceType(s, t.ElementType);
+                WriteLimits(s, t.Min, t.Max);
+                WriteInstruction(s, t.Init);
+                s.WriteByte(0x0B); // end
             }
             else
             {
-                s.WriteByte(0x00); // no max
-                WriteU32Leb(s, t.Min);
+                WriteReferenceType(s, t.ElementType);
+                WriteLimits(s, t.Min, t.Max);
             }
         }
+    }
+
+    private static void WriteLimits(Stream s, uint min, uint? max)
+    {
+        s.WriteByte(max.HasValue ? (byte)0x01 : (byte)0x00);
+        WriteU32Leb(s, min);
+        if (max.HasValue)
+            WriteU32Leb(s, max.Value);
+    }
+
+    private static void WriteReferenceType(Stream stream, Microsoft.NET.WebAssembly.Types.ValueType.Reference type)
+    {
+        if (type.HeapType is AbstractHeapType abstractType)
+        {
+            if (!AbstractHeapTypeCodes.TryToCode(abstractType.Kind, out byte code))
+                throw new WatException($"Unsupported abstract heap type {abstractType.Kind}.");
+            if (type.Nullability == Nullability.Nullable)
+            {
+                stream.WriteByte(code);
+                return;
+            }
+
+            stream.WriteByte(0x64);
+            WriteS33Leb(stream, code - 0x80);
+            return;
+        }
+
+        if (type.HeapType is DefinedHeapType defined)
+        {
+            stream.WriteByte(type.Nullability == Nullability.Nullable ? (byte)0x63 : (byte)0x64);
+            WriteS33Leb(stream, defined.TypeIndex);
+            return;
+        }
+
+        throw new WatException(
+            $"The WAT encoder cannot serialize heap type '{type.HeapType.Key}'.");
     }
 
     private void WriteMemorySection(Stream s)
@@ -269,49 +419,138 @@ public sealed class WasmEncoder
     private void WriteElementSection(Stream s)
     {
         WriteU32Leb(s, (uint)_module.Elements.Count);
-        foreach (var e in _module.Elements)
+        for (int elementIndex = 0; elementIndex < _module.Elements.Count; elementIndex++)
         {
-            s.WriteByte(0x00); // active segment, implicit table 0
-            // Offset expression
-            if (e.Offset != null)
+            var element = _module.Elements[elementIndex];
+            bool explicitTable = element.HasExplicitTable || element.TableIndex != 0 ||
+                (element.UsesExpressions && !IsNullableAbstractFunc(element.ElementType));
+            uint flags = element.Mode switch
             {
-                WriteInstruction(s, e.Offset);
+                WatElemMode.Active when element.UsesExpressions => explicitTable ? 6u : 4u,
+                WatElemMode.Passive when element.UsesExpressions => 5u,
+                WatElemMode.Declarative when element.UsesExpressions => 7u,
+                WatElemMode.Active => explicitTable ? 2u : 0u,
+                WatElemMode.Passive => 1u,
+                WatElemMode.Declarative => 3u,
+                _ => throw new WatException(
+                    $"Element segment {elementIndex} has unknown mode {element.Mode}."),
+            };
+
+            WriteU32Leb(s, flags);
+            if (element.Mode == WatElemMode.Active)
+            {
+                if (element.TableIndex < 0)
+                    throw new WatException($"Active element segment {elementIndex} has no table index.");
+                if (explicitTable)
+                    WriteU32Leb(s, (uint)element.TableIndex);
+                if (element.Offset is null)
+                    throw new WatException($"Active element segment {elementIndex} has no offset.");
+                WriteInstruction(s, element.Offset);
+                s.WriteByte(0x0B);
             }
-            s.WriteByte(0x0B); // end of init expression
-            // Function indices
-            WriteU32Leb(s, (uint)e.FuncIndices.Count);
-            foreach (var fi in e.FuncIndices)
-                WriteU32Leb(s, (uint)fi);
+
+            if (element.UsesExpressions)
+            {
+                if (flags != 4)
+                    WriteReferenceType(s, element.ElementType);
+                WriteU32Leb(s, (uint)element.ElementExpressions.Count);
+                foreach (var expression in element.ElementExpressions)
+                {
+                    WriteInstructions(s, expression);
+                    s.WriteByte(0x0B);
+                }
+                continue;
+            }
+
+            if (flags != 0)
+                s.WriteByte(0x00);
+            WriteU32Leb(s, (uint)element.FuncIndices.Count);
+            foreach (int functionIndex in element.FuncIndices)
+            {
+                if (functionIndex < 0)
+                    throw new WatException(
+                        $"Element segment {elementIndex} has negative function index {functionIndex}.");
+                WriteU32Leb(s, (uint)functionIndex);
+            }
         }
     }
 
-    private void WriteCodeSection(Stream s)
-    {
-        WriteU32Leb(s, (uint)_module.Funcs.Count);
-        foreach (var f in _module.Funcs)
+    private static bool IsNullableAbstractFunc(Microsoft.NET.WebAssembly.Types.ValueType.Reference type) =>
+        type is
         {
-            var body = new MemoryStream();
-            WriteLocals(body, f.Locals);
-            WriteInstructions(body, f.Body);
-            body.WriteByte(0x0B); // end
+            Nullability: Nullability.Nullable,
+            HeapType: AbstractHeapType { Kind: HeapTypeKind.Func },
+        };
 
-            var bodyBytes = body.ToArray();
-            WriteU32Leb(s, (uint)bodyBytes.Length);
+    private sealed record EncodedWatFunction(
+        byte[] Bytes,
+        SourceSpan Span,
+        IReadOnlyList<(uint Offset, BranchHintKind Kind)> BranchHints);
 
-            if (_debugLineEntries != null && f.Span != SourceSpan.None)
+    private IReadOnlyList<EncodedWatFunction> EncodeFunctionBodies()
+    {
+        var encoded = new List<EncodedWatFunction>(_module.Funcs.Count);
+        foreach (ResolvedFunc function in _module.Funcs)
+        {
+            using var body = new MemoryStream();
+            WriteLocals(body, function.Locals);
+            _currentBranchHints = [];
+            WriteInstructions(body, function.Body);
+            body.WriteByte(0x0B);
+            encoded.Add(new EncodedWatFunction(
+                body.ToArray(),
+                function.Span,
+                _currentBranchHints));
+            _currentBranchHints = null;
+        }
+        return encoded;
+    }
+
+    private byte[] BuildBranchHintSection(IReadOnlyList<EncodedWatFunction> functions)
+    {
+        using var content = new MemoryStream();
+        int hintedFunctionCount = functions.Count(
+            static function => function.BranchHints.Count != 0);
+        WriteU32Leb(content, checked((uint)hintedFunctionCount));
+        for (int i = 0; i < functions.Count; i++)
+        {
+            IReadOnlyList<(uint Offset, BranchHintKind Kind)> hints = functions[i].BranchHints;
+            if (hints.Count == 0)
+                continue;
+
+            WriteU32Leb(content, checked((uint)(_module.ImportFuncCount + i)));
+            WriteU32Leb(content, checked((uint)hints.Count));
+            foreach ((uint offset, BranchHintKind kind) in hints)
+            {
+                WriteU32Leb(content, offset);
+                WriteU32Leb(content, 1);
+                content.WriteByte((byte)kind);
+            }
+        }
+        return content.ToArray();
+    }
+
+    private void WriteCodeSection(Stream s, IReadOnlyList<EncodedWatFunction> functions)
+    {
+        WriteU32Leb(s, (uint)functions.Count);
+        foreach (EncodedWatFunction function in functions)
+        {
+            WriteU32Leb(s, (uint)function.Bytes.Length);
+
+            if (_debugLineEntries != null && function.Span != SourceSpan.None)
             {
                 // s.Position is now the byte offset of the first byte of this function body
                 // within the code section content — used as the DWARF address.
                 _debugLineEntries.Add(new DwarfLineEntry(
                     Address: (uint)s.Position,
                     FileName: _sourceFile,
-                    Line: f.Span.StartLine,
-                    Column: f.Span.StartCol,
+                    Line: function.Span.StartLine,
+                    Column: function.Span.StartCol,
                     IsStatement: true,
                     PrologueEnd: true));
             }
 
-            s.Write(bodyBytes);
+            s.Write(function.Bytes);
         }
     }
 
@@ -320,12 +559,16 @@ public sealed class WasmEncoder
         WriteU32Leb(s, (uint)_module.DataSegments.Count);
         foreach (var d in _module.DataSegments)
         {
-            // Active data segment: flags = 0, memidx implicit 0
-            s.WriteByte(0x00);
-            // Offset expression
-            if (d.Offset != null)
+            if (d.Offset is null)
+            {
+                s.WriteByte(0x01); // passive segment
+            }
+            else
+            {
+                s.WriteByte(0x00); // active segment, implicit memory 0
                 WriteInstruction(s, d.Offset);
-            s.WriteByte(0x0B); // end of init expr
+                s.WriteByte(0x0B); // end of init expr
+            }
             // Data bytes
             WriteU32Leb(s, (uint)d.Bytes.Length);
             s.Write(d.Bytes);
@@ -378,6 +621,15 @@ public sealed class WasmEncoder
         // Folded S-expressions: emit operands first (they produce values on the stack)
         foreach (var op in instr.Operands)
             WriteInstruction(s, op);
+
+        if (instr.BranchHint is { } branchHint)
+        {
+            if (_currentBranchHints is null)
+                throw new WatException("@metadata.code.branch_hint annotation is only valid in a function body");
+            if (instr.Mnemonic is not "if" and not "br_if")
+                throw new WatException("@metadata.code.branch_hint annotation: invalid target");
+            _currentBranchHints.Add((checked((uint)s.Position), branchHint));
+        }
 
         // Special handling for block-like instructions
         if (instr.Mnemonic is "block" or "loop")
@@ -481,7 +733,7 @@ public sealed class WasmEncoder
                 break;
 
             case ImmediateKind.RefType:
-                s.WriteByte((byte)(instr.Index ?? 0x70)); // default funcref
+                WriteS33Leb(s, instr.IntValue ?? -16); // default heap type: func
                 break;
 
             case ImmediateKind.DataMemIdx:
@@ -506,27 +758,21 @@ public sealed class WasmEncoder
 
             case ImmediateKind.V128:
                 // 16 raw bytes for v128.const
-                if (instr.V128Bytes is { Length: 16 } v128)
-                    s.Write(v128);
-                else
-                    s.Write(new byte[16]);
+                s.Write(RequireV128Bytes(instr));
                 break;
 
             case ImmediateKind.SimdLane:
-                s.WriteByte((byte)(instr.Index ?? 0));
+                s.WriteByte((byte)RequireImmediate(instr.Index, instr, "lane index"));
                 break;
 
             case ImmediateKind.SimdShuffle:
                 // 16 lane bytes for i8x16.shuffle
-                if (instr.V128Bytes is { Length: 16 } shuf)
-                    s.Write(shuf);
-                else
-                    s.Write(new byte[16]);
+                s.Write(RequireV128Bytes(instr));
                 break;
 
             case ImmediateKind.MemArgLane:
                 WriteMemArg(s, instr);
-                s.WriteByte((byte)(instr.LaneIndex ?? 0));
+                s.WriteByte((byte)RequireImmediate(instr.LaneIndex, instr, "lane index"));
                 break;
 
             case ImmediateKind.TagIdx:
@@ -539,6 +785,29 @@ public sealed class WasmEncoder
                 break;
         }
     }
+
+    /// <summary>
+    /// Returns the 16 raw immediate bytes, or throws. Substituting zeros here would turn a
+    /// dropped immediate into a valid-but-wrong module — exactly how issue #419 stayed hidden:
+    /// the resolver lost <c>V128Bytes</c> and every <c>v128.const</c> silently became zero.
+    /// Only <see cref="WatParser"/> ever sets this, so a miss is a bug, not bad input.
+    /// </summary>
+    private static byte[] RequireV128Bytes(WatInstruction instr) =>
+        instr.V128Bytes is { Length: 16 } bytes
+            ? bytes
+            : throw new WatException(
+                $"Internal error: '{instr.Mnemonic}' reached the encoder without its 16-byte " +
+                $"immediate (got {(instr.V128Bytes is null ? "null" : instr.V128Bytes.Length + " bytes")}). " +
+                "Refusing to emit zeros in its place.");
+
+    /// <summary>
+    /// Returns a required scalar immediate, or throws rather than defaulting to zero.
+    /// See <see cref="RequireV128Bytes"/> for why silent defaults are not acceptable here.
+    /// </summary>
+    private static int RequireImmediate(int? value, WatInstruction instr, string what) =>
+        value ?? throw new WatException(
+            $"Internal error: '{instr.Mnemonic}' reached the encoder without its {what}. " +
+            "Refusing to emit zero in its place.");
 
     private void WriteTryTableInstruction(Stream s, WatInstruction instr)
     {
@@ -636,7 +905,7 @@ public sealed class WasmEncoder
     {
         if (instr.BlockTypeIndex.HasValue)
         {
-            WriteS32Leb(s, instr.BlockTypeIndex.Value);
+            WriteS33Leb(s, instr.BlockTypeIndex.Value);
         }
         else if (instr.BlockResultType.HasValue)
         {
@@ -729,6 +998,13 @@ public sealed class WasmEncoder
                 b |= 0x80;
             s.WriteByte(b);
         }
+    }
+
+    internal static void WriteS33Leb(Stream stream, long value)
+    {
+        if (!S33Leb128.IsInRange(value))
+            throw new ArgumentOutOfRangeException(nameof(value), value, "Value is outside the signed 33-bit range.");
+        WriteS64Leb(stream, value);
     }
 
     private static void WriteF32(Stream s, float value)

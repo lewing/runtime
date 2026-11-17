@@ -23,10 +23,22 @@ internal sealed class DeadCodeEliminator
     private readonly Dictionary<uint, HashSet<uint>> _funcToData = new();
     // merged function index → merged tag indices it references
     private readonly Dictionary<uint, HashSet<uint>> _funcToTags = new();
-    // merged element segment index → list of merged function indices it contains
-    private readonly Dictionary<uint, List<uint>> _elemToFuncs = new();
-    // merged global index → merged data segments it references
-    private readonly Dictionary<uint, HashSet<uint>> _globalToData = new();
+    private readonly HashSet<uint> _allElements = new();
+    private readonly Dictionary<uint, HashSet<uint>> _elemToFuncs = new();
+    private readonly Dictionary<uint, HashSet<uint>> _elemToGlobals = new();
+    private readonly Dictionary<uint, HashSet<uint>> _globalToFuncs = new();
+    private readonly Dictionary<uint, HashSet<uint>> _globalToGlobals = new();
+    private readonly Dictionary<uint, HashSet<uint>> _dataToGlobals = new();
+
+    /// <summary>
+    /// A permutation of the discovery passes, as indices into the array
+    /// <see cref="ComputeLiveSets"/> declares. <see langword="null"/> keeps declaration order.
+    /// </summary>
+    /// <remarks>
+    /// This is the instrument for the closure property, not a knob. Static roots are seeded before
+    /// these passes; permuting the dependency-propagation rules proves their order is not load-bearing.
+    /// </remarks>
+    public IReadOnlyList<int>? DiscoveryPassOrder { get; init; }
 
     public DceLiveSet ComputeLiveSets(
         IReadOnlyList<WasmModule> inputs,
@@ -97,35 +109,34 @@ internal sealed class DeadCodeEliminator
             foreach (var (_, mergedIdx) in indexMaps[m].DataSegments) liveDataSegments.Add(mergedIdx);
         }
 
-        // BFS pass 1: propagate from explicit roots
-        BfsFunctions(liveFunctions, liveGlobals, liveDataSegments, liveTags);
+        // Static semantic roots are seeded before closure. A fixed point propagates from roots; it
+        // cannot invent a start function or an active segment that no pass ever added.
+        SeedSemanticRoots(
+            inputs,
+            indexMaps,
+            liveFunctions,
+            liveGlobals,
+            liveDataSegments,
+            liveElements,
+            liveTags);
+        _ = CollectTableRoots(inputs, indexMaps, liveFunctions, liveGlobals);
 
-        // Conservative indirect-call handling: if any non-import function is live and
-        // element segments exist, all element-segment members become roots.  When the
-        // live set is empty (no exports / no entry point) we skip this to produce a
-        // minimal output module, matching wasm-ld's behaviour.
-        bool anyLiveUserCode = liveFunctions.Any(f => f >= mergedFuncImportCount);
-        if (anyLiveUserCode && _elemToFuncs.Count > 0)
+        // ── Closure ──────────────────────────────────────────────────────────────────────────────
+        //
+        // Every dependency rule below can feed another, so they run to a fixed point. Root discovery
+        // is intentionally not among them: the rejected implementation expected the loop to invent
+        // an exported table's active segment and a start function, which no propagation rule could do.
+        var passes = new Func<bool>[]
         {
-            int prevCount = liveFunctions.Count;
-            foreach (var (elemIdx, funcList) in _elemToFuncs)
-            {
-                liveElements.Add(elemIdx);
-                foreach (var fi in funcList)
-                    liveFunctions.Add(fi);
-            }
-            // BFS pass 2: propagate newly added element-segment roots
-            if (liveFunctions.Count != prevCount)
-                BfsFunctions(liveFunctions, liveGlobals, liveDataSegments, liveTags);
-        }
+            () => BfsFunctions(liveFunctions, liveGlobals, liveDataSegments, liveTags),
+            () => CollectElementSegmentRoots(
+                liveFunctions, liveGlobals, liveElements, mergedFuncImportCount),
+            () => PropagateGlobalsToFunctions(liveGlobals, liveFunctions),
+            () => PropagateGlobalsToGlobals(liveGlobals),
+            () => PropagateDataToGlobals(liveDataSegments, liveGlobals),
+        };
 
-        // Propagate: live globals → live data segments
-        foreach (uint g in liveGlobals.ToArray())
-        {
-            if (_globalToData.TryGetValue(g, out var dataSet))
-                foreach (var d in dataSet)
-                    liveDataSegments.Add(d);
-        }
+        RunToFixedPoint(Permute(passes));
 
         // Print removed items if requested
         if (options.PrintGcSections)
@@ -141,12 +152,296 @@ internal sealed class DeadCodeEliminator
         };
     }
 
+    /// <summary>Applies <see cref="DiscoveryPassOrder"/>, refusing anything that is not a permutation.</summary>
+    /// <remarks>
+    /// A partial order would silently drop a discovery rule and the run would look like a pass. The
+    /// check is affirmative — every index exactly once — so a malformed permutation is a loud failure
+    /// rather than a quieter version of the bug this seam exists to rule out.
+    /// </remarks>
+    private IReadOnlyList<Func<bool>> Permute(Func<bool>[] passes)
+    {
+        if (DiscoveryPassOrder is not { } order)
+            return passes;
+
+        if (order.Count != passes.Length || order.Distinct().Count() != passes.Length ||
+            order.Any(i => i < 0 || i >= passes.Length))
+        {
+            throw new LinkerException(
+                $"DiscoveryPassOrder must be a permutation of the {passes.Length} discovery passes; got " +
+                $"[{string.Join(", ", order)}].");
+        }
+
+        return [.. order.Select(i => passes[i])];
+    }
+
+    /// <summary>
+    /// Runs every discovery rule until a whole sweep of them adds nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The rules are monotone — each one only ever <em>adds</em> to a live set — and the sets are
+    /// bounded by the merged index spaces, so the loop terminates. The iteration cap is therefore a
+    /// contradiction detector rather than a safety valve: reaching it means some rule reported
+    /// "changed" without changing anything, which would otherwise spin silently.
+    /// </para>
+    /// <para>
+    /// Order is deliberately not load-bearing. <see cref="RunToFixedPoint"/> is handed the rules as
+    /// an array precisely so a test can permute them.
+    /// </para>
+    /// </remarks>
+    internal static int RunToFixedPoint(IReadOnlyList<Func<bool>> passes)
+    {
+        ArgumentNullException.ThrowIfNull(passes);
+
+        // One round per item that could still be discovered, plus slack. Any real input converges in
+        // a handful; a rule that lies about changing would not converge at all.
+        const int MaxRounds = 10_000;
+
+        for (int round = 1; round <= MaxRounds; round++)
+        {
+            bool changed = false;
+            foreach (var pass in passes)
+                changed |= pass();
+
+            if (!changed)
+                return round;
+        }
+
+        throw new LinkerException(
+            $"Dead-code elimination did not reach a fixed point in {MaxRounds} rounds. The live sets only ever " +
+            "grow and are bounded by the index spaces, so this means a discovery pass reported a change it did " +
+            "not make.");
+    }
+
+    /// <summary>
+    /// Propagates dependencies from live element segments. Once any non-import function is live,
+    /// passive and declarative segments are conservatively retained too.
+    /// </summary>
+    /// <remarks>
+    /// Active segments are already roots because they execute at instantiation. This gate controls
+    /// only the conservative retention of passive and declarative segments that live code may reach
+    /// indirectly, and is re-evaluated as the function closure grows.
+    /// </remarks>
+    private bool CollectElementSegmentRoots(
+        HashSet<uint> liveFunctions,
+        HashSet<uint> liveGlobals,
+        HashSet<uint> liveElements,
+        uint mergedFuncImportCount)
+    {
+        if (_allElements.Count == 0)
+            return false;
+
+        bool changed = false;
+        if (liveFunctions.Any(f => f >= mergedFuncImportCount))
+            foreach (uint element in _allElements)
+                changed |= liveElements.Add(element);
+
+        foreach (uint elemIdx in liveElements.ToArray())
+        {
+            if (_elemToFuncs.TryGetValue(elemIdx, out var functions))
+                foreach (uint function in functions)
+                    changed |= liveFunctions.Add(function);
+            if (_elemToGlobals.TryGetValue(elemIdx, out var globals))
+                foreach (uint global in globals)
+                    changed |= liveGlobals.Add(global);
+        }
+
+        return changed;
+    }
+
+    private bool PropagateGlobalsToFunctions(HashSet<uint> liveGlobals, HashSet<uint> liveFunctions)
+    {
+        bool changed = false;
+        foreach (uint g in liveGlobals)
+            if (_globalToFuncs.TryGetValue(g, out var functions))
+                foreach (uint function in functions)
+                    changed |= liveFunctions.Add(function);
+        return changed;
+    }
+
+    private bool PropagateGlobalsToGlobals(HashSet<uint> liveGlobals)
+    {
+        bool changed = false;
+        foreach (uint g in liveGlobals.ToArray())
+            if (_globalToGlobals.TryGetValue(g, out var globals))
+                foreach (uint global in globals)
+                    changed |= liveGlobals.Add(global);
+        return changed;
+    }
+
+    private bool PropagateDataToGlobals(
+        HashSet<uint> liveDataSegments, HashSet<uint> liveGlobals)
+    {
+        bool changed = false;
+        foreach (uint data in liveDataSegments)
+            if (_dataToGlobals.TryGetValue(data, out var globals))
+                foreach (uint global in globals)
+                    changed |= liveGlobals.Add(global);
+        return changed;
+    }
+
+    private static void SeedSemanticRoots(
+        IReadOnlyList<WasmModule> inputs,
+        IndexMap[] indexMaps,
+        HashSet<uint> liveFunctions,
+        HashSet<uint> liveGlobals,
+        HashSet<uint> liveDataSegments,
+        HashSet<uint> liveElements,
+        HashSet<uint> liveTags)
+    {
+        for (int m = 0; m < inputs.Count; m++)
+        {
+            var module = inputs[m];
+            var map = indexMaps[m];
+
+            if (module.StartFunction is int start &&
+                map.Functions.TryGetValue((uint)start, out uint mergedStart))
+            {
+                liveFunctions.Add(mergedStart);
+            }
+
+            foreach (var export in module.Exports.Values.Concat(module.ExportEntries))
+            {
+                switch (export.Descriptor)
+                {
+                    case ExportDescriptor.Func function
+                        when map.Functions.TryGetValue((uint)function.FunctionIndex, out uint merged):
+                        liveFunctions.Add(merged);
+                        break;
+                    case ExportDescriptor.Global global
+                        when map.Globals.TryGetValue((uint)global.GlobalIndex, out uint merged):
+                        liveGlobals.Add(merged);
+                        break;
+                    case ExportDescriptor.Tag tag
+                        when map.Tags.TryGetValue((uint)tag.TagIndex, out uint merged):
+                        liveTags.Add(merged);
+                        break;
+                }
+            }
+
+            for (int i = 0; i < module.Elements.Count; i++)
+                if (module.Elements[i].Mode == ElementMode.Active &&
+                    map.Elements.TryGetValue((uint)i, out uint merged))
+                {
+                    liveElements.Add(merged);
+                }
+
+            for (int i = 0; i < module.DataSegments.Count; i++)
+                if (!module.DataSegments[i].IsPassive &&
+                    map.DataSegments.TryGetValue((uint)i, out uint merged))
+                {
+                    liveDataSegments.Add(merged);
+                }
+        }
+    }
+
+    /// <summary>
+    /// Roots everything a table needs, because no pass eliminates tables.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A table's initializer expression is a root in the strongest sense: the table survives the
+    /// sweep unconditionally, so a <c>ref.func</c> inside it names a function that <em>will</em> be
+    /// referenced by the output. Before this the graph never looked, the function was swept, and
+    /// compaction moved a <em>different</em> live function into the index the expression still
+    /// named — measured as an exported table whose slot 0 called the function returning 7 where the
+    /// source called the one returning 42. The module validated; only the value was wrong
+    /// (GitHub #383).
+    /// </para>
+    /// <para>
+    /// Imported tables are walked too: a <c>tabletype</c> cannot carry an initializer, but its exact
+    /// element type can name a defined type, and that type has to survive
+    /// <see cref="CompactTypes"/>.
+    /// </para>
+    /// </remarks>
+    private static bool CollectTableRoots(
+        IReadOnlyList<WasmModule> inputs,
+        IndexMap[] indexMaps,
+        HashSet<uint> liveFunctions,
+        HashSet<uint> liveGlobals)
+    {
+        bool changed = false;
+        for (int m = 0; m < inputs.Count; m++)
+        {
+            var map = indexMaps[m];
+            foreach (var table in EnumerateTables(inputs[m]))
+            {
+                if (table.InitExpr.Length == 0)
+                    continue;
+
+                ConstExprScanner.Scan(table.InitExpr, (kind, value) =>
+                {
+                    switch (kind)
+                    {
+                        case ConstExprScanner.OperandKind.FunctionIndex
+                            when map.Functions.TryGetValue(checked((uint)value), out uint merged):
+                            changed |= liveFunctions.Add(merged);
+                            break;
+                        case ConstExprScanner.OperandKind.GlobalIndex
+                            when map.Globals.TryGetValue(checked((uint)value), out uint merged):
+                            changed |= liveGlobals.Add(merged);
+                            break;
+                    }
+                });
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>Every table a module declares or imports, in local table index order.</summary>
+    private static IEnumerable<TableType> EnumerateTables(WasmModule module)
+    {
+        foreach (var import in module.Imports)
+            if (import.Descriptor is ImportDescriptor.Table table)
+                yield return table.Type;
+
+        foreach (var table in module.Tables)
+            yield return table;
+    }
+
+    /// <summary>
+    /// The exact content type of every global that will reach the output — imports, plus the
+    /// definitions the sweep is keeping.
+    /// </summary>
+    /// <remarks>
+    /// Global imports are unconditional: <c>MergeImports</c> copies a non-function, non-tag import
+    /// through whatever the live set says. Definitions are filtered, because keeping the type a
+    /// <em>swept</em> global named would defeat the sweep — and the merger never asks for it.
+    /// </remarks>
+    private static IEnumerable<Microsoft.NET.WebAssembly.Types.ValueType?> EnumerateGlobalTypes(
+        WasmModule module, DceLiveSet liveSets, int moduleIndex)
+    {
+        foreach (var import in module.Imports)
+            if (import.Descriptor is ImportDescriptor.Global global)
+                yield return global.Type.ExactContentType;
+
+        foreach (var global in EnumerateLiveGlobalDefinitions(module, liveSets, moduleIndex))
+            yield return global.Type.ExactContentType;
+    }
+
+    /// <inheritdoc cref="EnumerateGlobalTypes"/>
+    private static IEnumerable<WasmGlobal> EnumerateLiveGlobalDefinitions(
+        WasmModule module, DceLiveSet liveSets, int moduleIndex)
+    {
+        uint localGlobalImports = 0;
+        foreach (var import in module.Imports)
+            if (import.Descriptor is ImportDescriptor.Global) localGlobalImports++;
+
+        for (int j = 0; j < module.Globals.Count; j++)
+        {
+            if (liveSets.DeadGlobalsByModule?[moduleIndex].Contains(localGlobalImports + (uint)j) == true)
+                continue;
+
+            yield return module.Globals[j];
+        }
+    }
+
     public static void ComposeCompactionIntoIndexMaps(
         IReadOnlyList<WasmModule> inputs,
         IndexMap[] indexMaps,
         DceLiveSet liveSets)
-    {
-        // Before composing, record which local indices are dead per module
+    {        // Before composing, record which local indices are dead per module
         var deadFuncsByModule = new List<HashSet<uint>>(inputs.Count);
         var deadGlobalsByModule = new List<HashSet<uint>>(inputs.Count);
         var deadDataSegsByModule = new List<HashSet<uint>>(inputs.Count);
@@ -212,14 +507,20 @@ internal sealed class DeadCodeEliminator
     /// <summary>
     /// Returns a filtered and compacted merged types list. Also rewrites IndexMap.Types
     /// so that local type indices now map to compacted type indices, and updates
-    /// <paramref name="mergedImports"/> in-place to use the new compacted type indices.
+    /// <paramref name="mergedImports"/> and <paramref name="mergedTypeDefinitions"/> in-place to use
+    /// the new compacted type indices.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="mergedTypeDefinitions"/> is the exact type space that runs in lockstep with
+    /// <paramref name="mergedTypes"/>; it is compacted in place alongside it when supplied.
+    /// </remarks>
     public static List<FuncType> CompactTypes(
         List<FuncType> mergedTypes,
         DceLiveSet liveSets,
         IReadOnlyList<WasmModule> inputs,
         IndexMap[] indexMaps,
-        List<Import> mergedImports)
+        List<Import> mergedImports,
+        List<TypeDefinition>? mergedTypeDefinitions = null)
     {
         var liveTypes = new HashSet<uint>();
 
@@ -271,6 +572,19 @@ internal sealed class DeadCodeEliminator
                 uint localTypeIdx = (uint)inputs[m].Functions[j].TypeIndex;
                 if (indexMaps[m].Types.TryGetValue(localTypeIdx, out uint mergedTypeIdx))
                     liveTypes.Add(mergedTypeIdx);
+
+                foreach (var local in inputs[m].Functions[j].ExactLocals)
+                {
+                    if (local is Microsoft.NET.WebAssembly.Types.ValueType.Reference
+                        {
+                            HeapType: DefinedHeapType defined,
+                        } &&
+                        indexMaps[m].Types.TryGetValue(
+                            checked((uint)defined.TypeIndex), out uint localType))
+                    {
+                        liveTypes.Add(localType);
+                    }
+                }
             }
         }
 
@@ -293,31 +607,114 @@ internal sealed class DeadCodeEliminator
             }
         }
 
+        // Keep types named by a table's element type, by a global's content type, or by a
+        // `ref.null <typeidx>` / GC constructor inside a constant expression. No pass eliminates
+        // tables, and a global that survived the sweep still carries its declared type — so these are
+        // unconditional. Sweeping the sole type a typed table named left the table pointing at
+        // whichever type compaction moved into that index — a different, structurally unrelated type,
+        // in a module that still validated (GitHub #383).
+        for (int m = 0; m < inputs.Count; m++)
+        {
+            var map = indexMaps[m];
+
+            void KeepExact(Microsoft.NET.WebAssembly.Types.ValueType? exact)
+            {
+                if (exact is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType defined } &&
+                    map.Types.TryGetValue((uint)defined.TypeIndex, out uint mergedTypeIdx))
+                {
+                    liveTypes.Add(mergedTypeIdx);
+                }
+            }
+
+            void KeepConstExpr(byte[] expr)
+            {
+                if (expr.Length == 0)
+                    return;
+
+                ConstExprScanner.Scan(expr, (kind, value) =>
+                {
+                    bool namesType = kind switch
+                    {
+                        // `ref.null` carries an s33: non-negative is a defined type index.
+                        ConstExprScanner.OperandKind.HeapType => value >= 0,
+
+                        // A GC constructor's operand is always a defined type index.
+                        ConstExprScanner.OperandKind.TypeIndex => true,
+                        _ => false,
+                    };
+
+                    if (namesType && map.Types.TryGetValue(checked((uint)value), out uint mergedTypeIdx))
+                        liveTypes.Add(mergedTypeIdx);
+                });
+            }
+
+            foreach (var table in EnumerateTables(inputs[m]))
+            {
+                KeepExact(table.ExactElementType);
+                KeepConstExpr(table.InitExpr);
+            }
+
+            foreach (var globalType in EnumerateGlobalTypes(inputs[m], liveSets, m))
+                KeepExact(globalType);
+
+            foreach (var global in EnumerateLiveGlobalDefinitions(inputs[m], liveSets, m))
+                KeepConstExpr(global.InitExpr);
+
+            for (int elementIndex = 0; elementIndex < inputs[m].Elements.Count; elementIndex++)
+            {
+                if (liveSets.DeadElementsByModule?[m].Contains((uint)elementIndex) == true)
+                    continue;
+
+                var element = inputs[m].Elements[elementIndex];
+                KeepExact(element.ElementType);
+                KeepConstExpr(element.OffsetExpr);
+                foreach (byte[] expression in element.ElementExpressions)
+                    KeepConstExpr(expression);
+            }
+        }
+
+        // Close over the type space itself: a live definition that names another type keeps it live.
+        // Without the closure a surviving type could reference a swept one, and the compaction below
+        // would have no honest index to give it.
+        if (mergedTypeDefinitions is not null)
+            CloseOverTypeReferences(liveTypes, mergedTypeDefinitions);
+
         var typeCompaction = BuildCompactionMap(liveTypes);
 
         // Compose into IndexMaps.Types
         for (int m = 0; m < inputs.Count; m++)
             ComposeMap(indexMaps[m].Types, typeCompaction);
 
-        // Update mergedImports type indices (they were built before compaction)
-        for (int i = 0; i < mergedImports.Count; i++)
+        // Rewrite the merged imports into the compacted type space.
+        //
+        // They were built in phase 3, before this compaction existed, so every type index they carry
+        // still names the pre-compaction space. This used to update function and tag descriptors only,
+        // which left a table import declared `(ref null (func (result i64)))` naming whichever type
+        // compaction moved into that index — measured as a silent redirect onto a surviving `(func)`,
+        // in a module `wasm-tools validate -f all` accepts (GitHub #383).
+        //
+        // Driven through the same walk the merge uses, so the two cannot fall out of step, and a type
+        // with no mapping is refused rather than left at its old number: an unmapped index is still a
+        // valid index into the compacted space and names an unrelated type. Imports the sweep is about
+        // to drop are skipped — their types are the ones it removed, so demanding a mapping for them
+        // would fail a correct link.
+        // ToArray() first: ClassifyImports iterates mergedImports lazily and the loop writes back into
+        // it, which throws "Collection was modified" on a List<T> enumerator.
+        var classified = SectionMerger.ClassifyImports(mergedImports, liveSets).ToArray();
+        for (int i = 0; i < classified.Length; i++)
         {
-            if (mergedImports[i].Descriptor is ImportDescriptor.Func func &&
-                typeCompaction.TryGetValue((uint)func.TypeIndex, out uint newFuncTypeIdx))
-            {
-                mergedImports[i] = mergedImports[i] with
-                {
-                    Descriptor = new ImportDescriptor.Func(checked((int)newFuncTypeIdx))
-                };
-            }
-            else if (mergedImports[i].Descriptor is ImportDescriptor.Tag tag &&
-                     typeCompaction.TryGetValue((uint)tag.TypeIndex, out uint newTagTypeIdx))
-            {
-                mergedImports[i] = mergedImports[i] with
-                {
-                    Descriptor = new ImportDescriptor.Tag(checked((int)newTagTypeIdx))
-                };
-            }
+            var (import, survives) = classified[i];
+            if (!survives)
+                continue;
+
+            mergedImports[i] = SectionMerger.RemapImportTypeIndices(import, typeIndex =>
+                typeCompaction.TryGetValue(typeIndex, out uint compacted)
+                    ? compacted
+                    : throw new LinkerException(
+                        $"Import '{import.ModuleName}.{import.Name}' names type index {typeIndex}, which " +
+                        "dead-code elimination removed. Keeping the old number would point the import at " +
+                        "an unrelated type in the compacted space, which still validates and means " +
+                        "something else (GitHub #383)."));
         }
 
         // Build compacted types list
@@ -327,8 +724,147 @@ internal sealed class DeadCodeEliminator
             if (idx < (uint)mergedTypes.Count)
                 result.Add(mergedTypes[(int)idx]);
 
+        if (mergedTypeDefinitions is not null)
+        {
+            var compactedDefinitions = new List<TypeDefinition>(sortedLive.Length);
+            foreach (var idx in sortedLive)
+            {
+                if (idx >= (uint)mergedTypeDefinitions.Count)
+                    continue;
+                compactedDefinitions.Add(
+                    RemapDefinitionIndices(mergedTypeDefinitions[(int)idx], typeCompaction));
+            }
+
+            mergedTypeDefinitions.Clear();
+            mergedTypeDefinitions.AddRange(compactedDefinitions);
+        }
+
         return result;
     }
+
+    /// <summary>
+    /// Adds to <paramref name="liveTypes"/> every type reachable from one already in it.
+    /// </summary>
+    /// <remarks>
+    /// Supertypes, recursion-group anchors, operand and field types are all type indices a surviving
+    /// definition names. Compaction renumbers the space, so a reference out of the live set has no
+    /// correct destination — the choice is between keeping the target and emitting a wrong index,
+    /// and this keeps the target.
+    /// </remarks>
+    private static void CloseOverTypeReferences(
+        HashSet<uint> liveTypes, IReadOnlyList<TypeDefinition> definitions)
+    {
+        var queue = new Queue<uint>(liveTypes);
+        while (queue.Count > 0)
+        {
+            uint index = queue.Dequeue();
+            if (index >= (uint)definitions.Count)
+                continue;
+
+            foreach (uint referenced in ReferencedTypeIndices(definitions[(int)index]))
+                if (referenced < (uint)definitions.Count && liveTypes.Add(referenced))
+                    queue.Enqueue(referenced);
+        }
+    }
+
+    /// <inheritdoc cref="CloseOverTypeReferences"/>
+    private static IEnumerable<uint> ReferencedTypeIndices(TypeDefinition definition)
+    {
+        foreach (int super in definition.SuperTypeIndices)
+            if (super >= 0)
+                yield return (uint)super;
+
+        if (definition.RecGroup.StartTypeIndex >= 0)
+            yield return (uint)definition.RecGroup.StartTypeIndex;
+
+        switch (definition.CompositeType)
+        {
+            case CompositeType.Function function:
+                foreach (var operand in function.Parameters.Concat(function.Results))
+                    if (ReferencedTypeIndex(operand) is { } index)
+                        yield return index;
+                break;
+            case CompositeType.Struct structure:
+                foreach (var field in structure.Fields)
+                    if (field.StorageType is StorageType.Value value && ReferencedTypeIndex(value.Type) is { } index)
+                        yield return index;
+                break;
+            case CompositeType.Array array:
+                if (array.Field.StorageType is StorageType.Value element &&
+                    ReferencedTypeIndex(element.Type) is { } arrayIndex)
+                {
+                    yield return arrayIndex;
+                }
+
+                break;
+            case CompositeType.Continuation continuation when continuation.FunctionTypeIndex >= 0:
+                yield return (uint)continuation.FunctionTypeIndex;
+                break;
+        }
+    }
+
+    /// <inheritdoc cref="CloseOverTypeReferences"/>
+    private static uint? ReferencedTypeIndex(Microsoft.NET.WebAssembly.Types.ValueType type) =>
+        type is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType defined } && defined.TypeIndex >= 0
+            ? (uint)defined.TypeIndex
+            : null;
+
+    /// <summary>
+    /// Rewrites every type index a <see cref="TypeDefinition"/> names through
+    /// <paramref name="compaction"/>.
+    /// </summary>
+    /// <remarks>
+    /// An index with no entry names a type the compaction dropped. Leaving it alone was the original
+    /// behaviour and it is a silent redirect: the old number is a valid index into the <em>new</em>
+    /// space and names an unrelated type, so the definition comes out describing something else and
+    /// the module still validates. <see cref="CloseOverTypeReferences"/> makes that unreachable for
+    /// a well-formed space, so reaching it means the closure is incomplete — which is a linker bug
+    /// worth a stack trace, not a fabricated index (GitHub #383).
+    /// </remarks>
+    private static TypeDefinition RemapDefinitionIndices(
+        TypeDefinition definition, Dictionary<uint, uint> compaction)
+    {
+        int Map(int index)
+        {
+            if (index < 0)
+                return index;
+            if (compaction.TryGetValue((uint)index, out uint mapped))
+                return checked((int)mapped);
+
+            throw new LinkerException(
+                $"Type definition {definition.Index} names type index {index}, which dead-code elimination " +
+                "removed. Keeping the old number would point it at an unrelated type in the compacted " +
+                "space, which still validates and means something else (GitHub #383).");
+        }
+
+        return new TypeDefinition(
+            Map(definition.Index),
+            definition.IsFinal,
+            [.. definition.SuperTypeIndices.Select(Map)],
+            RemapComposite(definition.CompositeType, Map),
+            definition.RecGroup with { StartTypeIndex = Map(definition.RecGroup.StartTypeIndex) });
+    }
+
+    private static CompositeType RemapComposite(CompositeType composite, Func<int, int> map) => composite switch
+    {
+        CompositeType.Function f => new CompositeType.Function(
+            [.. f.Parameters.Select(p => RemapValue(p, map))],
+            [.. f.Results.Select(r => RemapValue(r, map))]),
+        CompositeType.Struct s => new CompositeType.Struct([.. s.Fields.Select(field => RemapField(field, map))]),
+        CompositeType.Array a => new CompositeType.Array(RemapField(a.Field, map)),
+        CompositeType.Continuation c => new CompositeType.Continuation(map(c.FunctionTypeIndex)),
+        _ => composite,
+    };
+
+    private static FieldType RemapField(FieldType field, Func<int, int> map) =>
+        field.StorageType is StorageType.Value value
+            ? field with { StorageType = new StorageType.Value(RemapValue(value.Type, map)) }
+            : field;
+
+    private static Microsoft.NET.WebAssembly.Types.ValueType RemapValue(Microsoft.NET.WebAssembly.Types.ValueType type, Func<int, int> map) =>
+        type is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType defined } reference
+            ? reference with { HeapType = new DefinedHeapType(map(defined.TypeIndex)) }
+            : type;
 
     private void BuildGraph(
         IReadOnlyList<WasmModule> inputs,
@@ -376,20 +912,86 @@ internal sealed class DeadCodeEliminator
                 }
             }
 
-            // Element segments: track which functions they reference
+            // Constant-expression carriers do not have relocation records. Record their
+            // dependencies directly from the bytes the reader preserved.
             for (int j = 0; j < module.Elements.Count; j++)
             {
-                if (!map.Elements.TryGetValue((uint)j, out uint elemMerged)) continue;
-                if (!_elemToFuncs.ContainsKey(elemMerged))
-                    _elemToFuncs[elemMerged] = new List<uint>();
+                if (!map.Elements.TryGetValue((uint)j, out uint elemMerged))
+                    continue;
+                _allElements.Add(elemMerged);
+                var element = module.Elements[j];
 
-                foreach (var funcIdx in module.Elements[j].FunctionIndices)
+                foreach (var funcIdx in element.FunctionIndices.Concat(element.DeclaredFunctionIndices))
                 {
                     if (funcIdx >= 0 && map.Functions.TryGetValue((uint)funcIdx, out uint fMerged))
-                        _elemToFuncs[elemMerged].Add(fMerged);
+                        AddEdge(_elemToFuncs, elemMerged, fMerged);
+                }
+
+                ScanConstExprDependencies(
+                    element.OffsetExpr,
+                    map,
+                    function => AddEdge(_elemToFuncs, elemMerged, function),
+                    global => AddEdge(_elemToGlobals, elemMerged, global));
+                foreach (byte[] expression in element.ElementExpressions)
+                {
+                    ScanConstExprDependencies(
+                        expression,
+                        map,
+                        function => AddEdge(_elemToFuncs, elemMerged, function),
+                        global => AddEdge(_elemToGlobals, elemMerged, global));
                 }
             }
+
+            for (int j = 0; j < module.Globals.Count; j++)
+            {
+                uint localIndex = globalImportCount + (uint)j;
+                if (!map.Globals.TryGetValue(localIndex, out uint globalMerged))
+                    continue;
+
+                ScanConstExprDependencies(
+                    module.Globals[j].InitExpr,
+                    map,
+                    function => AddEdge(_globalToFuncs, globalMerged, function),
+                    global => AddEdge(_globalToGlobals, globalMerged, global));
+            }
+
+            for (int j = 0; j < module.DataSegments.Count; j++)
+            {
+                if (!map.DataSegments.TryGetValue((uint)j, out uint dataMerged))
+                    continue;
+
+                ScanConstExprDependencies(
+                    module.DataSegments[j].OffsetExpr,
+                    map,
+                    function: static _ => { },
+                    global => AddEdge(_dataToGlobals, dataMerged, global));
+            }
         }
+    }
+
+    private static void ScanConstExprDependencies(
+        byte[] expression,
+        IndexMap map,
+        Action<uint> function,
+        Action<uint> global)
+    {
+        if (expression.Length == 0)
+            return;
+
+        ConstExprScanner.Scan(expression, (kind, value) =>
+        {
+            switch (kind)
+            {
+                case ConstExprScanner.OperandKind.FunctionIndex
+                    when map.Functions.TryGetValue(checked((uint)value), out uint merged):
+                    function(merged);
+                    break;
+                case ConstExprScanner.OperandKind.GlobalIndex
+                    when map.Globals.TryGetValue(checked((uint)value), out uint merged):
+                    global(merged);
+                    break;
+            }
+        });
     }
 
     private void ProcessRelocation(
@@ -513,6 +1115,9 @@ internal sealed class DeadCodeEliminator
         var extraExports = options.Exports is { Count: > 0 }
             ? new HashSet<string>(options.Exports, StringComparer.Ordinal)
             : null;
+        var conditionalExports = options.ExportIfDefined is { Count: > 0 }
+            ? new HashSet<string>(options.ExportIfDefined, StringComparer.Ordinal)
+            : null;
 
         foreach (var sym in symbolTable.Symbols.Values)
         {
@@ -522,7 +1127,8 @@ internal sealed class DeadCodeEliminator
             bool isRoot = options.ExportAll
                 || (sym.Flags & SymbolFlags.NoStrip) != 0
                 || (sym.Flags & SymbolFlags.Exported) != 0
-                || (extraExports?.Contains(sym.Name) == true);
+                || (extraExports?.Contains(sym.Name) == true)
+                || (conditionalExports?.Contains(sym.Name) == true);
 
             if (!isRoot) continue;
 
@@ -551,12 +1157,13 @@ internal sealed class DeadCodeEliminator
         }
     }
 
-    private void BfsFunctions(
+    private bool BfsFunctions(
         HashSet<uint> liveFunctions,
         HashSet<uint> liveGlobals,
         HashSet<uint> liveDataSegments,
         HashSet<uint> liveTags)
     {
+        bool changed = false;
         var queue = new Queue<uint>(liveFunctions);
         while (queue.Count > 0)
         {
@@ -567,19 +1174,24 @@ internal sealed class DeadCodeEliminator
                 foreach (uint callee in callees)
                 {
                     if (liveFunctions.Add(callee))
+                    {
+                        changed = true;
                         queue.Enqueue(callee);
+                    }
                 }
             }
 
             if (_funcToGlobals.TryGetValue(funcIdx, out var globals))
-                foreach (uint g in globals) liveGlobals.Add(g);
+                foreach (uint g in globals) changed |= liveGlobals.Add(g);
 
             if (_funcToData.TryGetValue(funcIdx, out var data))
-                foreach (uint d in data) liveDataSegments.Add(d);
+                foreach (uint d in data) changed |= liveDataSegments.Add(d);
 
             if (_funcToTags.TryGetValue(funcIdx, out var tags))
-                foreach (uint t in tags) liveTags.Add(t);
+                foreach (uint t in tags) changed |= liveTags.Add(t);
         }
+
+        return changed;
     }
 
     private static Dictionary<uint, uint> BuildCompactionMap(HashSet<uint>? liveSet)
@@ -592,14 +1204,27 @@ internal sealed class DeadCodeEliminator
         return map;
     }
 
-    private static void ComposeMap(Dictionary<uint, uint> indexMap, Dictionary<uint, uint> compactionMap)
+    /// <remarks>
+    /// <para>
+    /// A key whose target did not survive is <em>removed</em>, not left pointing at its
+    /// pre-compaction index. The old number is still a valid index into the compacted space and
+    /// names an unrelated item, so leaving it turns every later lookup into a silent redirect that
+    /// produces a valid module meaning something else. Removing it makes
+    /// <c>SectionMerger.ResolveMappedIndex</c> throw instead, which converts an unclosed dependency
+    /// from a wrong answer into a failure (GitHub #383).
+    /// </para>
+    /// Callers that legitimately walk dead items — the section merger's per-kind skips — consult
+    /// <c>DceLiveSet.DeadXxxByModule</c> before the map, so they never reach a removed key. An empty
+    /// compaction map therefore removes every key; it does not mean "skip composition".
+    /// </remarks>
+    internal static void ComposeMap(Dictionary<uint, uint> indexMap, Dictionary<uint, uint> compactionMap)
     {
-        if (compactionMap.Count == 0) return;
         foreach (var key in indexMap.Keys.ToArray())
         {
             if (compactionMap.TryGetValue(indexMap[key], out uint compacted))
                 indexMap[key] = compacted;
-            // else: dead — leave stale (SectionMerger skips via DeadXxxByModule)
+            else
+                indexMap.Remove(key);
         }
     }
 
@@ -627,16 +1252,20 @@ internal sealed class DeadCodeEliminator
 
     private void AddFuncEdge(uint from, uint to)
     {
-        if (!_funcToFuncs.TryGetValue(from, out var set))
-            _funcToFuncs[from] = set = new HashSet<uint>();
-        set.Add(to);
+        AddEdge(_funcToFuncs, from, to);
     }
 
     private void AddGlobalEdge(uint from, uint globalTo)
     {
-        if (!_funcToGlobals.TryGetValue(from, out var set))
-            _funcToGlobals[from] = set = new HashSet<uint>();
-        set.Add(globalTo);
+        AddEdge(_funcToGlobals, from, globalTo);
+    }
+
+    private static void AddEdge(
+        Dictionary<uint, HashSet<uint>> graph, uint from, uint to)
+    {
+        if (!graph.TryGetValue(from, out var set))
+            graph[from] = set = new HashSet<uint>();
+        set.Add(to);
     }
 
     private void AddDataEdge(uint from, uint dataTo)

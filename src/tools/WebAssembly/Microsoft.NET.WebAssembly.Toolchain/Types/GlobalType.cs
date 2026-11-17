@@ -4,7 +4,11 @@
 namespace Microsoft.NET.WebAssembly.Types;
 
 /// <summary>Global type (§2.3.8)</summary>
-public sealed record GlobalType(ValType ContentType, Mutability Mutability);
+public sealed record GlobalType(ValType ContentType, Mutability Mutability)
+{
+    internal string ContentTypeKey { get; init; } = "";
+    public ValueType? ExactContentType { get; init; }
+}
 
 public enum Mutability : byte
 {

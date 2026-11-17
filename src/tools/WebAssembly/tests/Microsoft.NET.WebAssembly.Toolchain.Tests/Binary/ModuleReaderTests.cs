@@ -3,10 +3,12 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
 
+using Microsoft.NET.WebAssembly;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
+using Microsoft.NET.WebAssembly.Validation;
 
 public class ModuleReaderTests
 {
@@ -150,6 +152,36 @@ public class ModuleReaderTests
         Assert.Empty(module.Exports);
     }
 
+    [Theory]
+    [InlineData(false, 0x04)]
+    [InlineData(false, 0xFF)]
+    [InlineData(true, 0x04)]
+    [InlineData(true, 0xFF)]
+    public void InvalidGlobalMutability_ThrowsWasmFormatException(bool imported, byte mutability)
+    {
+        byte[] section = imported
+            ? BuildSection(2, [0x01, 0x00, 0x00, 0x03, 0x7F, mutability])
+            : BuildSection(6, [0x01, 0x7F, mutability, 0x41, 0x00, 0x0B]);
+        byte[] module = BuildModule(section);
+
+        Assert.Throws<WasmFormatException>(() => ModuleReader.ReadModule(new MemoryStream(module)));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x80, 0x01 })]
+    [InlineData(new byte[] { 0x80, 0x02 })]
+    public void InvalidMemArgFlags_ThrowsWasmFormatException(byte[] flags)
+    {
+        byte[] body = [0x00, 0x41, 0x00, 0x28, .. flags, 0x00, 0x1A, 0x0B];
+        byte[] module = BuildModule(
+            BuildSection(1, [0x01, 0x60, 0x00, 0x00]),
+            BuildSection(3, [0x01, 0x00]),
+            BuildSection(5, [0x01, 0x00, 0x01]),
+            BuildSection(10, [0x01], EncodeU32((uint)body.Length), body));
+
+        Assert.Throws<WasmFormatException>(() => ModuleReader.ReadModule(new MemoryStream(module)));
+    }
+
     [Fact]
     public void StreamReader_ParsesSameModuleAsByteArrayPath()
     {
@@ -184,15 +216,15 @@ public class ModuleReaderTests
 
         byte[] codeSection = [
             0x0A,                   // section id: code
-            0x0D,                   // section size
+            0x0F,                   // section size
             0x02,                   // two code entries
-            0x04,                   // body size
+            0x05,                   // body size
             0x00,                   // no locals
-            0x41, 0x01, 0x0B,      // i32.const 1; end
-            0x06,                   // body size
+            0x41, 0x01, 0x1A, 0x0B,// i32.const 1; drop; end
+            0x07,                   // body size
             0x01,                   // one local decl
             0x02, 0x7F,            // two i32 locals
-            0x41, 0x07, 0x0B,      // i32.const 7; end
+            0x41, 0x07, 0x1A, 0x0B,// i32.const 7; drop; end
         ];
 
         byte[] bytes = BuildModule(typeSection, functionSection, exportSection, customSection, codeSection);
@@ -203,7 +235,7 @@ public class ModuleReaderTests
 
         AssertEquivalent(fromBytes, fromStream);
         Assert.Equal([ValType.I32, ValType.I32], fromStream.Functions[1].Locals);
-        Assert.Equal([0x41, 0x07, 0x0B], fromStream.Functions[1].Body);
+        Assert.Equal([0x41, 0x07, 0x1A, 0x0B], fromStream.Functions[1].Body);
     }
 
     [Fact]
@@ -358,7 +390,9 @@ public class ModuleReaderTests
     [Fact]
     public void RealWasmFiles_ExposeParsedProducerMetadataAndTargetFeatures()
     {
-        foreach (string sampleName in new[] { "add.wasm", "math.wasm" })
+        string[] sampleNames = ["add.wasm", "math.wasm"];
+        Assert.NotEmpty(sampleNames);
+        foreach (string sampleName in sampleNames)
         {
             var module = ModuleReader.ReadModule(new MemoryStream(File.ReadAllBytes(WasmAssert.TestAssetPath(Path.Combine("c", sampleName)))));
             var producers = Assert.IsType<ProducersSection>(module.ProducersSection);
@@ -430,6 +464,8 @@ public class ModuleReaderTests
     [Fact]
     public void ExportSection_ParsesFunctionExport()
     {
+        byte[] typeSection = BuildSection(1, [0x01, 0x60, 0x00, 0x00]);
+        byte[] functionSection = BuildSection(3, [0x01, 0x00]);
         byte[] exportSection = [
             0x07,                           // section id: export
             0x07,                           // section size
@@ -438,19 +474,25 @@ public class ModuleReaderTests
             0x00,                           // export kind: func
             0x00,                           // function index 0
         ];
+        byte[] codeSection = BuildSection(10, [0x01, 0x02, 0x00, 0x0B]);
 
-        var module = ModuleReader.ReadModule(new MemoryStream(BuildModule(exportSection)));
+        var module = ModuleReader.ReadModuleAndValidate(new MemoryStream(
+            BuildModule(typeSection, functionSection, exportSection, codeSection)));
 
         Assert.Single(module.Exports);
         var export = module.Exports.GetAt(0).Value;
         Assert.Equal("add", export.Name);
         var funcDesc = Assert.IsType<ExportDescriptor.Func>(export.Descriptor);
         Assert.Equal(0, funcDesc.FunctionIndex);
+
+        var bodyValidation = FunctionBodyValidator.ValidateModule(module, WasmFeatures.All);
+        Assert.True(bodyValidation.IsValid);
     }
 
     [Fact]
     public void ImportSection_ParsesFunctionImport()
     {
+        byte[] typeSection = BuildSection(1, [0x01, 0x60, 0x00, 0x00]);
         byte[] importSection = [
             0x02,                                       // section id: import
             0x0B,                                       // section size
@@ -461,7 +503,7 @@ public class ModuleReaderTests
             0x00,                                       // type index 0
         ];
 
-        var module = ModuleReader.ReadModule(new MemoryStream(BuildModule(importSection)));
+        var module = ModuleReader.ReadModuleAndValidate(new MemoryStream(BuildModule(typeSection, importSection)));
 
         Assert.Single(module.Imports);
         var import = module.Imports[0];
@@ -469,6 +511,9 @@ public class ModuleReaderTests
         Assert.Equal("log", import.Name);
         var funcDesc = Assert.IsType<ImportDescriptor.Func>(import.Descriptor);
         Assert.Equal(0, funcDesc.TypeIndex);
+
+        var bodyValidation = FunctionBodyValidator.ValidateModule(module, WasmFeatures.All);
+        Assert.True(bodyValidation.IsValid);
     }
 
     [Fact]

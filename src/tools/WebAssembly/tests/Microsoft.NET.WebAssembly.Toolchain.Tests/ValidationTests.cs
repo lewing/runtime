@@ -3,20 +3,197 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests;
 
+using Microsoft.NET.WebAssembly;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Validation;
+using Microsoft.NET.WebAssembly.Wat;
 
 /// <summary>
-/// Validation tests — assert that <see cref="ModuleReader.ReadAndValidate"/> throws
-/// <see cref="WasmValidationException"/> for semantically invalid Wasm modules, and
-/// <see cref="WasmFormatException"/> for binary format errors.
+/// Validation tests — assert that module loading and module validation throw
+/// <see cref="WasmValidationException"/> for semantically invalid Wasm modules,
+/// and <see cref="WasmFormatException"/> for binary format errors.
 /// </summary>
 public class ValidationTests
 {
     // ── Wasm binary header: magic + version 1 ─────────────────────────────────
     private static readonly byte[] Header = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+
+    [Fact]
+    public void Validate_ModuleObject_RejectsInvalidLimits()
+    {
+        var invalidModule = new WasmModule
+        {
+            Memories = [new MemoryType(new Limits(2, 1))],
+        };
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => WasmModuleValidator.ValidateAndThrow(invalidModule, invalidModule.EnabledFeatures));
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.LimitsMaxLessThanMin);
+    }
+
+    [Fact]
+    public void Validate_ModuleObject_RejectsDivergentTypeMetadata()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (func))
+            """);
+        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
+        module.Types[0] = new FuncType([ValType.I32], []);
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => WasmModuleValidator.ValidateAndThrow(module, module.EnabledFeatures));
+
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TypeMetadataMismatch);
+    }
+
+    [Fact]
+    public void Validate_ModuleObject_RejectsDivergentExactLocalMetadata()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (func (local i32)))
+            """);
+        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
+        module.Functions[0].ExactLocals[0] = new Microsoft.NET.WebAssembly.Types.ValueType.Number(NumberType.I64);
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => WasmModuleValidator.ValidateAndThrow(module, module.EnabledFeatures));
+
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TypeMetadataMismatch);
+    }
+
+    [Fact]
+    public void Validate_ModuleObject_RejectsFunctionUsingNonFunctionType()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (func))
+            """);
+        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
+        module.TypeDefinitions[0] = module.TypeDefinitions[0] with
+        {
+            CompositeType = new CompositeType.Struct([]),
+        };
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => WasmModuleValidator.ValidateAndThrow(module, module.EnabledFeatures));
+
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TypeIndexOutOfRange);
+    }
+
+    [Fact]
+    public void Validate_ModuleObject_RejectsTagUsingInvalidType()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (tag))
+            """);
+        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
+        module.Tags[0] = new Tag(1);
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => WasmModuleValidator.ValidateAndThrow(module, module.EnabledFeatures));
+
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TypeIndexOutOfRange);
+    }
+
+    [Theory]
+    [InlineData("(tag (type $t))", 1, "Tag type must have an empty result type; found 1 result(s)")]
+    [InlineData("(tag (type $t))", 2, "Tag type must have an empty result type; found 2 result(s)")]
+    [InlineData("(import \"host\" \"tag\" (tag (type $t)))", 1, "Imported tag 'host.tag' type must have an empty result type; found 1 result(s)")]
+    [InlineData("(import \"host\" \"tag\" (tag (type $t)))", 2, "Imported tag 'host.tag' type must have an empty result type; found 2 result(s)")]
+    public void TagTypeUse_WithResults_IsRejectedByTagResultRule(
+        string tagDeclaration,
+        int resultCount,
+        string expectedMessage)
+    {
+        string results = string.Join(' ', Enumerable.Repeat("i32", resultCount));
+        byte[] bytes = WatCompiler.Compile($"""
+            (module
+              (type $t (func (result {results})))
+              {tagDeclaration})
+            """);
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(new MemoryStream(bytes)));
+
+        var diagnostic = Assert.Single(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TagResultTypeNotEmpty);
+        Assert.Equal(expectedMessage, diagnostic.Message);
+        Assert.DoesNotContain(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TypeIndexOutOfRange);
+    }
+
+    [Theory]
+    [InlineData("(tag (result i32))", "Tag type must have an empty result type; found 1 result(s)")]
+    [InlineData("(import \"host\" \"tag\" (tag (result i32)))", "Imported tag 'host.tag' type must have an empty result type; found 1 result(s)")]
+    public void InlineTagResult_ReachesSemanticTagResultRule(
+        string tagDeclaration,
+        string expectedMessage)
+    {
+        byte[] bytes = WatCompiler.Compile($"(module {tagDeclaration})");
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(new MemoryStream(bytes)));
+
+        var diagnostic = Assert.Single(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.TagResultTypeNotEmpty);
+        Assert.Equal(expectedMessage, diagnostic.Message);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("i32")]
+    [InlineData("i32 i64 externref")]
+    public void TagTypeUse_WithAnyParameterCount_Validates(string parameters)
+    {
+        string parameterClause = parameters.Length == 0 ? "" : $"(param {parameters})";
+        var module = WatCompiler.CompileAndValidate($"""
+            (module
+              (type $defined (func {parameterClause}))
+              (type $imported (func {parameterClause}))
+              (import "host" "tag" (tag (type 1)))
+              (tag (type $defined)))
+            """);
+
+        Assert.Single(module.Tags);
+        Assert.Single(module.Imports, import => import.Descriptor is ImportDescriptor.Tag);
+        Assert.All(module.Types, type => Assert.Empty(type.Results));
+    }
+
+    [Fact]
+    public void StackSwitchingFeature_AllowsResultfulTagType()
+    {
+        byte[] bytes = WatCompiler.Compile("""
+            (module
+              (type $suspender (func (param i32) (result i64)))
+              (tag (type $suspender)))
+            """);
+
+        var module = ModuleReader.ReadModule(
+            new MemoryStream(bytes),
+            new ModuleReaderOptions { Features = WasmFeatures.All });
+        WasmModuleValidator.ValidateAndThrow(module, module.EnabledFeatures);
+
+        Assert.Single(module.Tags);
+        Assert.Single(module.Types[0].Results);
+    }
 
     private static byte[] BuildModule(params byte[][] sections)
     {
@@ -314,14 +491,10 @@ public class ValidationTests
         Assert.Throws<WasmFormatException>(() => ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes)));
     }
 
-    // ── 12. Operand/local type checking gap ───────────────────────────────────
-    // The validator does not type-check instruction operands against local types.
+    // ── 12. Operand/local type checking ────────────────────────────────────────
     // This module stores an i64 value into an i32-declared local via local.tee —
-    // ill-typed per the spec. A conforming validator (e.g. wasmtime) rejects it
-    // with "type mismatch: expected i32, found i64". This is the exact shape
-    // crossgen2 emitted for the wasi CoreCLR R2R corelib (Interop+Sys:GetCwd:
-    // i64.mul -> local.tee <i32 local>) which nesm reported as VALID while
-    // wasmtime rejected the module.
+    // ill-typed per the spec. A conforming validator rejects it with
+    // "type mismatch: expected i32, found i64".
     //
     // Type section: 1 type  () -> i32
     private static readonly byte[] TypeSection_ResultI32 =
@@ -364,19 +537,18 @@ public class ValidationTests
     }
 
     [Fact]
-    public void IllTypedLocalTee_I64StoredIntoI32Local_NotRejected_KnownValidatorGap()
+    public void IllTypedLocalTee_I64StoredIntoI32Local_RejectedByPublicModuleLoad()
     {
         // local.tee 0 stores the i64 product into i32-declared local 0 — ill-typed.
-        // wasmtime rejects this exact module ("expected i32, found i64"); nesm does not.
+        // wasmtime rejects this exact module ("expected i32, found i64").
         var bytes = BuildModule(TypeSection_ResultI32, FuncSection_Type0, CodeSection_I64MulTeeInto(0));
 
-        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
-        var result = WasmModuleValidator.Validate(module);
+        var exception = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(new MemoryStream(bytes)));
 
-        // Documents the current gap: the validator performs no operand/local type
-        // checking, so the ill-typed module is reported valid. When that checking
-        // is implemented, flip this to assert rejection (IsValid == false / throws).
-        Assert.True(result.IsValid);
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.FunctionBodyTypeMismatch);
     }
 
     [Fact]
@@ -388,5 +560,56 @@ public class ValidationTests
         var module = ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes));
 
         Assert.Single(module.Functions);
+    }
+
+    [Fact]
+    public void LegacyRethrow_LabelDepthCountsAllEnclosingLabels()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (tag $e)
+              (func
+                (try
+                  (do (throw $e))
+                  (catch $e
+                    (block
+                      (rethrow 1)
+                    )
+                  )
+                )
+              )
+            )
+            """);
+
+        var module = ModuleReader.ReadModule(new MemoryStream(bytes));
+
+        Assert.Single(module.Functions);
+    }
+
+    [Fact]
+    public void LegacyRethrow_LabelMustIdentifyCatchFrame()
+    {
+        var bytes = WatCompiler.Compile("""
+            (module
+              (tag $e)
+              (func
+                (try
+                  (do (throw $e))
+                  (catch $e
+                    (block
+                      (rethrow 0)
+                    )
+                  )
+                )
+              )
+            )
+            """);
+
+        var exception = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(new MemoryStream(bytes)));
+
+        Assert.Contains(
+            exception.Diagnostics,
+            diagnostic => diagnostic.Code == WasmValidationCode.FunctionBodyUnknownLabel);
     }
 }

@@ -595,6 +595,92 @@ public class DwarfVariableReaderTests
             DwarfVariableReader.ParseLocationExpression([0xED, 0x01, 0x00]).Kind);
     }
 
+    // ── #530: the low_pc-as-index fallback must not fire on zeroed DWARF ─────────
+    // wasm-opt without -g leaves EVERY subprogram at DW_AT_low_pc 0, outside every code
+    // range. The #141 fallback reads low_pc as a function index, so on such DWARF it took
+    // the FIRST subprogram at 0 and attached its variables to function 0 — an arbitrary
+    // function's variables, reported with confidence. Two subprograms sharing the value
+    // prove it is not an index; the fallback must then yield nothing. (The single-subprogram
+    // case, UnrelocatedLowPc_Fallback_ResolvesVariables, still resolves.)
+    [Fact]
+    public void Fallback_RefusesLowPcSharedByManySubprograms_ZeroedDwarf()
+    {
+        var abbrevData = BuildAbbrevSection(
+            new AbbrevDef(1, 0x11, true,  [(0x03, 0x08)]),
+            new AbbrevDef(2, 0x24, false, [(0x03, 0x08), (0x0b, 0x0b)]),
+            new AbbrevDef(3, 0x2e, true,  [(0x03, 0x08), (0x11, 0x01)]),
+            new AbbrevDef(4, 0x05, false, [(0x03, 0x08), (0x49, 0x13), (0x02, 0x18)])
+        );
+
+        var dies = new List<byte>();
+        WriteUleb128(dies, 1);
+        WriteInlineString(dies, "zeroed.c");
+        int intTypeOffset = 11 + dies.Count;
+        WriteUleb128(dies, 2);
+        WriteInlineString(dies, "int");
+        dies.Add(4);
+        foreach (var (fn, param) in new[] { ("first", "pf"), ("second", "ps") })
+        {
+            WriteUleb128(dies, 3);
+            WriteInlineString(dies, fn);
+            WriteU32LE(dies, 0);                     // DW_AT_low_pc tombstoned to 0
+            WriteUleb128(dies, 4);
+            WriteInlineString(dies, param);
+            WriteU32LE(dies, (uint)intTypeOffset);
+            WriteWasmLocationExprloc(dies, 0x00, 0); // a real wasm local, so a wrong match is visible
+            dies.Add(0);
+        }
+        dies.Add(0);
+
+        var infoData = BuildInfoSection_D4(dies.ToArray());
+        var funcRanges = new List<(long, long, int)> { (100, 200, 0), (200, 300, 1) };
+
+        Assert.Empty(DwarfVariableReader.ParseVariables(infoData, abbrevData, null, null, null, 0, funcRanges));
+        var infos = DwarfVariableReader.ParseVariableInfos(infoData, abbrevData, null, null, null, 0, funcRanges);
+        Assert.Empty(infos.Variables);
+        Assert.Equal(-1, infos.FrameBaseLocalIndex);
+    }
+
+    // The real #530 build: wasm-opt zeroed all 130 subprogram addresses. No function of the
+    // module may receive variables from that DWARF.
+    [Fact]
+    public void ZeroedDwarf_RealWasmOptBuild_AttachesNoVariablesToAnyFunction()
+    {
+        var module = LoadModule("dwarf/sq_O1_wasmopt.wasm");
+        int imports = module.Imports.Count(i => i.Descriptor is ImportDescriptor.Func);
+        Assert.NotEmpty(module.Functions);
+        Assert.Contains(module.CustomSections, cs => cs.Name == ".debug_info");
+        for (int f = 0; f < imports + module.Functions.Count; f++)
+        {
+            Assert.Empty(DwarfVariableReader.ReadVariables(module, f));
+            Assert.Empty(DwarfVariableReader.ReadVariableInfos(module, f).Variables);
+        }
+    }
+
+    // DWARF 5 code addresses are DW_FORM_addrx indices into .debug_addr. Read as raw
+    // addresses, sq's index (1) is a code offset inside the FIRST function's entry, so sq's
+    // parameter was attached to that function. Resolved through .debug_addr, sq's parameter
+    // lands on sq and on nothing else. The expected index comes from the DWARF 4 build's name
+    // section — an independent source.
+    [Fact]
+    public void Dwarf5_AddrxLowPc_ResolvesThroughDebugAddr()
+    {
+        var named = LoadModule("dwarf/sq_O0.wasm");
+        int sq = Microsoft.NET.WebAssembly.Debugging.Symbols.ModuleSymbols.For(named).NameSection.FunctionNames
+            .Single(kv => kv.Value == "sq").Key;
+        var module = LoadModule("dwarf/sq_O0_dwarf5_noname.wasm");
+        int imports = module.Imports.Count(i => i.Descriptor is ImportDescriptor.Func);
+
+        var info = DwarfVariableReader.ReadVariableInfos(module, sq);
+        var x = Assert.Single(info.Variables);
+        Assert.Equal("x", x.Name);
+        Assert.True(x.IsParameter);
+        var owners = Enumerable.Range(0, imports + module.Functions.Count)
+            .Where(f => DwarfVariableReader.ReadVariableInfos(module, f).Variables.Any(v => v.Name == "x"))
+            .ToList();
+        Assert.Equal([sq], owners);
+    }
+
     // ── Fix A/B: fallback must not steal another function's variables ───────────
     // Reviewer-identified blocker: when a subprogram RANGE-MATCHES the requested
     // funcIndex but has zero mappable wasm-local vars, the old code fell through to

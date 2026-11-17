@@ -44,6 +44,9 @@ public enum WasmFeatures : ulong
     /// <summary>Relaxed SIMD proposal — non-deterministic SIMD ops with native-mapping semantics (0xFD 0x100–0x113).</summary>
     RelaxedSimd       = 1UL << 9,
 
+    /// <summary>Wide arithmetic proposal — 128-bit add/subtract and widening i64 multiply.</summary>
+    WideArithmetic    = 1UL << 10,
+
     // ── Debug / tooling ────────────────────────────────────────────────────
     /// <summary>
     /// Parse DWARF .debug_line sections into <see cref="Module.WasmModule.DebugInfo"/>.
@@ -56,12 +59,12 @@ public enum WasmFeatures : ulong
     Mvp               = None,
 
     /// <summary>
-    /// All post-MVP runtime proposals enabled (current implicit behavior).
+    /// All post-MVP proposals with an implemented runtime and validation surface enabled.
     /// Does NOT include DebugInfo (opt-in only).
     /// </summary>
     Default           = MultiValue | ReferenceTypes | BulkMemory | Simd
-                      | Gc | ExceptionHandling | Threads | TailCalls | StackSwitching | RelaxedSimd,
+                      | ExceptionHandling | TailCalls | RelaxedSimd | WideArithmetic,
 
-    /// <summary>Everything including debug info parsing.</summary>
-    All               = Default | DebugInfo,
+    /// <summary>Every implemented parsing/validation surface, including opt-in debug info parsing.</summary>
+    All               = Default | Gc | StackSwitching | DebugInfo,
 }
