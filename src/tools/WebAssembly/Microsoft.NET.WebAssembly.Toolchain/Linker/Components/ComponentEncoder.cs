@@ -135,7 +135,7 @@ public static class ComponentEncoder
     /// <summary>
     /// Reads a <c>--component-type</c> input: either a component-type payload itself (a component binary encoding
     /// a world) or a core module carrying <c>component-type</c> custom sections (as written by
-    /// <c>wasm-tools component embed --only-custom</c>). WIT text is not supported.
+    /// <c>wasm-tools component embed --only-custom</c>), or WIT text, encoded like wit-component (<see cref="WitWorldEncoder"/>).
     /// </summary>
     public static IReadOnlyList<byte[]> ReadComponentTypeFile(byte[] bytes)
     {
@@ -150,8 +150,9 @@ public static class ComponentEncoder
             return payloads;
         }
 
-        throw new NotSupportedException(
-            "WIT text component types are not supported; encode the world first with `wasm-tools component embed --only-custom <wit> --world <world> ...`.");
+        // Anything else is WIT text, as wasm-component-ld's --component-type takes: the file's package must have one world.
+        string text = System.Text.Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF');
+        return [WitWorldEncoder.EncodePayload(WitText.ResolveWorld(text))];
     }
 
     private static bool IsComponentType(string name) =>
