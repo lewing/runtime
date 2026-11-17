@@ -1591,7 +1591,10 @@ public static partial class ModuleReader
             RelocationType type = (RelocationType)reader.ReadByte();
             uint offset = reader.ReadU32Leb128();
             uint index = reader.ReadU32Leb128();
-            int addend = RelocationTypeRequiresAddend(type) ? reader.ReadS32Leb128() : 0;
+            // LLVM writes every addend as an SLEB128 of int64; wasm32 addends fit in 32 bits.
+            int addend = RelocationTypeRequiresAddend(type)
+                ? checked((int)reader.ReadS64Leb128())
+                : 0;
 
             entries.Add(new Relocation
             {
@@ -1615,6 +1618,8 @@ public static partial class ModuleReader
     private static bool SymbolHasInlineName(SymbolFlags flags)
         => !flags.HasFlag(SymbolFlags.Undefined) || flags.HasFlag(SymbolFlags.ExplicitName);
 
+    // Mirrors llvm::wasm::relocTypeHasAddend (llvm/lib/BinaryFormat/Wasm.cpp). Table-index relocations,
+    // including the REL forms, carry no addend.
     private static bool RelocationTypeRequiresAddend(RelocationType type) => type switch
     {
         RelocationType.R_WASM_MEMORY_ADDR_LEB or
@@ -1623,7 +1628,6 @@ public static partial class ModuleReader
         RelocationType.R_WASM_FUNCTION_OFFSET_I32 or
         RelocationType.R_WASM_SECTION_OFFSET_I32 or
         RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB or
-        RelocationType.R_WASM_TABLE_INDEX_REL_SLEB or
         RelocationType.R_WASM_MEMORY_ADDR_LEB64 or
         RelocationType.R_WASM_MEMORY_ADDR_SLEB64 or
         RelocationType.R_WASM_MEMORY_ADDR_I64 or
@@ -1631,7 +1635,7 @@ public static partial class ModuleReader
         RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB or
         RelocationType.R_WASM_FUNCTION_OFFSET_I64 or
         RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I32 or
-        RelocationType.R_WASM_TABLE_INDEX_REL_SLEB64 or
+        RelocationType.R_WASM_MEMORY_ADDR_LOCREL_I64 or
         RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB64 => true,
         _ => false,
     };

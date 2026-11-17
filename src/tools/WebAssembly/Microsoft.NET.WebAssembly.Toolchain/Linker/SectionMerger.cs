@@ -523,10 +523,10 @@ public sealed class SectionMerger
         // ── Custom sections: debug info + name ─────────────────────────────────────
         var customSections = new List<CustomSection>();
 
-        if (!options.StripDebug)
+        if (!options.StripDebug && !options.StripAll)
             customSections.AddRange(MergeDebugSections(inputs, indexMaps));
 
-        if (!options.NoNameSection)
+        if (!options.NoNameSection && !options.StripAll)
         {
             var nameSection = BuildNameSection(resolvedSymbols);
             if (nameSection is not null)
@@ -534,7 +534,7 @@ public sealed class SectionMerger
         }
 
         // ── Producers section ──────────────────────────────────────────────────────
-        var producers = MergeProducers(inputs);
+        var producers = options.StripAll ? null : MergeProducers(inputs);
 
         return new WasmModule
         {

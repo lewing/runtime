@@ -97,12 +97,12 @@ public class WasmLdCommandLineTests
     }
 
     [Fact]
-    public void StripAll_StripsDebugInfoAndNames()
+    public void StripAllAndCompressRelocations_MapToLinkerOptions()
     {
-        var options = WasmLdCommandLine.Parse(["-s"]).Options;
+        var options = WasmLdCommandLine.Parse(["-s", "--compress-relocations"]).Options;
 
-        Assert.True(options.StripDebug);
-        Assert.True(options.NoNameSection);
+        Assert.True(options.StripAll);
+        Assert.True(options.CompressRelocations);
     }
 
     [Fact]
@@ -117,7 +117,7 @@ public class WasmLdCommandLineTests
     [Fact]
     public void IgnoredOptions_AreReportedAsWarnings()
     {
-        var commandLine = WasmLdCommandLine.Parse(["--compress-relocations", "--error-limit=0"]);
+        var commandLine = WasmLdCommandLine.Parse(["--fatal-warnings", "--error-limit=0"]);
 
         Assert.Single(commandLine.Warnings);
     }

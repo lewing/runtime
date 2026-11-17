@@ -20,10 +20,9 @@ namespace Microsoft.WebAssembly.Build.Tasks;
 /// </summary>
 public class WasmLink : Task
 {
-    /// <summary>Input <c>.o</c>, <c>.wasm</c> and <c>.a</c> files.</summary>
-    [NotNull]
-    [Required]
-    public ITaskItem[]? InputFiles { get; set; }
+    /// <summary>Input <c>.o</c>, <c>.wasm</c> and <c>.a</c> files, appended after <see cref="ExtraArguments"/>.
+    /// Inputs may also be passed only through <see cref="ExtraArguments"/>, for example in a response file.</summary>
+    public ITaskItem[] InputFiles { get; set; } = [];
 
     /// <summary>Output module path.</summary>
     [NotNull]
