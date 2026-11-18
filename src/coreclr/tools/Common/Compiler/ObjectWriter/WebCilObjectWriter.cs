@@ -19,6 +19,7 @@ using Internal.Text;
 using Internal.TypeSystem;
 using Microsoft.NET.WebAssembly.Webcil;
 using CodeDataLayout = CodeDataLayoutMode.CodeDataLayout;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -394,7 +395,7 @@ namespace ILCompiler.ObjectWriter
                     throw new InvalidDataException("Wasm async resume info fixups are not ordered by location.");
                 }
 
-                WriteULEB128(destinationStream, fixupRva - previousFixupEndRva);
+                WasmLeb128.WriteULeb128(destinationStream, fixupRva - previousFixupEndRva);
 
                 sourcePosition = relocation.Offset + Relocation.GetSize(relocation.Type);
                 sourceStream.Position = sourcePosition;
@@ -449,25 +450,10 @@ namespace ILCompiler.ObjectWriter
                 return value;
             }
 
-            static void WriteULEB128(Stream stream, uint value)
-            {
-                do
-                {
-                    byte current = (byte)(value & 0x7F);
-                    value >>= 7;
-                    if (value != 0)
-                    {
-                        current |= 0x80;
-                    }
-                    stream.WriteByte(current);
-                } while (value != 0);
-            }
         }
 
         private protected override void EmitObjectFile(Stream outputFileStream)
         {
-            Debug.Assert(outputFileStream.CanSeek, $"EmitObjectFile requires seekable output stream");
-
             if (_pendingBaseRelocs.Count > 0)
             {
                 GetOrCreateSection<WebcilSection>(WebcilRelocSection, out _);
@@ -505,7 +491,7 @@ namespace ILCompiler.ObjectWriter
            * Write Wasm Sections, Excluding Data
            *********************************************************************/
 
-            EmitWasmHeader(outputFileStream);
+            WasmModuleWriter writer = new(outputFileStream);
             int codeSectionIndex = _sections.Contains(ObjectNodeSection.WasmCodeSection.Name)
                 ? _sections.GetSectionIndex(ObjectNodeSection.WasmCodeSection.Name)
                 : -1;
@@ -526,13 +512,12 @@ namespace ILCompiler.ObjectWriter
                     }
                 }
 
+                ((IWasmSection)section).Emit(writer);
                 if (index == codeSectionIndex)
                 {
-                    // Function bodies begin after the section header and the (externally counted) entry-count prefix.
-                    codeContentFileOffset = outputFileStream.Position + (section.EncodeSize() - section.ContentReadStream.Length);
+                    // The function bodies are the last bytes of the code section, after its header and entry count.
+                    codeContentFileOffset = writer.Position - section.ContentReadStream.Length;
                 }
-
-                section.EmitToStream(outputFileStream);
             }
 
 #if READYTORUN
@@ -550,9 +535,8 @@ namespace ILCompiler.ObjectWriter
 
             // Create combined data section and emit
             WasmDataSection dataSection = new WasmDataSection([webcilSizeSegment, webcilPayloadSegment], new Utf8String("data"));
-            PaddingWasmSection paddingSection = new PaddingWasmSection(dataSection.FileAlignment, outputFileStream.Position);
-            paddingSection.EmitToStream(outputFileStream);
-            dataSection.EmitToStream(outputFileStream);
+            writer.WritePaddingSection(dataSection.FileAlignment);
+            dataSection.Emit(writer);
 #endif
 
             if (_emitNameSection)
@@ -561,7 +545,7 @@ namespace ILCompiler.ObjectWriter
                 // in-image record of function names now that they are no longer carried by the export table,
                 // and wasm-merge -g synthesizes the merged module's names from it.
                 WasmNameSection nameSection = new WasmNameSection(_wasmSymbolManager.GetDefinitions(WasmIndexSpace.Function));
-                nameSection.EmitToStream(outputFileStream);
+                nameSection.Emit(writer);
             }
 
             if (_outputInfoBuilder is not null)
@@ -781,9 +765,8 @@ namespace ILCompiler.ObjectWriter
                     tempStream.SetLength(tempStream.Position);
 
                     // Write the temp stream back into the original stream with a NEW length prefix, starting at writeCursor
-                    DwarfHelper.WriteULEB128(countBuffer, (ulong)tempStream.Length);
                     sectionStream.Position = writeCursor;
-                    sectionStream.Write(countBuffer, 0, (int)DwarfHelper.SizeOfULEB128((ulong)tempStream.Length));
+                    sectionStream.Write(countBuffer, 0, WasmLeb128.WriteULeb128(countBuffer, (ulong)tempStream.Length));
                     writeCursor = sectionStream.Position; // set writeCursor to the position after the length prefix we just wrote
 
                     tempStream.Position = 0;
@@ -794,9 +777,8 @@ namespace ILCompiler.ObjectWriter
                 else
                 {
                     // No relocations in this blob. Copy the blob as-is but shrink the length prefix if possible.
-                    DwarfHelper.WriteULEB128(countBuffer, (ulong)blob.Size);
                     sectionStream.Position = writeCursor;
-                    sectionStream.Write(countBuffer, 0, (int)DwarfHelper.SizeOfULEB128((ulong)blob.Size));
+                    sectionStream.Write(countBuffer, 0, WasmLeb128.WriteULeb128(countBuffer, (ulong)blob.Size));
                     writeCursor = sectionStream.Position;
 
                     CopyOnly(src: sectionStream, srcPos: blob.Start, dest: sectionStream, destPos: writeCursor, count: blob.Size);
@@ -1057,7 +1039,7 @@ namespace ILCompiler.ObjectWriter
                 return;
             }
 
-            if (shrink && _sections[sectionIndex] is WasmSection { Type: WasmSectionType.Code })
+            if (shrink && _sections[sectionIndex] is WasmSection { Type: WasmSectionId.Code })
             {
                 sectionStream.Position = 0;
                 sectionStream.CopyTo(dstStream);

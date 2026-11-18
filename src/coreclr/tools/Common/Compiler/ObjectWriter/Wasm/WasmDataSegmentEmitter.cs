@@ -39,9 +39,9 @@ namespace ILCompiler.ObjectWriter
             _alignment = Math.Max(_alignment, alignment);
         }
 
-        public override int EncodeSize() => HeaderSize + ContentSize;
+        public int EncodeSize() => HeaderSize + ContentSize;
 
-        public override int EmitToStream(Stream outputFileStream)
+        public int EmitToStream(Stream outputFileStream)
         {
             Span<byte> headerBuffer = stackalloc byte[HeaderSize];
             int headerSize = WasmDataSegmentEncoding.EncodeHeader(
