@@ -220,6 +220,95 @@ public sealed partial class WasmCodeWriterTests
         Assert.True(compared > 470, $"only {compared} opcodes compared");
     }
 
+    /// <summary>The source of <c>WasmOp.cs</c>: every <see cref="OpcodeTable"/> opcode except stack switching, plus typed <c>select</c>.</summary>
+    private static string GenerateWasmOpSource()
+    {
+        var ops = new List<(uint Value, string Name, string Mnemonic, WasmImmediateShape Shape)>
+        {
+            // Typed select shares the select mnemonic, so it is not in the WAT table.
+            (0x1C, "SelectTyped", "select (typed)", WasmImmediateShape.SelectTyped),
+        };
+        foreach (string mnemonic in OpcodeTable.AllMnemonics)
+        {
+            OpcodeEntry entry = OpcodeTable.Get(mnemonic);
+            if (entry.Opcodes[0] == WasmOpcode.StackSwitchingPrefix)
+                continue;
+            uint value = entry.Opcodes[0];
+            if (entry.Opcodes.Length > 1)
+            {
+                int at = 1;
+                value = value << 24 | WasmLeb128.ReadU32(entry.Opcodes, ref at);
+                Assert.Equal(entry.Opcodes.Length, at);
+            }
+
+            ops.Add((value, PascalCase(mnemonic), mnemonic, ExpectedShape(entry.Immediate)));
+        }
+
+        ops.Sort((a, b) => a.Value.CompareTo(b.Value));
+        var s = new StringBuilder();
+        s.Append("""
+            // Generated from Microsoft.NET.WebAssembly.Wat.OpcodeTable (stack switching, 0xE0, excluded) by
+            // WasmCodeWriterTests.GenerateWasmOpSource. Do not edit; regenerate with
+            // NESM_REGENERATE_WASMOP=1 dotnet test tests/Microsoft.NET.WebAssembly.Toolchain.Tests --filter WasmOpSourceIsGeneratedFromTheOpcodeTable
+
+            namespace Microsoft.NET.WebAssembly.Binary.Writing;
+
+            /// <summary>
+            /// WebAssembly instruction opcodes for <see cref="WasmCodeWriter"/>. A single-byte opcode is its value; a prefixed
+            /// one is <c>prefix &lt;&lt; 24 | sub-opcode</c> (the sub-opcode is written as a u32 LEB128), as dotnet/runtime's
+            /// <c>WasmExprKind</c> encodes them.
+            /// </summary>
+            public enum WasmOp : uint
+            {
+
+            """);
+        foreach (var op in ops)
+            s.Append(CultureInfo.InvariantCulture, $"    /// <summary><c>{op.Mnemonic}</c></summary>\n    {op.Name} = 0x{op.Value:X},\n");
+        s.Append("""
+            }
+
+            /// <summary>Opcode properties.</summary>
+            public static class WasmOps
+            {
+                /// <summary>The immediates <paramref name="op"/> takes.</summary>
+                /// <exception cref="ArgumentOutOfRangeException"><paramref name="op"/> is not a defined opcode.</exception>
+                public static WasmImmediateShape GetImmediateShape(WasmOp op) => op switch
+                {
+
+            """);
+        foreach (WasmImmediateShape shape in Enum.GetValues<WasmImmediateShape>())
+        {
+            var line = new StringBuilder("        ");
+            bool first = true;
+            foreach (var op in ops)
+            {
+                if (op.Shape != shape)
+                    continue;
+                string item = (first ? "" : " or ") + "WasmOp." + op.Name;
+                if (!first && line.Length + item.Length + 3 > 120)
+                {
+                    s.Append(line).Append(" or\n");
+                    line.Clear().Append("            ");
+                    item = item[4..];
+                }
+
+                line.Append(item);
+                first = false;
+            }
+
+            Assert.False(first, $"no opcode has shape {shape}");
+            s.Append(line).Append(CultureInfo.InvariantCulture, $" => WasmImmediateShape.{shape},\n");
+        }
+
+        s.Append("""
+                    _ => throw new ArgumentOutOfRangeException(nameof(op), op, "Not a defined opcode."),
+                };
+            }
+
+            """);
+        return s.ToString();
+    }
+
     private static string PascalCase(string mnemonic) =>
         string.Concat(mnemonic.Split('.', '_').Select(part => char.ToUpperInvariant(part[0]) + part[1..]));
 
@@ -290,5 +379,26 @@ public sealed partial class WasmCodeWriterTests
             if (!bodies[i].AsSpan().SequenceEqual(reemitted))
                 ObjectReencoder.AssertBytesEqual(bodies[i], reemitted, $"{relativePath} body {i}");
         }
+    }
+
+    private static HashSet<WasmImmediateShape> Shapes(byte[] body)
+    {
+        int at = 0;
+        uint groups = WasmLeb128.ReadU32(body, ref at);
+        for (int i = 0; i < groups; i++)
+        {
+            WasmLeb128.ReadU32(body, ref at);
+            at++;
+        }
+
+        var shapes = new HashSet<WasmImmediateShape>();
+        var cursor = new InstructionCursor(body[at..], WasmFeatures.All);
+        while (cursor.MoveNext(out DecodedInstruction instruction))
+        {
+            OpcodeId id = instruction.OpcodeId;
+            shapes.Add(WasmOps.GetImmediateShape((WasmOp)(id.IsPrefixed ? ((uint)id.Opcode << 24) | id.SubOpcode : id.Opcode)));
+        }
+
+        return shapes;
     }
 }

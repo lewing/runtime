@@ -3,6 +3,7 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Wat;
 
+using Microsoft.DotNet.XUnitExtensions;
 using System.Diagnostics;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Wat;
@@ -242,6 +243,26 @@ public partial class WasmDisassemblerTests
         Assert.Equal(originalNameSection, roundTrippedNameSection);
     }
 
+    [ConditionalFact]
+    public void Disassemble_LocalNamesMatchWasmToolsOracle()
+    {
+        var wasmTools = FindWasmTools();
+        if (wasmTools == null)
+        {
+            throw new SkipTestException(
+                "wasm-tools is required for the independent disassembly oracle; "
+                + "install it with `cargo install wasm-tools` or set WASM_TOOLS.");
+        }
+
+        var bytes = WatCompiler.Compile(SparseNamedLocalsWat);
+
+        var nesmDisassembly = WasmDisassembler.Disassemble(bytes);
+        var wasmToolsDisassembly = PrintWithWasmTools(wasmTools, bytes);
+
+        AssertNameBindings(wasmToolsDisassembly);
+        AssertNameBindings(nesmDisassembly);
+    }
+
     [Fact]
     public void Disassemble_PreservesImportedParamNames()
     {
@@ -281,5 +302,31 @@ public partial class WasmDisassemblerTests
     {
         var module = ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes));
         return module.CustomSections.Single(section => section.Name == "name").Content;
+    }
+
+    private static string? FindWasmTools()
+        => WasmToolsTestHelper.Find();
+
+    private static string PrintWithWasmTools(string wasmTools, byte[] bytes)
+    {
+        var startInfo = new ProcessStartInfo(wasmTools)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add("print");
+        startInfo.ArgumentList.Add("-");
+
+        using var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+        process.StandardInput.BaseStream.Write(bytes);
+        process.StandardInput.Close();
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        Assert.True(process.WaitForExit(10_000), "wasm-tools print timed out.");
+        Assert.True(process.ExitCode == 0, $"wasm-tools print failed: {error}");
+        return output;
     }
 }

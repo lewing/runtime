@@ -17,7 +17,9 @@ Binary/WasmObjectWriterApiTests.cs
 Linker/ArArchiveReaderTests.cs
 Linker/DeadCodeEliminatorTests.cs
 Linker/DebugAndNameSectionTests.cs
+Linker/ExternalTool.cs
 Linker/ImportMergingTests.cs
+Linker/ModuleFacets.cs
 Linker/RelocationEngineTests.cs
 Linker/SectionMergerTests.cs
 Linker/SingleObjectRelocatorTests.cs
@@ -26,6 +28,7 @@ Linker/WasmLinkerTests.cs
 Linker/WasmModuleStartFunctionTests.cs
 Linker/WatIntegrationTests.cs
 ValidationTests.cs
+WasmToolsTestHelper.cs
 Wat/StreamingTests.cs
 Wat/WasmDisassemblerTests.cs
 Wat/WatCompilerTests.cs

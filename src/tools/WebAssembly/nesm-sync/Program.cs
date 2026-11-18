@@ -7,9 +7,7 @@ using Microsoft.NET.WebAssembly.NesmSync;
 //     Renames Nesm.* namespaces to Microsoft.NET.WebAssembly.* and adds license headers, in place.
 // nesm-sync extract <file> <member>...
 //     Writes <file without .cs>.RuntimeLocal.cs with the named members, which then replace nesm's on every sync.
-// nesm-sync members <file>...
-//     Lists each member of each file with a hash of its text.
-// nesm-sync tests <dir> --nesm <checkout> --library <dir> --runtime-tests <dir> --synced <list> [--report]
+// nesm-sync tests <dir> --library <dir> --runtime-tests <dir> --synced <list> [--report]
 //     Also adapts nesm's tests to this repository: see TestAdapter.
 try
 {
@@ -22,7 +20,6 @@ try
         case ["tests", string dir, .. string[] options]:
             var adapter = new TestAdapter(
                 stagedDirectory: dir,
-                nesmRoot: Option(options, "--nesm"),
                 libraryDirectory: Option(options, "--library"),
                 runtimeTestsDirectory: Option(options, "--runtime-tests"),
                 syncedFiles: File.ReadAllLines(Option(options, "--synced")).Where(static l => l.Length != 0).ToArray(),
@@ -33,19 +30,10 @@ try
             // Moves hand-adapted members of a synced test file into its runtime-only partial file.
             File.WriteAllText(Path.ChangeExtension(file, null) + TestAdapter.RuntimeLocalSuffix, Overlay.Extract(File.ReadAllText(file), members));
             return 0;
-        case ["members", .. string[] paths]:
-            // Each member of each file, with a hash of its text: for comparing a rewrite with hand-adapted sources.
-            foreach (string path in paths)
-            {
-                foreach (string line in MemberHashes.Describe(File.ReadAllText(path)))
-                    Console.WriteLine($"{path}\t{line}");
-            }
-
-            return 0;
         default:
             Console.Error.WriteLine("""
                 Usage: nesm-sync library <dir>
-                       nesm-sync tests <dir> --nesm <checkout> --library <dir> --runtime-tests <dir> --synced <list> [--report]
+                       nesm-sync tests <dir> --library <dir> --runtime-tests <dir> --synced <list> [--report]
                 """);
             return 1;
     }

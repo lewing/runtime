@@ -3,6 +3,7 @@
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
 
+using Microsoft.DotNet.XUnitExtensions;
 using System.Diagnostics;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
@@ -140,6 +141,29 @@ public partial class WatIntegrationTests
         Assert.Throws<WasmValidationException>(() => _linker.Link([invalidInput]));
     }
 
+    [ConditionalFact]
+    public void LinkToBinary_ShippedArtifact_AgreesWithNesmAndWasmTools()
+    {
+        var first = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "first") (param i32) (result i32)
+                (local.get 0)))
+            """);
+        var second = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "second") (param i32) (result i32)
+                (local.get 0)))
+            """);
+
+        byte[] binary = _linker.LinkToBinary([first, second]);
+        var reparsed = ModuleReader.ReadModuleAndValidate(new MemoryStream(binary));
+
+        AssertSemanticValidatorsAccept(reparsed);
+        AssertWasmToolsAccepts(binary);
+    }
+
     // ── GcSections=true with plain WAT (no linking section) ─────────────────────
 
     [Fact]
@@ -158,6 +182,45 @@ public partial class WatIntegrationTests
         Assert.Equal(2, merged.Functions.Count);
         Assert.True(merged.Exports.ContainsKey("visible"));
         Assert.True(merged.Exports.ContainsKey("also_visible"));
+    }
+
+    private static void AssertSemanticValidatorsAccept(WasmModule module)
+    {
+        var typeResult = TypeDeclarationValidator.Validate(module);
+        Assert.True(typeResult.IsValid, FormatDiagnostics(typeResult));
+
+        var bodyResult = FunctionBodyValidator.ValidateModule(module, WasmFeatures.All);
+        Assert.True(bodyResult.IsValid, FormatDiagnostics(bodyResult));
+
+        var moduleResult = WasmModuleValidator.Validate(module);
+        Assert.True(moduleResult.IsValid, FormatDiagnostics(moduleResult));
+    }
+
+    private static string FormatDiagnostics(WasmValidationResult result)
+        => string.Join(Environment.NewLine, result.Diagnostics.Select(static diagnostic => diagnostic.Message));
+
+    private static void AssertWasmToolsAccepts(byte[] binary)
+    {
+        string tool = WasmToolsTestHelper.RequireOracle("The independent linker-output oracle");
+
+        var startInfo = new ProcessStartInfo(tool)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add("validate");
+        startInfo.ArgumentList.Add("-f");
+        startInfo.ArgumentList.Add("all");
+        startInfo.ArgumentList.Add("-");
+
+        using var process = Process.Start(startInfo)!;
+        process.StandardInput.BaseStream.Write(binary);
+        process.StandardInput.Close();
+        string standardError = process.StandardError.ReadToEnd();
+        Assert.True(process.WaitForExit(10_000), "wasm-tools validate timed out.");
+        Assert.True(process.ExitCode == 0, $"wasm-tools validate -f all rejected linked binary: {standardError}");
     }
 
     // ── Type deduplication under linking ────────────────────────────────────────

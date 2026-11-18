@@ -6,6 +6,11 @@
 // under the Apache License v2.0 with LLVM Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+// SA1136 and CA1859: this file is a line-for-line port kept diffable against LLVM. Its compact enum lists mirror
+// LLVM's enum declarations, and its parser methods return Node where LLVM returns Node*; one enum value per line,
+// or return types narrowed to concrete node classes, would diverge from LLVM for no measurable gain.
+#pragma warning disable SA1136, CA1859
+
 namespace Microsoft.NET.WebAssembly.Linker.Demangling;
 
 internal sealed partial class ItaniumParser

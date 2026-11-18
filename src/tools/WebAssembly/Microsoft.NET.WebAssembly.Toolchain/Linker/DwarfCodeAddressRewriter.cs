@@ -245,7 +245,7 @@ internal static class DwarfCodeAddressRewriter
             foreach (var (position, size, offset) in stmtListPatches)
             {
                 if (!offsets.TryGetValue(offset, out uint newOffset))
-                    throw new DwarfRewriteException($"DW_AT_stmt_list {offset:#x} is not the start of a line program");
+                    throw new DwarfRewriteException($"DW_AT_stmt_list 0x{offset:x} is not the start of a line program");
                 WriteUnsigned(info, position, size, newOffset);
             }
         }
@@ -349,7 +349,7 @@ internal static class DwarfCodeAddressRewriter
                 if (code == 0)
                     continue;
                 if (!abbreviations.TryGetValue(code, out var abbreviation))
-                    throw new DwarfRewriteException($"abbreviation {code} of the unit at {unitStart:#x} is not defined");
+                    throw new DwarfRewriteException($"abbreviation {code} of the unit at 0x{unitStart:x} is not defined");
 
                 ulong? lowPcOld = null;
                 ulong? highPcOld = null;
@@ -381,7 +381,7 @@ internal static class DwarfCodeAddressRewriter
                                     WriteUnsigned(info, valueStart, 4, Tombstone);
                                     break;
                                 case CodeAddressMap.Outcome.Invalid:
-                                    throw new DwarfRewriteException($"attribute {spec.Name:#x} at .debug_info+{valueStart:#x} names {value:#x}, which is not an instruction boundary");
+                                    throw new DwarfRewriteException($"attribute 0x{spec.Name:x} at .debug_info+0x{valueStart:x} names 0x{value:x}, which is not an instruction boundary");
                             }
 
                             break;
@@ -401,7 +401,7 @@ internal static class DwarfCodeAddressRewriter
                             locRefs.Add(((uint)value, unitIndex));
                             break;
                         case DwForm.SecOffset when spec.Name is not (DwAt.MacroInfo or DwAt.GnuMacros): // address-free
-                            throw new DwarfRewriteException($"attribute {spec.Name:#x} with DW_FORM_sec_offset is not supported");
+                            throw new DwarfRewriteException($"attribute 0x{spec.Name:x} with DW_FORM_sec_offset is not supported");
                     }
                 }
 
@@ -413,7 +413,7 @@ internal static class DwarfCodeAddressRewriter
                     if (map.Map(low, out uint newLow) == CodeAddressMap.Outcome.Mapped)
                     {
                         if (map.Map(low + h.Length, out uint newHigh) != CodeAddressMap.Outcome.Mapped || newHigh < newLow)
-                            throw new DwarfRewriteException($"DW_AT_high_pc at .debug_info+{h.Position:#x} does not end in the function it starts in");
+                            throw new DwarfRewriteException($"DW_AT_high_pc at .debug_info+0x{h.Position:x} does not end in the function it starts in");
                         WriteFormValue(info, h.Position, h.Form, h.Width, newHigh - newLow);
                     }
                 }
@@ -457,7 +457,7 @@ internal static class DwarfCodeAddressRewriter
             case DwForm.FlagPresent: return 0;
             case DwForm.GnuRefAlt or DwForm.GnuStrpAlt: return ReadU32(data, ref pos);
             default:
-                throw new DwarfRewriteException($"DW_FORM {form:#x} (DWARF {version}) is not supported");
+                throw new DwarfRewriteException($"DW_FORM 0x{form:x} (DWARF {version}) is not supported");
         }
     }
 
@@ -473,7 +473,7 @@ internal static class DwarfCodeAddressRewriter
                 WasmLeb128.WritePaddedULeb128(data.Slice(position, width), value);
                 break;
             default:
-                throw new DwarfRewriteException($"a DW_AT_high_pc length of {value} does not fit its form {form:#x}");
+                throw new DwarfRewriteException($"a DW_AT_high_pc length of {value} does not fit its form 0x{form:x}");
         }
     }
 
@@ -562,7 +562,7 @@ internal static class DwarfCodeAddressRewriter
             if (bases.TryGetValue(offset, out uint existing))
             {
                 if (existing != baseOld)
-                    throw new DwarfRewriteException($"list {offset:#x} is used by units with different base addresses");
+                    throw new DwarfRewriteException($"list 0x{offset:x} is used by units with different base addresses");
                 continue;
             }
 
@@ -618,10 +618,10 @@ internal static class DwarfCodeAddressRewriter
             }
 
             if (outcome != CodeAddressMap.Outcome.Mapped || map.Map(absEnd, out uint newEnd) != CodeAddressMap.Outcome.Mapped || newEnd < newBegin)
-                throw new DwarfRewriteException($"the list entry at {entry:#x} [{absBegin:#x}, {absEnd:#x}) does not lie within one function");
+                throw new DwarfRewriteException($"the list entry at 0x{entry:x} [0x{absBegin:x}, 0x{absEnd:x}) does not lie within one function");
             uint relBegin = newBegin - baseNew, relEnd = newEnd - baseNew;
             if ((relBegin == 0 && relEnd == 0) || relBegin == 0xFFFFFFFF)
-                throw new DwarfRewriteException($"the list entry at {entry:#x} would become a terminator or base selection");
+                throw new DwarfRewriteException($"the list entry at 0x{entry:x} would become a terminator or base selection");
             WriteUnsigned(data, entry, 4, relBegin);
             WriteUnsigned(data, entry + 4, 4, relEnd);
         }
@@ -631,7 +631,7 @@ internal static class DwarfCodeAddressRewriter
     {
         CodeAddressMap.Outcome.Mapped or CodeAddressMap.Outcome.Special => (mapped, false),
         CodeAddressMap.Outcome.Removed => (ListTombstone, true),
-        _ => throw new DwarfRewriteException($"base address {baseOld:#x} is not an instruction boundary"),
+        _ => throw new DwarfRewriteException($"base address 0x{baseOld:x} is not an instruction boundary"),
     };
 
     // ── .debug_aranges ───────────────────────────────────────────────────────
@@ -667,14 +667,14 @@ internal static class DwarfCodeAddressRewriter
                 {
                     if (CodeAddressMap.IsSpecial(address) || facts.DataAddresses.Contains((unitOffset, address)))
                         continue;
-                    unclassified = $"its range [{address:#x}, +{length:#x}) at .debug_aranges+{tuple:#x} is neither a code range of .debug_info nor a variable's address";
+                    unclassified = $"its range [0x{address:x}, +0x{length:x}) at .debug_aranges+0x{tuple:x} is neither a code range of .debug_info nor a variable's address";
                     return null;
                 }
                 switch (map.Map(address, out uint newAddress))
                 {
                     case CodeAddressMap.Outcome.Mapped:
                         if (map.Map((ulong)address + length, out uint newEnd) != CodeAddressMap.Outcome.Mapped || newEnd < newAddress)
-                            throw new DwarfRewriteException($"the address range at .debug_aranges+{tuple:#x} does not lie within one function");
+                            throw new DwarfRewriteException($"the address range at .debug_aranges+0x{tuple:x} does not lie within one function");
                         WriteUnsigned(data, tuple, 4, newAddress);
                         WriteUnsigned(data, tuple + 4, 4, newEnd - newAddress);
                         break;
@@ -682,7 +682,7 @@ internal static class DwarfCodeAddressRewriter
                         WriteUnsigned(data, tuple, 4, Tombstone);
                         break;
                     case CodeAddressMap.Outcome.Invalid:
-                        throw new DwarfRewriteException($"the address range at .debug_aranges+{tuple:#x} starts at {address:#x}, which is not an instruction boundary");
+                        throw new DwarfRewriteException($"the address range at .debug_aranges+0x{tuple:x} starts at 0x{address:x}, which is not an instruction boundary");
                 }
             }
 
@@ -720,7 +720,7 @@ internal static class DwarfCodeAddressRewriter
             int lineRange = original[pos++];
             int opcodeBase = original[pos++];
             if (minimumInstructionLength != 1 || lineRange == 0 || opcodeBase == 0)
-                throw new DwarfRewriteException($"the line table at {unitStart:#x} has minimum_instruction_length {minimumInstructionLength}, line_range {lineRange}, opcode_base {opcodeBase}");
+                throw new DwarfRewriteException($"the line table at 0x{unitStart:x} has minimum_instruction_length {minimumInstructionLength}, line_range {lineRange}, opcode_base {opcodeBase}");
             ReadOnlySpan<byte> standardLengths = original.Slice(pos, opcodeBase - 1);
 
             int newProgramStart = checked((int)programs.Length);
@@ -805,7 +805,7 @@ internal static class DwarfCodeAddressRewriter
                 else if (sub == DwLne.SetAddress)
                 {
                     if (length != 5)
-                        throw new DwarfRewriteException($"DW_LNE_set_address in the line table at {unitStart:#x} has a {length - 1}-byte address");
+                        throw new DwarfRewriteException($"DW_LNE_set_address in the line table at 0x{unitStart:x} has a {length - 1}-byte address");
                     uint address = BinaryPrimitives.ReadUInt32LittleEndian(code[(pos + 1)..]);
                     output.Write(code.Slice(opStart, pos + 1 - opStart));
                     switch (map.Map(address, out uint newValue))
@@ -823,7 +823,7 @@ internal static class DwarfCodeAddressRewriter
                             mapped = false;
                             break;
                         default:
-                            throw new DwarfRewriteException($"DW_LNE_set_address {address:#x} in the line table at {unitStart:#x} is not an instruction boundary");
+                            throw new DwarfRewriteException($"DW_LNE_set_address 0x{address:x} in the line table at 0x{unitStart:x} is not an instruction boundary");
                     }
 
                     BinaryPrimitives.WriteUInt32LittleEndian(value, newValue);
@@ -883,7 +883,7 @@ internal static class DwarfCodeAddressRewriter
     private static ulong AdvanceTo(ulong oldAddress, ref ulong newAddress, CodeAddressMap map, int unitStart)
     {
         if (map.Map(oldAddress, out uint target) != CodeAddressMap.Outcome.Mapped || target < newAddress)
-            throw new DwarfRewriteException($"a row at {oldAddress:#x} in the line table at {unitStart:#x} does not follow its sequence's function");
+            throw new DwarfRewriteException($"a row at 0x{oldAddress:x} in the line table at 0x{unitStart:x} does not follow its sequence's function");
         ulong delta = target - newAddress;
         newAddress = target;
         return delta;

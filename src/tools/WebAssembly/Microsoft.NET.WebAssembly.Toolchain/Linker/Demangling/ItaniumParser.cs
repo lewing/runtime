@@ -6,6 +6,10 @@
 // under the Apache License v2.0 with LLVM Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+// CA1859: parser methods return Node where LLVM returns Node*; narrowing them to concrete node classes would
+// diverge from LLVM for no measurable gain. This file is a line-for-line port kept diffable against LLVM.
+#pragma warning disable CA1859
+
 namespace Microsoft.NET.WebAssembly.Linker.Demangling;
 
 internal sealed partial class ItaniumParser
