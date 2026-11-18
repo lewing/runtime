@@ -483,6 +483,51 @@ public sealed partial class WasmObjectWriterApiTests
         return output.ToArray();
     }
 
+    /// <summary>
+    /// <c>int answer = 42; int get() { return answer; }</c>, laid out the way the runtime writer lays out an
+    /// object: memory import, data count, code with a padded relocated operand, data, then linking and reloc.CODE.
+    /// </summary>
+    private static byte[] BuildAnswerObject() => BuildObject(writer =>
+    {
+        writer.WriteVectorSection(WasmSectionId.Type, 1, new MemoryStream(Convert.FromHexString("6000017f")));
+        writer.WriteVectorSection(WasmSectionId.Import, 1, new MemoryStream(
+            Convert.FromHexString("03" + Convert.ToHexString("env"u8) + "0f" + Convert.ToHexString("__linear_memory"u8) + "020000")));
+        writer.WriteVectorSection(WasmSectionId.Function, 1, new MemoryStream([0x00]));
+        writer.WriteSection(WasmSectionId.DataCount, [0x01]);
+
+        // body: no locals; i32.const <padded MEMORY_ADDR_LEB>; i32.load; end — passed through as-is.
+        byte[] body = new byte[12];
+        body[0] = 0x00;
+        body[1] = 0x41;
+        WasmLeb128.WritePaddedULeb128(body.AsSpan(2, RelocationTypes.GetPatchSize(RelocationType.R_WASM_MEMORY_ADDR_LEB)), 0);
+        body[7] = 0x28;
+        body[8] = 0x02;
+        body[9] = 0x00;
+        body[10] = 0x0b;
+        using var bodies = new MemoryStream();
+        WasmLeb128.WriteULeb128(bodies, 11);
+        bodies.Write(body, 0, 11);
+        bodies.Position = 0;
+        int codeIndex = writer.WriteVectorSection(WasmSectionId.Code, 1, bodies);
+
+        writer.WriteVectorSection(WasmSectionId.Data, 1, new MemoryStream(Convert.FromHexString("00" + "41000b" + "04" + "2a000000")));
+
+        var symbols = new SymbolTableEncoder();
+        symbols.AddFunction(SymbolFlags.None, 0, "get"u8);
+        int answer = symbols.AddData(SymbolFlags.None, "answer"u8, segmentIndex: 0, offset: 0, size: 4);
+        var segments = new SegmentInfoEncoder();
+        segments.Add(".data.answer"u8, alignmentLog2: 2, SegmentFlags.None);
+        var linking = new LinkingSectionEncoder();
+        linking.WriteSymbolTable(symbols);
+        linking.WriteSegmentInfo(segments);
+        writer.WriteCustomSection("linking"u8, linking);
+
+        // The relocated operand starts after the vector count, the body size and the opcode bytes.
+        var reloc = new RelocationSectionEncoder((uint)codeIndex);
+        reloc.Add(RelocationType.R_WASM_MEMORY_ADDR_LEB, offset: 1 + 1 + 2, index: (uint)answer, addend: 0);
+        writer.WriteCustomSection("reloc.CODE"u8, reloc);
+    });
+
     private sealed class ForwardOnlyStream(Stream inner) : Stream
     {
         public override bool CanRead => false;

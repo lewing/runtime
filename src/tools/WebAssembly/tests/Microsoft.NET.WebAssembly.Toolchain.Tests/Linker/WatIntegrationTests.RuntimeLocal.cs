@@ -86,19 +86,4 @@ public partial class WatIntegrationTests
         AssertSemanticValidatorsAccept(shippedModule);
         Assert.Equal(first.Functions[0].Body, WasmAssert.ExportedFunctionBody(shippedModule, "first").Body);
     }
-
-    private static void AssertSemanticValidatorsAccept(WasmModule module)
-    {
-        var typeResult = TypeDeclarationValidator.Validate(module);
-        Assert.True(typeResult.IsValid, FormatDiagnostics(typeResult));
-
-        var bodyResult = FunctionBodyValidator.ValidateModule(module, WasmFeatures.All);
-        Assert.True(bodyResult.IsValid, FormatDiagnostics(bodyResult));
-
-        var moduleResult = WasmModuleValidator.Validate(module);
-        Assert.True(moduleResult.IsValid, FormatDiagnostics(moduleResult));
-    }
-
-    private static string FormatDiagnostics(WasmValidationResult result)
-        => string.Join(Environment.NewLine, result.Diagnostics.Select(static diagnostic => diagnostic.Message));
 }

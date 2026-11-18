@@ -265,7 +265,7 @@ internal static class ObjectReencoder
     private static uint Minimal(byte[] bytes, ref int at, string what)
     {
         uint value = Index(bytes, ref at, out int width);
-        Assert.True(width == 0, $"padded {what} at {at:#x}");
+        Assert.True(width == 0, $"padded {what} at 0x{at:x}");
         return value;
     }
 
@@ -299,7 +299,7 @@ internal static class ObjectReencoder
     private static (ulong Min, ulong? Max, bool Is64, bool Shared) Limits(byte[] bytes, ref int at)
     {
         byte flags = bytes[at++];
-        Assert.True(flags <= 0x07, $"limits flags {flags:#x}");
+        Assert.True(flags <= 0x07, $"limits flags 0x{flags:x}");
         ulong min = ReadULeb(bytes, at, out int minWidth);
         Assert.Equal(WasmLeb128.GetULeb128Size(min), minWidth);
         at += minWidth;
@@ -328,7 +328,7 @@ internal static class ObjectReencoder
             }
         }
 
-        Assert.Fail($"unterminated constant expression at {start:#x}");
+        Assert.Fail($"unterminated constant expression at 0x{start:x}");
         return [];
     }
 
@@ -496,7 +496,7 @@ internal static class ObjectReencoder
         for (int i = 0; i < length; i++)
         {
             if (expected[i] != actual[i])
-                Assert.Fail($"{label}: first difference at offset {i:#x} (expected {expected[i]:x2}, actual {actual[i]:x2}); sizes {expected.Length} vs {actual.Length}");
+                Assert.Fail($"{label}: first difference at offset 0x{i:x} (expected {expected[i]:x2}, actual {actual[i]:x2}); sizes {expected.Length} vs {actual.Length}");
         }
 
         Assert.True(expected.Length == actual.Length, $"{label}: sizes differ ({expected.Length} vs {actual.Length})");

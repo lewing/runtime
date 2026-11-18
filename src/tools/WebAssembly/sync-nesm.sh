@@ -14,7 +14,8 @@
 # patch shrinks. Files that exist only here are never touched.
 #
 # Tests listed in nesm-test-files.txt (paths under nesm's tests/Nesm.Tests) are adapted by nesm-sync, a syntax-only
-# Roslyn rewriter (see nesm-sync/TestAdapter.cs), so they run without nesm's interpreter, wasi-sdk or repository.
+# Roslyn rewriter (see nesm-sync/TestAdapter.cs) that applies nesm's import rule: tests marked
+# [Trait("Requires", ...)] need nesm's interpreter, wasi-sdk parity harness or repository, and are deleted.
 # Members that need hand adaptation live in runtime-only <File>.RuntimeLocal.cs partial files, which replace nesm's
 # members of the same name on every sync. Create one with:
 #   dotnet run --project nesm-sync -- extract <synced test file> <member>...
@@ -37,15 +38,12 @@ nesm_sync() {
 
 # Writes nesm's tests listed in nesm-test-files.txt at <commit>, adapted against the library in <library>, into <out>.
 stage_tests() {
-    local checkout="$1" commit="$2" library="$3" out="$4" nesm f
-    nesm="$(mktemp -d)"
-    git -C "$checkout" archive "$commit" src tests | tar -x -C "$nesm"
+    local checkout="$1" commit="$2" library="$3" out="$4" f
     while read -r f; do
         mkdir -p "$out/$(dirname "$f")"
-        cp "$nesm/tests/Nesm.Tests/$f" "$out/$f"
+        git -C "$checkout" show "$commit:tests/Nesm.Tests/$f" > "$out/$f"
     done < "$test_files_list"
-    nesm_sync tests "$out" --nesm "$nesm" --library "$library" --runtime-tests "$tests" --synced "$test_files_list"
-    rm -rf "$nesm"
+    nesm_sync tests "$out" --library "$library" --runtime-tests "$tests" --synced "$test_files_list"
 }
 
 # Writes a patch from the files under <a> to the matching files under <b>.

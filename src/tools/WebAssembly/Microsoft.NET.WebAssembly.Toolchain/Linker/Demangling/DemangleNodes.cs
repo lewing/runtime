@@ -6,6 +6,10 @@
 // under the Apache License v2.0 with LLVM Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+// SA1136: the compact enum lists mirror LLVM's ItaniumNodes.def and enum declarations, one value per line
+// would break that mapping. This file is a line-for-line port kept diffable against LLVM.
+#pragma warning disable SA1136
+
 namespace Microsoft.NET.WebAssembly.Linker.Demangling;
 
 using System.Text;
