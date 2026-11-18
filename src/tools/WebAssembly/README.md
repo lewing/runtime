@@ -93,6 +93,9 @@ Build and test with:
 
 The parity tests compile C with the wasi-sdk from the shared wasm tool cache (`eng/wasm/WasmToolCache.props`) and
 compare the managed linker's output with wasm-ld's. They are skipped when the wasi-sdk is not present.
+`CaptureParityTests` relinks real captured links and compares them byte for byte with wasm-ld's output: set
+`NESM_LINKCAP_DIR` to a NativeAOT capture (`ld-args.template` and `ld.wasm`) and `NESM_HOSTCAP_DIR` to a CoreCLR WASI
+host capture (`ld-args.template` and `ld.core.wasm`). They are skipped when the variables aren't set.
 
 ## Provenance and differences from nesm
 

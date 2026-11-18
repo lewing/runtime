@@ -55,6 +55,9 @@ internal ref struct WasmSpanReader
     /// <summary>The absolute offset of the next byte.</summary>
     public readonly long AbsolutePosition => _baseOffset + _position;
 
+    /// <summary>The bytes not yet read, without advancing.</summary>
+    public readonly ReadOnlySpan<byte> RemainingBytes => _data[_position..];
+
     /// <summary>The bytes read since <paramref name="start"/>, a position previously read from <see cref="Position"/>.</summary>
     public readonly ReadOnlySpan<byte> ConsumedSince(int start) => _data[start.._position];
 

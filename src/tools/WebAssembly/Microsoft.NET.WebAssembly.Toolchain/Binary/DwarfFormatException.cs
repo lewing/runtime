@@ -10,7 +10,7 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// </summary>
 /// <remarks>
 /// DWARF lives in custom sections, so a malformed DWARF section never invalidates the module.
-/// The line and type readers recover per unit: a malformed unit is reported and skipped, and only
+/// The line, type and compile-unit readers recover per unit: a malformed unit is reported and skipped, and only
 /// a bad <c>unit_length</c> (which leaves no next unit to resume at) ends the parse.
 /// <see cref="ModuleReader"/> keeps the good units and records one
 /// <see cref="Module.WasmModule.MetadataDiagnostics"/> entry per bad unit (strict mode throws

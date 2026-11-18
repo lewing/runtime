@@ -14,9 +14,9 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// Handles LEB128 encoding, vectors, names, and raw bytes for both seekable and non-seekable streams.
 /// </summary>
 /// <remarks>
-/// A compatibility layer for callers that read a stream one value at a time. <see cref="ModuleReader"/> does not
-/// use it: it reads each section once and parses it from memory with <see cref="WasmSpanReader"/>, which reports
-/// the same messages for the same bytes.
+/// A compatibility layer for callers that read a stream one value at a time. <see cref="ModuleReader"/> and
+/// <c>ComponentReader</c> do not use it: they read each section once and parse it from memory with
+/// <see cref="WasmSpanReader"/>, which reports the same messages for the same bytes.
 /// </remarks>
 public sealed class WasmBinaryReader
 {

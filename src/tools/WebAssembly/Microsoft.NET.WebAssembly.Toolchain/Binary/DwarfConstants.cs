@@ -58,6 +58,9 @@ internal enum DwForm : uint
     GnuStrIndex = 0x1f02,
     GnuRefAlt = 0x1f20,
     GnuStrpAlt = 0x1f21,
+
+    /// <summary>LLVM: a ULEB128 .debug_addr index, then a 4-byte offset added to that address.</summary>
+    LlvmAddrxOffset = 0x2001,
 }
 
 /// <summary>Debugging-information entry tags (<c>DW_TAG_*</c>).</summary>
@@ -84,6 +87,8 @@ internal static class DwTag
     public const ushort VolatileType = 0x35;
     public const ushort RestrictType = 0x37;
     public const ushort PartialUnit = 0x3c;
+    public const ushort TypeUnit = 0x41;
+    public const ushort SkeletonUnit = 0x4a;
 }
 
 /// <summary>Attribute names (<c>DW_AT_*</c>).</summary>
@@ -181,7 +186,11 @@ internal static class DwOp
 internal static class DwUt
 {
     public const byte Compile = 0x01;
+    public const byte Type = 0x02;
     public const byte Partial = 0x03;
+    public const byte Skeleton = 0x04;
+    public const byte SplitCompile = 0x05;
+    public const byte SplitType = 0x06;
 }
 
 /// <summary>Standard line-number program opcodes (<c>DW_LNS_*</c>).</summary>

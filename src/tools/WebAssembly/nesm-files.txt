@@ -3,6 +3,8 @@ Binary/ArArchiveWriter.cs
 Binary/BoundedStream.cs
 Binary/BranchHintMetadataReader.cs
 Binary/ComponentEncoding.cs
+Binary/ConstExpressionWalker.cs
+Binary/DwarfCompileUnitReader.cs
 Binary/DwarfConstants.cs
 Binary/DwarfFormatException.cs
 Binary/DwarfLineReader.cs
@@ -11,6 +13,7 @@ Binary/DwarfReaderHelpers.cs
 Binary/DwarfSidecarMerger.cs
 Binary/DwarfSubprogramReader.cs
 Binary/DwarfTypeReader.cs
+Binary/DwarfUnitHeader.cs
 Binary/DwarfVariableReader.cs
 Binary/ExternalDebugInfo.cs
 Binary/InstructionCursor.cs

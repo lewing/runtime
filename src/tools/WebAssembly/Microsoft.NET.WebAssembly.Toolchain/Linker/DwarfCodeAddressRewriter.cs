@@ -180,7 +180,7 @@ internal static class DwarfCodeAddressRewriter
             reason = null;
             return Rewrite(sections, map);
         }
-        catch (Exception ex) when (ex is DwarfRewriteException or ArgumentOutOfRangeException or IndexOutOfRangeException or OverflowException)
+        catch (Exception ex) when (ex is DwarfRewriteException or DwarfFormatException or ArgumentOutOfRangeException or IndexOutOfRangeException or OverflowException)
         {
             reason = ex is DwarfRewriteException ? ex.Message : $"its DWARF is malformed ({ex.Message})";
             return null;
@@ -279,35 +279,24 @@ internal static class DwarfCodeAddressRewriter
 
     // ── .debug_info ──────────────────────────────────────────────────────────
 
-    private readonly record struct AttributeSpec(uint Name, uint Form);
-
-    private sealed record Abbreviation(bool HasChildren, List<AttributeSpec> Attributes);
-
-    private static Dictionary<ulong, Abbreviation> ReadAbbreviations(ReadOnlySpan<byte> abbrev, uint offset)
+    // The abbreviation table at `offset`, read with the shared parser. DW_FORM_implicit_const keeps its value in
+    // the table, not in .debug_info; the rewriter only rewrites DWARF 2–4, where it does not exist.
+    private static Dictionary<uint, DwarfAbbrevEntry> ReadAbbreviations(ReadOnlySpan<byte> abbrev, ulong offset)
     {
-        var result = new Dictionary<ulong, Abbreviation>();
-        int pos = checked((int)offset);
-        while (true)
+        if (offset >= (ulong)abbrev.Length)
+            throw new DwarfRewriteException($"the abbreviation offset 0x{offset:x} is past the end of .debug_abbrev");
+        int pos = (int)offset;
+        var table = DwarfAbbrevParser.ParseTable(abbrev, ref pos);
+        foreach (var entry in table.Values)
         {
-            ulong code = DwarfReaderHelpers.ReadULEB128U64(abbrev, ref pos);
-            if (code == 0)
-                return result;
-            DwarfReaderHelpers.ReadULEB128U64(abbrev, ref pos); // tag
-            bool children = abbrev[pos++] != 0;
-            var specs = new List<AttributeSpec>();
-            while (true)
+            foreach (var (_, form, _) in entry.Attributes)
             {
-                uint name = (uint)DwarfReaderHelpers.ReadULEB128U64(abbrev, ref pos);
-                uint form = (uint)DwarfReaderHelpers.ReadULEB128U64(abbrev, ref pos);
-                if (name == 0 && form == 0)
-                    break;
                 if (form == (uint)DwForm.ImplicitConst)
                     throw new DwarfRewriteException("DW_FORM_implicit_const (DWARF 5) is not supported");
-                specs.Add(new AttributeSpec(name, form));
             }
-
-            result[code] = new Abbreviation(children, specs);
         }
+
+        return table;
     }
 
     // Attributes whose sec_offset (DWARF 4) or data4 (DWARF 2/3) value is a location list.
@@ -320,24 +309,29 @@ internal static class DwarfCodeAddressRewriter
         List<(uint, int)> rangeRefs, List<(uint, int)> locRefs, List<(int, int, uint)> stmtListPatches, CodeRanges codeRanges,
         ExpressionFacts facts)
     {
-        var abbrevCache = new Dictionary<uint, Dictionary<ulong, Abbreviation>>();
-        int pos = 0;
-        while (pos < info.Length)
+        var abbrevCache = new Dictionary<ulong, Dictionary<uint, DwarfAbbrevEntry>>();
+        var walk = new DwarfUnitEnumerator(info, ".debug_info");
+        while (walk.MoveNext())
         {
-            int unitStart = pos;
-            uint unitLength = ReadU32(info, ref pos);
-            if (unitLength >= DwarfUnitLength.ReservedMin)
+            if (walk.Error is { } lengthError)
+                throw lengthError;
+            var frame = walk.Current;
+            if (frame.Is64Bit)
                 throw new DwarfRewriteException("64-bit DWARF is not supported");
-            int unitEnd = checked(pos + (int)unitLength);
-            int version = ReadU16(info, ref pos);
-            if (version is < 2 or > 4)
-                throw new DwarfRewriteException($"DWARF version {version} is not supported (only 2 to 4)");
-            uint abbrevOffset = ReadU32(info, ref pos);
-            int addressSize = info[pos++];
-            if (addressSize != 4)
-                throw new DwarfRewriteException($"DWARF address size {addressSize} is not supported");
-            if (!abbrevCache.TryGetValue(abbrevOffset, out var abbreviations))
-                abbrevCache[abbrevOffset] = abbreviations = ReadAbbreviations(abbrev, abbrevOffset);
+            if (!DwarfUnitHeader.TryRead(info, frame, ".debug_info", out var header) || header.Version > 4)
+                throw new DwarfRewriteException($"DWARF version {header.Version} is not supported (only 2 to 4)");
+            if (header.AddressSize != 4)
+                throw new DwarfRewriteException($"DWARF address size {header.AddressSize} is not supported");
+            if (!abbrevCache.TryGetValue(header.AbbrevOffset, out var abbreviations))
+                abbrevCache[header.AbbrevOffset] = abbreviations = ReadAbbreviations(abbrev, header.AbbrevOffset);
+
+            int unitStart = frame.UnitStart;
+            int unitEnd = frame.UnitEnd;
+            int version = header.Version;
+            var format = header.Format;
+            // Values are read bounded by the unit, so a malformed unit cannot read into the next one.
+            ReadOnlySpan<byte> unitData = info[..unitEnd];
+            int pos = header.DieStart;
 
             var unit = new UnitInfo { Offset = (uint)unitStart, Version = version };
             int unitIndex = units.Count;
@@ -345,10 +339,10 @@ internal static class DwarfCodeAddressRewriter
             bool first = true;
             while (pos < unitEnd)
             {
-                ulong code = DwarfReaderHelpers.ReadULEB128U64(info, ref pos);
+                ulong code = DwarfReaderHelpers.ReadULEB128U64(unitData, ref pos);
                 if (code == 0)
                     continue;
-                if (!abbreviations.TryGetValue(code, out var abbreviation))
+                if (code > uint.MaxValue || !abbreviations.TryGetValue((uint)code, out var abbreviation))
                     throw new DwarfRewriteException($"abbreviation {code} of the unit at 0x{unitStart:x} is not defined");
 
                 ulong? lowPcOld = null;
@@ -358,9 +352,9 @@ internal static class DwarfCodeAddressRewriter
                 {
                     uint form = spec.Form;
                     while (form == (uint)DwForm.Indirect)
-                        form = (uint)DwarfReaderHelpers.ReadULEB128U64(info, ref pos);
+                        form = (uint)DwarfReaderHelpers.ReadULEB128U64(unitData, ref pos);
                     int valueStart = pos;
-                    ulong value = SkipForm(info, ref pos, form, version);
+                    ulong value = ReadForm(unitData, ref pos, form, format);
                     // exprloc is always an expression; before DWARF 4, a block is one for a location attribute.
                     if ((DwForm)form == DwForm.Exprloc || ((DwForm)form is DwForm.Block2 or DwForm.Block4 or DwForm.Block or DwForm.Block1 && IsLocationListAttribute(spec.Name)))
                         ScanExpression(info, BlockContentStart(info, valueStart, form), pos, unit.Offset, facts);
@@ -424,41 +418,26 @@ internal static class DwarfCodeAddressRewriter
                     first = false;
                 }
             }
-
-            pos = unitEnd;
         }
     }
 
-    private static ulong SkipForm(ReadOnlySpan<byte> data, ref int pos, uint form, int version)
+    // Reads one attribute value with the shared form reader. Only the forms the rewriter knows to hold no code
+    // address it cannot find (or one it rewrites) are accepted; anything else drops the DWARF.
+    private static ulong ReadForm(ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format)
     {
-        switch ((DwForm)form)
+        if ((DwForm)form is not (DwForm.Addr or DwForm.Block2 or DwForm.Block4 or DwForm.Data2 or DwForm.Data4
+            or DwForm.Data8 or DwForm.String or DwForm.Block or DwForm.Exprloc or DwForm.Block1 or DwForm.Data1
+            or DwForm.Flag or DwForm.Sdata or DwForm.Strp or DwForm.Udata or DwForm.RefAddr or DwForm.Ref1
+            or DwForm.Ref2 or DwForm.Ref4 or DwForm.Ref8 or DwForm.RefSig8 or DwForm.RefUdata or DwForm.SecOffset
+            or DwForm.FlagPresent or DwForm.GnuRefAlt or DwForm.GnuStrpAlt))
         {
-            case DwForm.Addr: return ReadU32(data, ref pos);
-            case DwForm.Block2: { int n = ReadU16(data, ref pos); pos += n; return 0; }
-            case DwForm.Block4: { uint n = ReadU32(data, ref pos); pos = checked(pos + (int)n); return 0; }
-            case DwForm.Data2: return (ulong)ReadU16(data, ref pos);
-            case DwForm.Data4: return ReadU32(data, ref pos);
-            case DwForm.Data8: { ulong v = BinaryPrimitives.ReadUInt64LittleEndian(data[pos..]); pos += 8; return v; }
-            case DwForm.String: { while (data[pos++] != 0) { } return 0; }
-            case DwForm.Block or DwForm.Exprloc: { ulong n = DwarfReaderHelpers.ReadULEB128U64(data, ref pos); pos = checked(pos + (int)n); return 0; }
-            case DwForm.Block1: { int n = data[pos++]; pos += n; return 0; }
-            case DwForm.Data1: return data[pos++];
-            case DwForm.Flag: pos++; return 0;
-            case DwForm.Sdata: return (ulong)DwarfReaderHelpers.ReadSLEB128(data, ref pos);
-            case DwForm.Strp: return ReadU32(data, ref pos);
-            case DwForm.Udata: return DwarfReaderHelpers.ReadULEB128U64(data, ref pos);
-            case DwForm.RefAddr: return ReadU32(data, ref pos);                            // ref_addr (4 bytes for addr size 4 and v3+)
-            case DwForm.Ref1: return data[pos++];
-            case DwForm.Ref2: return (ulong)ReadU16(data, ref pos);
-            case DwForm.Ref4: return ReadU32(data, ref pos);
-            case DwForm.Ref8 or DwForm.RefSig8: pos += 8; return 0;
-            case DwForm.RefUdata: return DwarfReaderHelpers.ReadULEB128U64(data, ref pos);
-            case DwForm.SecOffset: return ReadU32(data, ref pos);
-            case DwForm.FlagPresent: return 0;
-            case DwForm.GnuRefAlt or DwForm.GnuStrpAlt: return ReadU32(data, ref pos);
-            default:
-                throw new DwarfRewriteException($"DW_FORM 0x{form:x} (DWARF {version}) is not supported");
+            throw new DwarfRewriteException($"DW_FORM 0x{form:x} (DWARF {format.Version}) is not supported");
         }
+
+        ulong value = DwarfReaderHelpers.ReadFormRaw(data, ref pos, form, format);
+        if (form == (uint)DwForm.String && data[pos - 1] != 0)
+            throw new DwarfRewriteException($"the string at .debug_info+0x{pos:x} is not terminated before the end of its unit");
+        return value;
     }
 
     private static void WriteFormValue(Span<byte> data, int position, uint form, int width, uint value)
@@ -645,10 +624,7 @@ internal static class DwarfCodeAddressRewriter
         while (pos < original.Length)
         {
             int setStart = pos;
-            uint unitLength = ReadU32(original, ref pos);
-            if (unitLength >= DwarfUnitLength.ReservedMin)
-                throw new DwarfRewriteException("64-bit DWARF is not supported");
-            int setEnd = checked(pos + (int)unitLength);
+            int setEnd = ReadUnitLength32(original, ref pos, ".debug_aranges");
             pos += 2; // version
             uint unitOffset = ReadU32(original, ref pos);
             int addressSize = original[pos++];
@@ -703,10 +679,7 @@ internal static class DwarfCodeAddressRewriter
         while (pos < original.Length)
         {
             int unitStart = pos;
-            uint unitLength = ReadU32(original, ref pos);
-            if (unitLength >= DwarfUnitLength.ReservedMin)
-                throw new DwarfRewriteException("64-bit DWARF is not supported");
-            int unitEnd = checked(pos + (int)unitLength);
+            int unitEnd = ReadUnitLength32(original, ref pos, ".debug_line");
             int version = ReadU16(original, ref pos);
             if (version is < 2 or > 4)
                 throw new DwarfRewriteException($"line table version {version} is not supported (only 2 to 4)");
@@ -898,6 +871,15 @@ internal static class DwarfCodeAddressRewriter
     }
 
     // ── Primitives ───────────────────────────────────────────────────────────
+
+    // A unit's unit_length, with the shared checks (reserved values, a unit past the section); returns the unit's end.
+    private static int ReadUnitLength32(ReadOnlySpan<byte> data, ref int pos, string section)
+    {
+        int end = DwarfReaderHelpers.ReadUnitLength(data, ref pos, section, out bool is64Bit);
+        if (is64Bit)
+            throw new DwarfRewriteException("64-bit DWARF is not supported");
+        return end;
+    }
 
     private static uint ReadU32(ReadOnlySpan<byte> data, ref int pos)
     {

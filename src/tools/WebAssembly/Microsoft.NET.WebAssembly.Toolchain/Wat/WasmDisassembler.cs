@@ -1329,67 +1329,63 @@ public static class WasmDisassembler
         string site)
     {
         var values = new List<string>();
-        var cursor = new InstructionCursor(expression, WasmFeatures.All);
+        var walker = new ConstExpressionWalker(expression);
         try
         {
-            while (cursor.MoveNext(out var instruction))
+            while (walker.MoveNext(out ConstOp op, out var instruction))
             {
-                byte opcode = instruction.OpcodeId.Opcode;
-                if (opcode == WasmOpcode.End)
+                switch (op)
                 {
-                    if (cursor.Position != expression.Length)
-                        throw new WatException(
-                            $"Cannot disassemble {site}: bytes follow the constant-expression end.");
-                    if (values.Count != 1)
-                    {
-                        throw new WatException(
-                            $"Cannot disassemble {site}: constant expression leaves {values.Count} " +
-                            "values; WAT requires exactly one.");
-                    }
-                    return values[0];
-                }
-
-                switch (opcode)
-                {
-                    case 0x23:
+                    case ConstOp.End:
+                        if (walker.Position != expression.Length)
+                            throw new WatException(
+                                $"Cannot disassemble {site}: bytes follow the constant-expression end.");
+                        if (values.Count != 1)
+                        {
+                            throw new WatException(
+                                $"Cannot disassemble {site}: constant expression leaves {values.Count} " +
+                                "values; WAT requires exactly one.");
+                        }
+                        return values[0];
+                    case ConstOp.GlobalGet:
                         values.Add($"global.get {instruction.Index0}");
                         break;
-                    case 0x41:
+                    case ConstOp.I32Const:
                         values.Add($"i32.const {unchecked((int)instruction.Index0)}");
                         break;
-                    case 0x42:
+                    case ConstOp.I64Const:
                         values.Add($"i64.const {unchecked((long)instruction.MemOffset)}");
                         break;
-                    case 0x43:
+                    case ConstOp.F32Const:
                         values.Add(
                             $"f32.const {FormatFloat(BitConverter.UInt32BitsToSingle(instruction.Index0))}");
                         break;
-                    case 0x44:
+                    case ConstOp.F64Const:
                         values.Add(
                             $"f64.const {FormatDouble(BitConverter.UInt64BitsToDouble(instruction.MemOffset))}");
                         break;
-                    case 0x6A:
+                    case ConstOp.I32Add:
                         FoldBinary(values, "i32.add", site);
                         break;
-                    case 0x6B:
+                    case ConstOp.I32Sub:
                         FoldBinary(values, "i32.sub", site);
                         break;
-                    case 0x6C:
+                    case ConstOp.I32Mul:
                         FoldBinary(values, "i32.mul", site);
                         break;
-                    case 0x7C:
+                    case ConstOp.I64Add:
                         FoldBinary(values, "i64.add", site);
                         break;
-                    case 0x7D:
+                    case ConstOp.I64Sub:
                         FoldBinary(values, "i64.sub", site);
                         break;
-                    case 0x7E:
+                    case ConstOp.I64Mul:
                         FoldBinary(values, "i64.mul", site);
                         break;
-                    case 0xD0:
+                    case ConstOp.RefNull:
                         values.Add($"ref.null {HeapTypeText(instruction.HeapType0, context)}");
                         break;
-                    case 0xD2:
+                    case ConstOp.RefFunc:
                     {
                         int functionIndex = checked((int)instruction.Index0);
                         string function = context.FuncNames.TryGetValue(functionIndex, out string? name)
@@ -1398,7 +1394,7 @@ public static class WasmDisassembler
                         values.Add($"ref.func {function}");
                         break;
                     }
-                    case WasmOpcode.SimdPrefix when instruction.OpcodeId.SubOpcode == 0x0C:
+                    case ConstOp.V128Const:
                     {
                         ReadOnlySpan<byte> bytes = instruction.ImmediateBytes[^16..];
                         var text = new StringBuilder("v128.const i32x4");
@@ -1410,9 +1406,16 @@ public static class WasmDisassembler
                         values.Add(text.ToString());
                         break;
                     }
-                    case WasmOpcode.GcPrefix:
+                    case ConstOp.StructNew:
+                    case ConstOp.StructNewDefault:
+                    case ConstOp.ArrayNew:
+                    case ConstOp.ArrayNewDefault:
+                    case ConstOp.ArrayNewFixed:
+                    case ConstOp.AnyConvertExtern:
+                    case ConstOp.ExternConvertAny:
+                    case ConstOp.RefI31:
                     {
-                        string name = GcConstantExpressionName(instruction.OpcodeId.SubOpcode);
+                        string name = GcConstantExpressionName(op);
                         throw new NotSupportedException(
                             $"Cannot disassemble {site}: {name} ({instruction.OpcodeId}) is a valid " +
                             "binary constant-expression instruction, but nesm's WAT compiler does not " +
@@ -1450,17 +1453,17 @@ public static class WasmDisassembler
         values.Add($"{mnemonic} ({left}) ({right})");
     }
 
-    private static string GcConstantExpressionName(uint subOpcode) => subOpcode switch
+    private static string GcConstantExpressionName(ConstOp op) => op switch
     {
-        0x00 => "struct.new",
-        0x01 => "struct.new_default",
-        0x06 => "array.new",
-        0x07 => "array.new_default",
-        0x08 => "array.new_fixed",
-        0x1A => "any.convert_extern",
-        0x1B => "extern.convert_any",
-        0x1C => "ref.i31",
-        _ => $"GC sub-opcode 0x{subOpcode:X}",
+        ConstOp.StructNew => "struct.new",
+        ConstOp.StructNewDefault => "struct.new_default",
+        ConstOp.ArrayNew => "array.new",
+        ConstOp.ArrayNewDefault => "array.new_default",
+        ConstOp.ArrayNewFixed => "array.new_fixed",
+        ConstOp.AnyConvertExtern => "any.convert_extern",
+        ConstOp.ExternConvertAny => "extern.convert_any",
+        ConstOp.RefI31 => "ref.i31",
+        _ => op.ToString(),
     };
 
     // ── Instruction body disassembly ─────────────────────────────────────

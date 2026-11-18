@@ -24,7 +24,7 @@ internal readonly record struct DwarfSubprogram(string? Name, string? LinkageNam
 /// <param name="HasDebugInfo">The module has a <c>.debug_info</c> section.</param>
 /// <param name="Subprograms">Every subprogram with a code address, in .debug_info order.</param>
 /// <param name="Units">Compile units read.</param>
-/// <param name="SkippedUnits">Units that could not be read (unsupported version, missing abbreviations, 64-bit DWARF).</param>
+/// <param name="SkippedUnits">Units that could not be read (unsupported version or unit type, missing abbreviations, or a malformed header, unit_length or DIE).</param>
 internal sealed record DwarfSubprogramIndex(
     bool HasDebugInfo, IReadOnlyList<DwarfSubprogram> Subprograms, int Units, int SkippedUnits);
 
@@ -50,8 +50,8 @@ internal static class DwarfSubprogramReader
     }
 
     internal static DwarfSubprogramIndex Parse(
-        byte[] infoData, byte[] abbrevData, byte[]? strData, byte[]? lineStrData,
-        byte[]? strOffsetsData, byte[]? addrData)
+        ReadOnlySpan<byte> infoData, ReadOnlySpan<byte> abbrevData, ReadOnlySpan<byte> strData, ReadOnlySpan<byte> lineStrData,
+        ReadOnlySpan<byte> strOffsetsData, ReadOnlySpan<byte> addrData)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
         // Every kept DIE by its .debug_info SECTION offset, so CU-relative and DW_FORM_ref_addr
@@ -59,55 +59,52 @@ internal static class DwarfSubprogramReader
         var bySectionOffset = new Dictionary<long, (DwarfReaderHelpers.DwarfDIE Die, int CuStart)>();
         var bodies = new List<(DwarfReaderHelpers.DwarfDIE Die, int CuStart, long LowPc, byte AddrSize)>();
         int units = 0, skipped = 0;
-        int pos = 0;
+        var unitWalk = new DwarfUnitEnumerator(infoData, ".debug_info");
 
-        while (pos < infoData.Length)
+        while (unitWalk.MoveNext())
         {
-            if (pos + 6 > infoData.Length) { skipped++; break; }
-            int cuStart = pos;
-            uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen >= DwarfUnitLength.ReservedMin) { skipped++; break; } // 64-bit DWARF and reserved lengths are not supported
-            long cuEndLong = (long)pos + 4 + unitLen;
-            if (cuEndLong > infoData.Length || cuEndLong < pos + 6) { skipped++; break; }
-            int cuEnd = (int)cuEndLong;
-            pos = cuEnd;
-
-            ushort version = DwarfReaderHelpers.ReadU16LE(infoData, cuStart + 4);
-            if (version < 2 || version > 5) { skipped++; continue; }
-            int headerEnd = version >= 5 ? cuStart + 12 : cuStart + 11;
-            if (headerEnd > cuEnd) { skipped++; continue; }
-
-            byte addrSize;
-            int abbrevOffset;
-            if (version >= 5)
+            if (unitWalk.Error is not null) { skipped++; break; } // a bad unit_length leaves no next unit
+            var frame = unitWalk.Current;
+            DwarfUnitHeader header;
+            try
             {
-                byte unitType = infoData[cuStart + 6];
-                // DW_UT_compile (1) and DW_UT_partial (3) share this header layout; type and
-                // skeleton/split units carry extra header fields and no function bodies here.
-                if (unitType is not (DwUt.Compile or DwUt.Partial)) { skipped++; continue; }
-                addrSize = infoData[cuStart + 7];
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, cuStart + 8);
+                if (!DwarfUnitHeader.TryRead(infoData, frame, ".debug_info", out header)) { skipped++; continue; }
             }
-            else
+            catch (DwarfFormatException)
             {
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, cuStart + 6);
-                addrSize = infoData[cuStart + 10];
+                skipped++;
+                continue;
             }
-            if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable)) { skipped++; continue; }
 
-            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(infoData, headerEnd, cuEnd, version, abbrevTable, addrSize);
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
-                addrData, addrBase, resolveAddrx: true);
-            var dies = DwarfReaderHelpers.ParseDIEs(infoData, headerEnd, cuEnd, abbrevTable, addrSize, ctx, cuStart,
-                keepTag: static tag => tag is DwTag.Subprogram or DwTag.CompileUnit or DwTag.PartialUnit);
+            // DW_UT_compile and DW_UT_partial hold function bodies; type and skeleton/split units do not.
+            if (header.UnitType is not (DwUt.Compile or DwUt.Partial)
+                || !header.TryGetAbbrevTable(abbrevTables, out var abbrevTable)) { skipped++; continue; }
+
+            // A malformed unit is skipped and counted; the units around it are still read.
+            var unit = infoData[..frame.UnitEnd];
+            var format = header.Format;
+            List<DwarfReaderHelpers.DwarfDIE> dies;
+            try
+            {
+                var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(unit, header.DieStart, unit.Length, abbrevTable, format);
+                var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
+                    addrData, addrBase, resolveAddrx: true);
+                dies = DwarfReaderHelpers.ParseDIEs(unit, header.DieStart, unit.Length, abbrevTable, format, ctx, frame.UnitStart,
+                    keepTag: static tag => tag is DwTag.Subprogram or DwTag.CompileUnit or DwTag.PartialUnit);
+            }
+            catch (Exception ex) when (ex is DwarfFormatException || DwarfReaderHelpers.IsRangeError(ex))
+            {
+                skipped++;
+                continue;
+            }
             units++;
 
             foreach (var die in dies)
             {
-                bySectionOffset[(long)cuStart + die.Offset] = (die, cuStart);
+                bySectionOffset[(long)frame.UnitStart + die.Offset] = (die, frame.UnitStart);
                 if (die.Tag == DwTag.Subprogram
                     && die.Attributes.TryGetValue(DwAt.LowPc, out var lowPcObj) && lowPcObj is long lowPc)
-                    bodies.Add((die, cuStart, lowPc, addrSize));
+                    bodies.Add((die, frame.UnitStart, lowPc, header.AddressSize));
             }
         }
 

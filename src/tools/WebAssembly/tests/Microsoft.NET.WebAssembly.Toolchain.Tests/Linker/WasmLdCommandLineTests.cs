@@ -229,9 +229,10 @@ public class WasmLdCommandLineTests
         string output = Path.Combine(dir, "out", "linked.wasm");
 
         var messages = new List<string>();
-        WasmModule result = WasmLdDriver.Run(WasmLdCommandLine.Parse([first, archive, "-o", output, "--no-entry", "--verbose"]), messages.Add);
+        WasmModule? result = WasmLdDriver.Run(WasmLdCommandLine.Parse([first, archive, "-o", output, "--no-entry", "--verbose"]), messages.Add);
 
         Assert.True(File.Exists(output));
+        Assert.NotNull(result);
         Assert.Equal(["first", "left", "right"], result.Exports.Keys.Order());
         Assert.Equal(4, messages.Count);
     }

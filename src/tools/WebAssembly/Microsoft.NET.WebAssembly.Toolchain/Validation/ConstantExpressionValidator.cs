@@ -137,19 +137,19 @@ internal static class ConstantExpressionValidator
             if (expression.Length == 0)
                 return Diagnostic(WasmValidationCode.InvalidGlobalInitExpr, $"{contextName}: constant expression is empty");
 
-            var cursor = new InstructionCursor(expression, features);
+            var walker = new ConstExpressionWalker(expression, features);
             try
             {
-                while (cursor.MoveNext(out var instruction))
+                while (walker.MoveNext(out ConstOp op, out var instruction))
                 {
-                    if (instruction.OpcodeId.Opcode == WasmOpcode.End)
+                    if (op == ConstOp.End)
                     {
-                        if (cursor.Position != expression.Length)
+                        if (walker.Position != expression.Length)
                             return Diagnostic(WasmValidationCode.InvalidGlobalInitExpr, $"{contextName}: bytes follow constant-expression end");
                         return Finish();
                     }
 
-                    Apply(instruction);
+                    Apply(op, instruction);
                 }
             }
             catch (WasmFormatException ex)
@@ -179,91 +179,80 @@ internal static class ConstantExpressionValidator
             return null;
         }
 
-        private void Apply(DecodedInstruction instruction)
+        private void Apply(ConstOp op, DecodedInstruction instruction)
         {
-            switch (instruction.OpcodeId.Opcode)
+            switch (op)
             {
-                case 0x23:
+                case ConstOp.GlobalGet:
                     GlobalGet(instruction.Index0);
                     return;
-                case 0x41:
+                case ConstOp.I32Const:
                     Push(I32);
                     return;
-                case 0x42:
+                case ConstOp.I64Const:
                     Push(I64);
                     return;
-                case 0x43:
+                case ConstOp.F32Const:
                     Push(F32);
                     return;
-                case 0x44:
+                case ConstOp.F64Const:
                     Push(F64);
                     return;
-                case 0x6A:
-                case 0x6B:
-                case 0x6C:
+                case ConstOp.I32Add:
+                case ConstOp.I32Sub:
+                case ConstOp.I32Mul:
                     Pop(I32);
                     Pop(I32);
                     Push(I32);
                     return;
-                case 0x7C:
-                case 0x7D:
-                case 0x7E:
+                case ConstOp.I64Add:
+                case ConstOp.I64Sub:
+                case ConstOp.I64Mul:
                     Pop(I64);
                     Pop(I64);
                     Push(I64);
                     return;
-                case 0xD0:
+                case ConstOp.RefNull:
                     Push(CastType(instruction.HeapType0, Nullability.Nullable));
                     return;
-                case 0xD2:
+                case ConstOp.RefFunc:
                     RefFunc(instruction.Index0);
                     return;
-                case WasmOpcode.SimdPrefix when instruction.OpcodeId.SubOpcode == 0x0C:
+                case ConstOp.V128Const:
                     Push(V128);
                     return;
-                case WasmOpcode.GcPrefix:
-                    ApplyGc(instruction);
-                    return;
-                default:
-                    throw Failure(WasmValidationCode.InvalidGlobalInitExpr,
-                        $"opcode {instruction.OpcodeId} is not permitted in a constant expression");
-            }
-        }
-
-        private void ApplyGc(DecodedInstruction instruction)
-        {
-            switch (instruction.OpcodeId.SubOpcode)
-            {
-                case 0x00:
+                case ConstOp.StructNew:
                     StructNew(instruction.Index0, defaultValues: false);
                     return;
-                case 0x01:
+                case ConstOp.StructNewDefault:
                     StructNew(instruction.Index0, defaultValues: true);
                     return;
-                case 0x06:
+                case ConstOp.ArrayNew:
                     ArrayNew(instruction.Index0, defaultValues: false);
                     return;
-                case 0x07:
+                case ConstOp.ArrayNewDefault:
                     ArrayNew(instruction.Index0, defaultValues: true);
                     return;
-                case 0x08:
+                case ConstOp.ArrayNewFixed:
                     ArrayNewFixed(instruction.Index0, instruction.Index1);
                     return;
-                case 0x1A:
+                case ConstOp.AnyConvertExtern:
                     Pop(ExternRef);
                     Push(AnyRef);
                     return;
-                case 0x1B:
+                case ConstOp.ExternConvertAny:
                     Pop(AnyRef);
                     Push(ExternRef);
                     return;
-                case 0x1C:
+                case ConstOp.RefI31:
                     Pop(I32);
                     Push(I31Ref);
                     return;
                 default:
                     throw Failure(WasmValidationCode.InvalidGlobalInitExpr,
-                        $"GC opcode {instruction.OpcodeId} is not permitted in a constant expression");
+                        instruction.OpcodeId.Opcode == WasmOpcode.GcPrefix
+                            ? $"GC opcode {instruction.OpcodeId} is not permitted in a constant expression"
+                            : $"opcode {instruction.OpcodeId} is not permitted in a constant expression");
             }
         }
 

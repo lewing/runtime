@@ -59,6 +59,26 @@ public sealed class LinkerOptions
     public bool PrintGcSections { get; init; }
 
     /// <summary>
+    /// When <c>true</c> (the default), the linker reads its output back and validates it before returning it, so a
+    /// product that serialized wrongly, or that combines inputs into an invalid module, is an error rather than a
+    /// file. When <c>false</c> the output is not read back: methods that return the validated module return
+    /// <see langword="null"/>, and <see cref="WasmLinker.LinkTo(Stream, IReadOnlyList{LinkerInput}, LinkerOptions?)"/>
+    /// streams the output without holding it in memory.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Validation reads the whole output back. On the 36 MB CoreCLR WASI host link it allocates about 80 MB with the
+    /// toolchain-only <c>Nesm.Toolchain</c> build and about 135 MB with the full <c>Nesm</c> library, and takes 10–20%
+    /// of the link. Turn it off only where something else validates the output, such as a build that runs it.
+    /// </para>
+    /// <para>
+    /// Unlike most options this one is settable rather than <c>init</c>-only, so a caller can turn it off on options
+    /// it did not construct, such as <see cref="WasmLdCommandLine.Options"/> parsed from a wasm-ld command line.
+    /// </para>
+    /// </remarks>
+    public bool ValidateOutput { get; set; } = true;
+
+    /// <summary>
     /// When <c>true</c>, strips all <c>.debug_*</c> custom sections from the output.
     /// Default: <c>false</c> (pass through debug sections if present).
     /// </summary>
@@ -275,7 +295,7 @@ public sealed class WasmLinker
     /// <see cref="LastLinkIndexMaps"/> after the call returns.
     /// </returns>
     public WasmModule Link(IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
-        => LinkProduct(inputs, options).Module;
+        => LinkOutput(inputs, options).Module;
 
     /// <summary>
     /// Parses relocatable object streams without treating them as runtime loads, links them, and
@@ -286,26 +306,63 @@ public sealed class WasmLinker
 
     /// <summary>Links the supplied input modules and immediately emits the merged output as a binary <c>.wasm</c>.</summary>
     public byte[] LinkToBinary(IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
-        => LinkProduct(inputs, options).Binary;
+        => LinkOutput(inputs, options).ToArray();
 
     /// <summary>Links inputs that may include lazily loaded archive members and emits the output as a binary <c>.wasm</c>.</summary>
     public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
-        => LinkProduct(inputs, options).Binary;
+        => LinkOutput(inputs, options).ToArray();
 
     /// <summary>
     /// Links inputs that may include lazily loaded archive members and emits the output as a binary <c>.wasm</c>;
     /// <paramref name="validatedModule"/> is the output as validation read it back, so callers need not read and
-    /// validate the bytes again.
+    /// validate the bytes again, or <see langword="null"/> when <see cref="LinkerOptions.ValidateOutput"/> is off.
     /// </summary>
-    public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options, out WasmModule validatedModule)
+    public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options, out WasmModule? validatedModule)
     {
-        (_, byte[] binary, validatedModule) = LinkAndValidate(inputs, options);
-        return binary;
+        LinkedOutput output = LinkOutput(inputs, options);
+        validatedModule = output.Validated;
+        return output.ToArray();
+    }
+
+    /// <summary>Links the supplied input modules and writes the output to <paramref name="output"/>.</summary>
+    /// <inheritdoc cref="LinkTo(Stream, IReadOnlyList{LinkerInput}, LinkerOptions?)"/>
+    public WasmModule? LinkTo(Stream output, IReadOnlyList<WasmModule> inputs, LinkerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        LinkedOutput linked = LinkOutput(inputs, options);
+        linked.WriteTo(output);
+        return linked.Validated;
+    }
+
+    /// <summary>
+    /// Links inputs that may include lazily loaded archive members and writes the output to <paramref name="output"/>.
+    /// </summary>
+    /// <param name="output">
+    /// The destination, which only needs to be writable. The module is written at its current position; the stream is
+    /// neither flushed nor disposed.
+    /// </param>
+    /// <param name="inputs">The inputs in link order.</param>
+    /// <param name="options">Optional linker configuration.</param>
+    /// <remarks>
+    /// Nothing is written unless the link (and, when <see cref="LinkerOptions.ValidateOutput"/> is on, validation)
+    /// succeeds, and every encoding error is raised before the first byte. An I/O error from
+    /// <paramref name="output"/> itself can still leave a partial module there.
+    /// </remarks>
+    /// <returns>
+    /// The output as validation read it back, or <see langword="null"/> when <see cref="LinkerOptions.ValidateOutput"/>
+    /// is off; the output is then streamed from the linked model without being held in memory.
+    /// </returns>
+    public WasmModule? LinkTo(Stream output, IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        LinkedOutput linked = LinkOutput(inputs, options);
+        linked.WriteTo(output);
+        return linked.Validated;
     }
 
     /// <summary>Links inputs that may include lazily loaded archive members.</summary>
     public WasmModule Link(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
-        => LinkProduct(inputs, options).Module;
+        => LinkOutput(inputs, options).Module;
 
     private static List<WasmModule> ParseInputModules(IEnumerable<Stream> inputStreams)
     {
@@ -316,26 +373,20 @@ public sealed class WasmLinker
         return modules;
     }
 
-    private (WasmModule Module, byte[] Binary) LinkProduct(
-        IReadOnlyList<WasmModule> inputs,
-        LinkerOptions? options)
+    private LinkedOutput LinkOutput(IReadOnlyList<WasmModule> inputs, LinkerOptions? options)
     {
         ArgumentNullException.ThrowIfNull(inputs);
-        return LinkProduct([.. inputs.Select(static m => new LinkerInput(m))], options);
+        var linkerInputs = new List<LinkerInput>(inputs.Count);
+        foreach (WasmModule input in inputs)
+            linkerInputs.Add(new LinkerInput(input));
+        return LinkOutput(linkerInputs, options);
     }
 
-    private (WasmModule Module, byte[] Binary) LinkProduct(
-        IReadOnlyList<LinkerInput> inputs,
-        LinkerOptions? options)
-    {
-        var (module, binary, _) = LinkAndValidate(inputs, options);
-        return (module, binary);
-    }
-
-    /// <summary>Links and returns the analytical model, the encoded bytes and the module validated from those bytes.</summary>
-    private (WasmModule Module, byte[] Binary, WasmModule Validated) LinkAndValidate(
-        IReadOnlyList<LinkerInput> inputs,
-        LinkerOptions? options)
+    /// <summary>
+    /// Links and encodes the output, and, when <see cref="LinkerOptions.ValidateOutput"/> is on, writes it to an
+    /// exactly sized array and validates that.
+    /// </summary>
+    internal LinkedOutput LinkOutput(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options)
     {
         ArgumentNullException.ThrowIfNull(inputs);
         options ??= new LinkerOptions();
@@ -351,17 +402,47 @@ public sealed class WasmLinker
         else
         {
             // Complete modules have no symbol table to drive lazy loading, so archive members are all linked.
-            mergedModule = LinkCore([.. inputs.Select(static i => i.CompleteModule())], options);
+            var modules = new List<WasmModule>(inputs.Count);
+            foreach (LinkerInput input in inputs)
+                modules.Add(input.CompleteModule());
+            mergedModule = LinkCore(modules, options);
         }
 
-        byte[] binary = new SectionMerger().EmitBinary(mergedModule);
+        SectionMerger.EncodedModule encoded = SectionMerger.PrepareBinary(mergedModule);
+        if (!options.ValidateOutput)
+            return new LinkedOutput(mergedModule, encoded, null, null);
 
         // Link() returns the analytical model because reparsing loses linker-only state and object
         // identity. Validate the exact bytes independently because model validation cannot establish
-        // that serialization preserved the linked product.
-        using var stream = new MemoryStream(binary, writable: false);
+        // that serialization preserved the linked product. An exposed buffer is read in place.
+        byte[] binary = encoded.ToArray();
+        using var stream = new MemoryStream(binary, 0, binary.Length, writable: false, publiclyVisible: true);
         WasmModule validated = ModuleReader.ReadModuleAndValidate(stream);
-        return (mergedModule, binary, validated);
+        return new LinkedOutput(mergedModule, encoded, binary, validated);
+    }
+
+    /// <summary>
+    /// A linked module: the analytical model, its encoding and, when the output was validated, the bytes that were
+    /// validated and the module read back from them.
+    /// </summary>
+    internal sealed class LinkedOutput(WasmModule module, SectionMerger.EncodedModule encoded, byte[]? bytes, WasmModule? validated)
+    {
+        public WasmModule Module => module;
+
+        public WasmModule? Validated => validated;
+
+        /// <summary>The output's size in bytes.</summary>
+        public long Length => encoded.Length;
+
+        public byte[] ToArray() => bytes ?? encoded.ToArray();
+
+        public void WriteTo(Stream output)
+        {
+            if (bytes is not null)
+                output.Write(bytes);
+            else
+                encoded.WriteTo(output);
+        }
     }
 
     private static bool UsesObjectSemantics(IReadOnlyList<LinkerInput> inputs, LinkerOptions options)
@@ -387,7 +468,7 @@ public sealed class WasmLinker
             "Set LinkerOptions.InputKind to choose how the inputs are linked.");
     }
 
-    private WasmModule LinkCore(IReadOnlyList<WasmModule> inputs, LinkerOptions? options)
+    private WasmModule LinkCore(List<WasmModule> inputs, LinkerOptions? options)
     {
         options ??= new LinkerOptions();
         ValidateMemoryOptions(options);

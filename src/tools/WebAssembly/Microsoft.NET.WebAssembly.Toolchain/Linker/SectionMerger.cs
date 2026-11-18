@@ -1090,95 +1090,359 @@ public sealed class SectionMerger
     /// Encodes a merged <see cref="WasmModule"/> as a WebAssembly binary without applying semantic
     /// validation. This is a producer boundary; validate the bytes before runtime loading.
     /// </summary>
+    /// <remarks>The output array is the only module-sized allocation: it is sized exactly and written once.</remarks>
     public byte[] EmitBinary(WasmModule module)
     {
         ArgumentNullException.ThrowIfNull(module);
-
-        // Sized for the bulk of the output (code, data and custom sections) so a large module is not copied
-        // through repeated buffer doublings.
-        long estimate = 4096;
-        foreach (WasmFunction function in module.Functions)
-            estimate += function.Body.Length + 16;
-        foreach (Data segment in module.DataSegments)
-            estimate += segment.InitData.Length + 16;
-        foreach (CustomSection section in module.CustomSections)
-            estimate += section.Content.Length + section.Name.Length + 16;
-        using var stream = new MemoryStream((int)Math.Min(estimate, Array.MaxLength));
-        WriteBinary(stream, module);
-        return stream.ToArray();
+        return PrepareBinary(module).ToArray();
     }
 
     /// <summary>
     /// Writes a merged <see cref="WasmModule"/> as a WebAssembly binary without applying semantic
     /// validation. This is a producer boundary; validate the bytes before runtime loading.
     /// </summary>
+    /// <remarks>
+    /// The module is encoded before anything is written, so an encoding error leaves <paramref name="output"/>
+    /// untouched. Code, data and custom-section content is then copied from the model straight to
+    /// <paramref name="output"/>, which only needs to be writable.
+    /// </remarks>
     public void WriteBinary(Stream output, WasmModule module)
     {
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(module);
-
-        output.Write([0x00, 0x61, 0x73, 0x6D]);
-        output.Write([0x01, 0x00, 0x00, 0x00]);
-
-        if (module.Types.Count > 0)
-            WriteSection(output, WasmSectionId.Type, s => WriteTypeSection(s, module.Types, module.TypeDefinitions));
-        if (module.Imports.Count > 0)
-            WriteSection(output, WasmSectionId.Import, s => WriteImportSection(s, module.Imports, module.TypeDefinitions));
-        if (module.Functions.Count > 0)
-            WriteSection(output, WasmSectionId.Function, s => WriteFunctionSection(s, module.Functions));
-        if (module.Tables.Count > 0)
-            WriteSection(output, WasmSectionId.Table, s => WriteTableSection(s, module.Tables, module.TypeDefinitions));
-        if (module.Memories.Count > 0)
-            WriteSection(output, WasmSectionId.Memory, s => WriteMemorySection(s, module.Memories));
-        if (module.Tags.Count > 0)
-            WriteSection(output, WasmSectionId.Tag, s => WriteTagSection(s, module.Tags));
-        if (module.Globals.Count > 0)
-            WriteSection(output, WasmSectionId.Global, s => WriteGlobalSection(s, module.Globals, module.TypeDefinitions));
-        if (module.Exports.Count > 0)
-            WriteSection(output, WasmSectionId.Export, s => WriteExportSection(s, module.Exports));
-        if (module.StartFunction.HasValue)
-            WriteSection(output, WasmSectionId.Start, s => WasmEncoder.WriteU32Leb(s, (uint)module.StartFunction.Value));
-        if (module.Elements.Count > 0)
-            WriteSection(output, WasmSectionId.Element, s => WriteElementSection(s, module.Elements, module.TypeDefinitions));
-        if (module.DataSegments.Any(static segment => segment.IsPassive))
-            WriteSection(output, WasmSectionId.DataCount, s => WasmEncoder.WriteU32Leb(s, (uint)module.DataSegments.Count));
-        if (module.Functions.Count > 0)
-        {
-            IReadOnlyList<EncodedFunctionBody> encodedFunctions =
-                EncodeFunctionBodies(module.Functions, module.TypeDefinitions);
-            if (encodedFunctions.Any(static function => function.BranchHints.Count != 0))
-            {
-                WriteSection(output, WasmSectionId.Custom, s => WriteBranchHintSection(
-                    s,
-                    encodedFunctions,
-                    CountFunctionImports(module.Imports)));
-            }
-            // Written straight to the output: the code section is most of a module, so it is sized up front
-            // rather than buffered.
-            long codeSize = WasmLeb128.GetULeb128Size((ulong)encodedFunctions.Count);
-            foreach (EncodedFunctionBody body in encodedFunctions)
-                codeSize += WasmLeb128.GetULeb128Size((ulong)body.Length) + body.Length;
-            output.WriteByte((byte)WasmSectionId.Code);
-            WasmEncoder.WriteU32Leb(output, checked((uint)codeSize));
-            WriteCodeSection(output, encodedFunctions);
-        }
-        if (module.DataSegments.Count > 0)
-            WriteSection(output, WasmSectionId.Data, s => WriteDataSection(s, module.DataSegments));
-
-        // LLVM tools require producers to precede target_features.
-        bool producersWritten = false;
-        foreach (var customSection in module.CustomSections)
-        {
-            if (string.Equals(customSection.Name, BranchHintMetadataReader.SectionName, StringComparison.Ordinal))
-                continue;
-            if (!producersWritten && string.Equals(customSection.Name, "target_features", StringComparison.Ordinal))
-                producersWritten = WriteProducers(output, module);
-            WriteCustomSectionDirect(output, customSection);
-        }
-
-        if (!producersWritten)
-            WriteProducers(output, module);
+        PrepareBinary(module).WriteTo(output);
     }
+
+    /// <summary>
+    /// Encodes everything about <paramref name="module"/> except its bulk content (function bodies, data and custom
+    /// section payloads), which is written later straight from the model. Every encoding error is raised here.
+    /// </summary>
+    internal static EncodedModule PrepareBinary(WasmModule module) => new(module);
+
+    /// <summary>
+    /// A module ready to be written: its small sections encoded, every function's locals encoded and the size of
+    /// each section known, so the output's <see cref="Length"/> is exact before a byte is written.
+    /// </summary>
+    internal sealed class EncodedModule
+    {
+        private readonly WasmModule _module;
+
+        // Small sections, function locals, data segment headers and custom section names, back to back; the
+        // ranges below index into it. Its order is not the output order.
+        private readonly MemoryStream _encoded = new();
+        private readonly List<(WasmSectionId Id, int Start, int Length)> _sectionsBeforeCode = [];
+
+        // Function i's body up to its instructions (size, then locals) is _encoded[_functionPrefixes[i].Start..End].
+        private readonly FunctionPrefix[] _functionPrefixes = [];
+        private readonly long _codeSize;
+
+        // Data segment i's header (mode, memory, offset and length) is _encoded[_dataOffsets[i].._dataOffsets[i + 1]].
+        private readonly int[] _dataOffsets = [];
+        private readonly long _dataSize;
+
+        // Custom section i's UTF-8 name is _encoded[_customNameOffsets[i].._customNameOffsets[i + 1]]; a branch-hint
+        // section from the model has an empty range and is not written (the code section's hints replace it).
+        private readonly int[] _customNameOffsets = [];
+        private readonly (int Start, int Length) _producers;
+        private readonly int _producersBefore;
+
+        public EncodedModule(WasmModule module)
+        {
+            _module = module;
+            MemoryStream e = _encoded;
+            List<TypeDefinition> typeDefinitions = module.TypeDefinitions;
+
+            if (module.Types.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteTypeSection(e, module.Types, typeDefinitions);
+                AddSection(WasmSectionId.Type, start);
+            }
+            if (module.Imports.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteImportSection(e, module.Imports, typeDefinitions);
+                AddSection(WasmSectionId.Import, start);
+            }
+            if (module.Functions.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteFunctionSection(e, module.Functions);
+                AddSection(WasmSectionId.Function, start);
+            }
+            if (module.Tables.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteTableSection(e, module.Tables, typeDefinitions);
+                AddSection(WasmSectionId.Table, start);
+            }
+            if (module.Memories.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteMemorySection(e, module.Memories);
+                AddSection(WasmSectionId.Memory, start);
+            }
+            if (module.Tags.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteTagSection(e, module.Tags);
+                AddSection(WasmSectionId.Tag, start);
+            }
+            if (module.Globals.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteGlobalSection(e, module.Globals, typeDefinitions);
+                AddSection(WasmSectionId.Global, start);
+            }
+            if (module.Exports.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteExportSection(e, module.Exports);
+                AddSection(WasmSectionId.Export, start);
+            }
+            if (module.StartFunction.HasValue)
+            {
+                int start = (int)e.Length;
+                WasmEncoder.WriteU32Leb(e, (uint)module.StartFunction.Value);
+                AddSection(WasmSectionId.Start, start);
+            }
+            if (module.Elements.Count > 0)
+            {
+                int start = (int)e.Length;
+                WriteElementSection(e, module.Elements, typeDefinitions);
+                AddSection(WasmSectionId.Element, start);
+            }
+            if (HasPassiveSegment(module.DataSegments))
+            {
+                int start = (int)e.Length;
+                WasmEncoder.WriteU32Leb(e, (uint)module.DataSegments.Count);
+                AddSection(WasmSectionId.DataCount, start);
+            }
+
+            List<WasmFunction> functions = module.Functions;
+            if (functions.Count > 0)
+            {
+                _functionPrefixes = new FunctionPrefix[functions.Count];
+                _codeSize = WasmLeb128.GetULeb128Size((ulong)functions.Count);
+                bool hasBranchHints = false;
+                ReadOnlySpan<byte> sizeRoom = [0, 0, 0, 0, 0];
+                for (int i = 0; i < functions.Count; i++)
+                {
+                    // The body's size precedes its locals but depends on them, so room for the longest size is
+                    // reserved and the size is written right-aligned into it once the locals are encoded.
+                    WasmFunction function = functions[i];
+                    e.Write(sizeRoom);
+                    int localsStart = (int)e.Length;
+                    WriteLocals(e, function, typeDefinitions, i);
+                    uint size = checked((uint)(e.Length - localsStart + function.Body.Length + (AppendsEnd(function) ? 1 : 0)));
+                    int sizeLength = WasmLeb128.GetULeb128Size(size);
+                    WasmLeb128.WriteULeb128(e.GetBuffer().AsSpan(localsStart - sizeLength, sizeLength), size);
+                    _functionPrefixes[i] = new FunctionPrefix(localsStart - sizeLength, localsStart, (int)e.Length);
+                    _codeSize += sizeLength + (long)size;
+                    hasBranchHints |= function.BranchHints.Count != 0;
+                }
+
+                if (hasBranchHints)
+                {
+                    int start = (int)e.Length;
+                    WriteBranchHintSection(e, functions, _functionPrefixes, CountFunctionImports(module.Imports));
+                    AddSection(WasmSectionId.Custom, start);
+                }
+            }
+
+            List<Data> segments = module.DataSegments;
+            if (segments.Count > 0)
+            {
+                _dataOffsets = new int[segments.Count + 1];
+                _dataSize = WasmLeb128.GetULeb128Size((ulong)segments.Count);
+                for (int i = 0; i < segments.Count; i++)
+                {
+                    _dataOffsets[i] = (int)e.Length;
+                    WriteDataSegmentHeader(e, segments[i], i);
+                    _dataSize += e.Length - _dataOffsets[i] + segments[i].InitData.Length;
+                }
+                _dataOffsets[segments.Count] = (int)e.Length;
+            }
+
+            // LLVM tools require producers to precede target_features.
+            List<CustomSection> customSections = module.CustomSections;
+            _producersBefore = customSections.Count;
+            _customNameOffsets = new int[customSections.Count + 1];
+            Span<byte> name = stackalloc byte[256];
+            for (int i = 0; i < customSections.Count; i++)
+            {
+                _customNameOffsets[i] = (int)e.Length;
+                string sectionName = customSections[i].Name;
+                if (string.Equals(sectionName, BranchHintMetadataReader.SectionName, StringComparison.Ordinal))
+                    continue;
+                if (_producersBefore == customSections.Count && string.Equals(sectionName, "target_features", StringComparison.Ordinal))
+                    _producersBefore = i;
+                int byteCount = Encoding.UTF8.GetByteCount(sectionName);
+                if (byteCount <= name.Length)
+                    e.Write(name[..Encoding.UTF8.GetBytes(sectionName, name)]);
+                else
+                    e.Write(Encoding.UTF8.GetBytes(sectionName));
+            }
+            _customNameOffsets[customSections.Count] = (int)e.Length;
+
+            if (module.ProducersSection is { Fields.Count: > 0 } producers)
+            {
+                int start = (int)e.Length;
+                WriteProducersSection(e, producers);
+                _producers = (start, (int)e.Length - start);
+            }
+
+            Length = ComputeLength();
+        }
+
+        /// <summary>The exact number of bytes <see cref="WriteTo"/> writes.</summary>
+        public long Length { get; }
+
+        /// <summary>Writes the module, which must be <see cref="Length"/> bytes long, to a new array.</summary>
+        public byte[] ToArray()
+        {
+            if (Length > Array.MaxLength)
+                throw new LinkerException($"The linked module is {Length} bytes, more than an array can hold.");
+            var bytes = new byte[Length];
+            using var stream = new MemoryStream(bytes);
+            WriteTo(stream);
+            return bytes;
+        }
+
+        /// <summary>Writes the module to <paramref name="output"/>, which only needs to be writable.</summary>
+        public void WriteTo(Stream output)
+        {
+            var writer = new WasmModuleWriter(output);
+            ReadOnlySpan<byte> encoded = _encoded.GetBuffer().AsSpan(0, (int)_encoded.Length);
+            foreach ((WasmSectionId id, int start, int length) in _sectionsBeforeCode)
+                writer.WriteSection(id, encoded.Slice(start, length));
+
+            List<WasmFunction> functions = _module.Functions;
+            if (functions.Count > 0)
+            {
+                writer.BeginSection(WasmSectionId.Code, _codeSize);
+                WriteLeb(writer, (ulong)functions.Count);
+                for (int i = 0; i < functions.Count; i++)
+                {
+                    WasmFunction function = functions[i];
+                    writer.Write(encoded[_functionPrefixes[i].Start.._functionPrefixes[i].End]);
+                    writer.Write(function.Body);
+                    if (AppendsEnd(function))
+                        writer.Write([WasmOpcode.End]);
+                }
+                writer.EndSection();
+            }
+
+            List<Data> segments = _module.DataSegments;
+            if (segments.Count > 0)
+            {
+                writer.BeginSection(WasmSectionId.Data, _dataSize);
+                WriteLeb(writer, (ulong)segments.Count);
+                for (int i = 0; i < segments.Count; i++)
+                {
+                    writer.Write(encoded[_dataOffsets[i].._dataOffsets[i + 1]]);
+                    writer.Write(segments[i].InitData);
+                }
+                writer.EndSection();
+            }
+
+            List<CustomSection> customSections = _module.CustomSections;
+            for (int i = 0; i < customSections.Count; i++)
+            {
+                if (i == _producersBefore)
+                    WriteProducers(writer, encoded);
+                if (IsSkipped(i))
+                    continue;
+                writer.BeginCustomSection(encoded[_customNameOffsets[i].._customNameOffsets[i + 1]], customSections[i].Content.Length);
+                writer.Write(customSections[i].Content);
+                writer.EndSection();
+            }
+            if (_producersBefore == customSections.Count)
+                WriteProducers(writer, encoded);
+
+            if (writer.Position != Length)
+                throw new InvalidOperationException($"Wrote {writer.Position} bytes of a module computed to be {Length} bytes long.");
+        }
+
+        private void WriteProducers(WasmModuleWriter writer, ReadOnlySpan<byte> encoded)
+        {
+            if (_producers.Length != 0)
+                writer.WriteSection(WasmSectionId.Custom, encoded.Slice(_producers.Start, _producers.Length));
+        }
+
+        // Also checks that every section's size fits the format's u32, so that no section header can fail once
+        // writing has begun.
+        private long ComputeLength()
+        {
+            long length = WasmModuleWriter.Header.Length;
+            foreach ((_, _, int sectionLength) in _sectionsBeforeCode)
+                length += SectionSize(sectionLength);
+            if (_module.Functions.Count > 0)
+                length += SectionSize(_codeSize, "code section");
+            if (_module.DataSegments.Count > 0)
+                length += SectionSize(_dataSize, "data section");
+            List<CustomSection> customSections = _module.CustomSections;
+            for (int i = 0; i < customSections.Count; i++)
+            {
+                if (IsSkipped(i))
+                    continue;
+                int nameLength = _customNameOffsets[i + 1] - _customNameOffsets[i];
+                length += SectionSize(WasmLeb128.GetULeb128Size((ulong)nameLength) + nameLength + (long)customSections[i].Content.Length);
+            }
+            if (_producers.Length != 0)
+                length += SectionSize(_producers.Length);
+            return length;
+
+            // Sections encoded into the buffer are smaller than an array, so only the code, data and custom sections
+            // (whose content stays in the model) can be too large.
+            static long SectionSize(long contentSize, string? section = null)
+            {
+                if (contentSize > uint.MaxValue)
+                {
+                    throw new LinkerException(
+                        $"The {section ?? "custom section"} is {contentSize} bytes, more than a section can hold ({uint.MaxValue}).");
+                }
+                return 1 + WasmLeb128.GetULeb128Size((ulong)contentSize) + contentSize;
+            }
+        }
+
+        // A branch-hint section in the model is replaced by the one encoded from the functions' hints.
+        private bool IsSkipped(int customSectionIndex) =>
+            _customNameOffsets[customSectionIndex] == _customNameOffsets[customSectionIndex + 1]
+            && string.Equals(_module.CustomSections[customSectionIndex].Name, BranchHintMetadataReader.SectionName, StringComparison.Ordinal);
+
+        private void AddSection(WasmSectionId id, int start) =>
+            _sectionsBeforeCode.Add((id, start, (int)_encoded.Length - start));
+
+        private static void WriteLeb(WasmModuleWriter writer, ulong value)
+        {
+            Span<byte> leb = stackalloc byte[WasmLeb128.MaxLength];
+            writer.Write(leb[..WasmLeb128.WriteULeb128(leb, value)]);
+        }
+    }
+
+    /// <summary>
+    /// Where a function body's encoded size and locals are in <see cref="EncodedModule"/>'s buffer: the size at
+    /// <see cref="Start"/>, the locals from <see cref="Locals"/> to <see cref="End"/>.
+    /// </summary>
+    private readonly record struct FunctionPrefix(int Start, int Locals, int End)
+    {
+        /// <summary>The length of the locals, which is where the function's instructions start.</summary>
+        public int LocalsLength => End - Locals;
+    }
+
+    private static bool HasPassiveSegment(List<Data> segments)
+    {
+        foreach (Data segment in segments)
+        {
+            if (segment.IsPassive)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool AppendsEnd(WasmFunction function) =>
+        function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End;
 
     /// <summary>
     /// Collects all <c>.debug_*</c> custom sections from the input modules, applies DWARF relocations
@@ -1385,22 +1649,6 @@ public sealed class SectionMerger
         return new CustomSection("name", content.ToArray());
     }
 
-    // A custom section's size is known up front, so its (often large) payload is not buffered.
-    private static void WriteCustomSectionDirect(Stream output, CustomSection section)
-    {
-        int nameLength = Encoding.UTF8.GetByteCount(section.Name);
-        long size = WasmLeb128.GetULeb128Size((ulong)nameLength) + nameLength + section.Content.Length;
-        output.WriteByte((byte)WasmSectionId.Custom);
-        WasmEncoder.WriteU32Leb(output, checked((uint)size));
-        WriteCustomSection(output, section);
-    }
-
-    private static void WriteCustomSection(Stream stream, CustomSection section)
-    {
-        WriteName(stream, section.Name);
-        stream.Write(section.Content);
-    }
-
     /// <summary>
     /// Merges producers sections from all input modules and appends a <c>processed-by: <see cref="ProducerName"/></c> entry.
     /// </summary>
@@ -1444,14 +1692,6 @@ public sealed class SectionMerger
         processedBy.Add(toolEntry);
 
         return new ProducersSection { Fields = merged };
-    }
-
-    /// <summary>Writes a producers custom section to the stream.</summary>
-    private static bool WriteProducers(Stream output, WasmModule module)
-    {
-        if (module.ProducersSection is { Fields.Count: > 0 } producers)
-            WriteSection(output, WasmSectionId.Custom, s => WriteProducersSection(s, producers));
-        return true;
     }
 
     private static void WriteProducersSection(Stream stream, ProducersSection producers)
@@ -2506,17 +2746,11 @@ public sealed class SectionMerger
 
     private static bool TryReadConstI32Expr(ReadOnlySpan<byte> expr, out uint value)
     {
-        value = 0;
-        if (expr.Length < 3 || expr[0] != WasmOpcode.I32Const)
-            return false;
-
-        int offset = 1;
-        if (!WasmLeb128.TryReadS32(expr, ref offset, out int decoded)
-            || offset != expr.Length - 1 || expr[^1] != WasmOpcode.End || decoded < 0)
-            return false;
-
-        value = unchecked((uint)decoded);
-        return true;
+        bool single = ConstExpressionWalker.TryReadSingle(expr, out ConstOp op, out DecodedInstruction instruction)
+            && op == ConstOp.I32Const
+            && unchecked((int)instruction.Index0) >= 0;
+        value = single ? instruction.Index0 : 0;
+        return single;
     }
 
     /// <summary>
@@ -2586,17 +2820,6 @@ public sealed class SectionMerger
             _ => throw new LinkerException(
                 $"Constant-expression operand kind {kind} has no merge-time remapping policy."),
         });
-
-    private static void WriteSection(Stream output, WasmSectionId sectionId, Action<Stream> writeContent)
-    {
-        using var content = new MemoryStream();
-        writeContent(content);
-
-        output.WriteByte((byte)sectionId);
-        WasmEncoder.WriteU32Leb(output, (uint)content.Length);
-        // GetBuffer() returns the internal buffer directly; avoids the extra copy that ToArray() would make.
-        output.Write(content.GetBuffer(), 0, (int)content.Length);
-    }
 
     /// <summary>
     /// Writes the type section as a flat list of <c>0x60</c> function types, refusing any type
@@ -3000,48 +3223,7 @@ public sealed class SectionMerger
     private static byte[] GetActiveOffsetExpr(byte[] offsetExpr, string site) =>
         offsetExpr.Length == 0 ? BuildI32ConstExpr(0) : NormalizeConstExpr(offsetExpr, site);
 
-    /// <summary>
-    /// A function body as written: its encoded local declarations, then its instructions (shared with the
-    /// <see cref="WasmFunction"/>, not copied), then an <c>end</c> when the instructions lack one.
-    /// </summary>
-    internal sealed record EncodedFunctionBody(
-        byte[] Locals,
-        byte[] Instructions,
-        bool AppendEnd,
-        IReadOnlyList<(uint Offset, BranchHintKind Kind)> BranchHints)
-    {
-        public int Length => Locals.Length + Instructions.Length + (AppendEnd ? 1 : 0);
-
-        public void WriteTo(Stream stream)
-        {
-            stream.Write(Locals);
-            stream.Write(Instructions);
-            if (AppendEnd)
-                stream.WriteByte(WasmOpcode.End);
-        }
-    }
-
-    internal static IReadOnlyList<EncodedFunctionBody> EncodeFunctionBodies(
-        IReadOnlyList<WasmFunction> functions,
-        IReadOnlyList<TypeDefinition>? typeDefinitions)
-    {
-        var encoded = new List<EncodedFunctionBody>(functions.Count);
-        using var locals = new MemoryStream();
-        for (int i = 0; i < functions.Count; i++)
-        {
-            WasmFunction function = functions[i];
-            locals.SetLength(0);
-            WriteLocals(locals, function, typeDefinitions, i);
-            encoded.Add(new EncodedFunctionBody(
-                locals.ToArray(),
-                function.Body,
-                function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End,
-                ResolveBranchHintOffsets(function, checked((uint)locals.Length), i)));
-        }
-        return encoded;
-    }
-
-    /// <summary>The size of each function body as <see cref="EncodeFunctionBodies"/> encodes it, without encoding the instructions.</summary>
+    /// <summary>The size of each function body as <see cref="EncodedModule"/> writes it, without encoding the instructions.</summary>
     internal static uint[] GetEncodedFunctionBodySizes(IReadOnlyList<WasmFunction> functions, IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
         var sizes = new uint[functions.Count];
@@ -3051,22 +3233,21 @@ public sealed class SectionMerger
             WasmFunction function = functions[i];
             locals.SetLength(0);
             WriteLocals(locals, function, typeDefinitions, i);
-            bool appendEnd = function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End;
-            sizes[i] = checked((uint)(locals.Length + function.Body.Length + (appendEnd ? 1 : 0)));
+            sizes[i] = checked((uint)(locals.Length + function.Body.Length + (AppendsEnd(function) ? 1 : 0)));
         }
 
         return sizes;
     }
 
     /// <summary>
-    /// The length <see cref="EncodeFunctionBodies"/> encodes <paramref name="function"/> (function <paramref name="index"/>)
+    /// The length <see cref="EncodedModule"/> encodes <paramref name="function"/> (function <paramref name="index"/>)
     /// to, measured without copying its body; <paramref name="scratch"/> receives its locals.
     /// </summary>
     internal static int EncodedFunctionBodyLength(WasmFunction function, IReadOnlyList<TypeDefinition>? typeDefinitions, int index, MemoryStream scratch)
     {
         scratch.SetLength(0);
         WriteLocals(scratch, function, typeDefinitions, index);
-        return checked((int)scratch.Length + function.Body.Length + (function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End ? 1 : 0));
+        return checked((int)scratch.Length + function.Body.Length + (AppendsEnd(function) ? 1 : 0));
     }
 
     private static IReadOnlyList<(uint Offset, BranchHintKind Kind)> ResolveBranchHintOffsets(
@@ -3122,22 +3303,32 @@ public sealed class SectionMerger
         return count;
     }
 
+    /// <summary>
+    /// Writes the branch-hint custom section (name included) for <paramref name="functions"/>, whose instructions
+    /// start after their encoded locals.
+    /// </summary>
     private static void WriteBranchHintSection(
         Stream stream,
-        IReadOnlyList<EncodedFunctionBody> functions,
+        List<WasmFunction> functions,
+        FunctionPrefix[] prefixes,
         uint importedFunctionCount)
     {
         WriteName(stream, BranchHintMetadataReader.SectionName);
-        int hintedFunctionCount = functions.Count(
-            static function => function.BranchHints.Count != 0);
-        WasmEncoder.WriteU32Leb(stream, checked((uint)hintedFunctionCount));
+        uint hintedFunctionCount = 0;
+        foreach (WasmFunction function in functions)
+        {
+            if (function.BranchHints.Count != 0)
+                hintedFunctionCount++;
+        }
+        WasmEncoder.WriteU32Leb(stream, hintedFunctionCount);
 
         for (int i = 0; i < functions.Count; i++)
         {
-            IReadOnlyList<(uint Offset, BranchHintKind Kind)> hints = functions[i].BranchHints;
-            if (hints.Count == 0)
+            if (functions[i].BranchHints.Count == 0)
                 continue;
 
+            uint instructionBase = (uint)prefixes[i].LocalsLength;
+            IReadOnlyList<(uint Offset, BranchHintKind Kind)> hints = ResolveBranchHintOffsets(functions[i], instructionBase, i);
             WasmEncoder.WriteU32Leb(stream, checked(importedFunctionCount + (uint)i));
             WasmEncoder.WriteU32Leb(stream, checked((uint)hints.Count));
             foreach ((uint offset, BranchHintKind kind) in hints)
@@ -3146,18 +3337,6 @@ public sealed class SectionMerger
                 WasmEncoder.WriteU32Leb(stream, 1);
                 stream.WriteByte((byte)kind);
             }
-        }
-    }
-
-    private static void WriteCodeSection(
-        Stream stream,
-        IReadOnlyList<EncodedFunctionBody> functions)
-    {
-        WasmEncoder.WriteU32Leb(stream, (uint)functions.Count);
-        for (int i = 0; i < functions.Count; i++)
-        {
-            WasmEncoder.WriteU32Leb(stream, (uint)functions[i].Length);
-            functions[i].WriteTo(stream);
         }
     }
 
@@ -3262,31 +3441,26 @@ public sealed class SectionMerger
         }
     }
 
-    private static void WriteDataSection(Stream stream, List<Data> dataSegments)
+    /// <summary>Writes data segment <paramref name="index"/> up to its content: mode, memory, offset and length.</summary>
+    private static void WriteDataSegmentHeader(Stream stream, Data segment, int index)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)dataSegments.Count);
-        for (int i = 0; i < dataSegments.Count; i++)
+        if (segment.IsPassive)
         {
-            var segment = dataSegments[i];
-            if (segment.IsPassive)
-            {
-                WasmEncoder.WriteU32Leb(stream, 1);
-            }
-            else if (segment.MemoryIndex == 0)
-            {
-                WasmEncoder.WriteU32Leb(stream, 0);
-                stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {i} offset"));
-            }
-            else
-            {
-                WasmEncoder.WriteU32Leb(stream, 2);
-                WasmEncoder.WriteU32Leb(stream, (uint)segment.MemoryIndex);
-                stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {i} offset"));
-            }
-
-            WasmEncoder.WriteU32Leb(stream, (uint)segment.InitData.Length);
-            stream.Write(segment.InitData);
+            WasmEncoder.WriteU32Leb(stream, 1);
         }
+        else if (segment.MemoryIndex == 0)
+        {
+            WasmEncoder.WriteU32Leb(stream, 0);
+            stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {index} offset"));
+        }
+        else
+        {
+            WasmEncoder.WriteU32Leb(stream, 2);
+            WasmEncoder.WriteU32Leb(stream, (uint)segment.MemoryIndex);
+            stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {index} offset"));
+        }
+
+        WasmEncoder.WriteU32Leb(stream, (uint)segment.InitData.Length);
     }
 
     /// <summary>
