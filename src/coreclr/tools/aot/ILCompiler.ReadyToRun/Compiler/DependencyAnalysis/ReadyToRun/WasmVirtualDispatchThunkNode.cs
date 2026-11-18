@@ -11,6 +11,7 @@ using Internal.TypeSystem;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.DependencyAnalysis.ReadyToRun
 {

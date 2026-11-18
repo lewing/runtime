@@ -185,16 +185,11 @@ public static class WasmDisassembler
         int? requiredInstruction = null,
         Func<string, int>? measureCharacters = null)
     {
-        if (startInstruction < 0)
-            throw new ArgumentOutOfRangeException(nameof(startInstruction));
-        if (endInstructionExclusive < startInstruction)
-            throw new ArgumentOutOfRangeException(nameof(endInstructionExclusive));
-        if (endInstructionExclusive > instructions.Count)
-            throw new ArgumentOutOfRangeException(nameof(endInstructionExclusive));
-        if (maxCharacters <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxCharacters));
-        if (previousInstructionLimit < 0)
-            throw new ArgumentOutOfRangeException(nameof(previousInstructionLimit));
+        ArgumentOutOfRangeException.ThrowIfNegative(startInstruction);
+        ArgumentOutOfRangeException.ThrowIfLessThan(endInstructionExclusive, startInstruction);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(endInstructionExclusive, instructions.Count);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxCharacters);
+        ArgumentOutOfRangeException.ThrowIfNegative(previousInstructionLimit);
         if (requiredInstruction is int required &&
             (required < 0 ||
              required >= instructions.Count ||
@@ -1696,8 +1691,7 @@ public static class WasmDisassembler
             var previous = Measured(pc);
             if (previous.Oversized)
             {
-                if (previousInstructionStart is null)
-                    previousInstructionStart = pc;
+                previousInstructionStart ??= pc;
                 break;
             }
             if (previousCharacters + previous.Characters > maxCharacters)

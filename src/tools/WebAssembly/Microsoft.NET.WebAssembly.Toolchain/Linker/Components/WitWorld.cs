@@ -157,8 +157,7 @@ internal sealed class WitWorld
             switch ((ComponentSectionId)id)
             {
                 case ComponentSectionId.Custom:
-                    string name = section.ReadName();
-                    if (name == "wit-component-encoding" && section.HasMore)
+                    if (section.ReadNameBytes().SequenceEqual("wit-component-encoding"u8) && section.HasMore)
                     {
                         section.ReadByte();
                         if (section.HasMore)

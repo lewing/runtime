@@ -123,7 +123,7 @@ public static class DwarfSidecarMerger
     /// Parse DWARF line programs from a section list without mutating any module.
     /// Returns null when no <c>.debug_line</c> section is present.
     /// </summary>
-    private static IReadOnlyList<DwarfLineProgram>? BuildDebugLineInfo(IReadOnlyList<CustomSection> sections)
+    private static List<DwarfLineProgram>? BuildDebugLineInfo(IReadOnlyList<CustomSection> sections)
     {
         var debugLine = sections.FirstOrDefault(s => s.Name == ".debug_line");
         if (debugLine is null)

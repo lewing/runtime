@@ -68,7 +68,14 @@ public sealed class ModuleMergeOptions
 /// </remarks>
 public static class ModuleMerger
 {
-    private enum Kind { Func, Table, Memory, Global, Tag }
+    private enum Kind
+    {
+        Func,
+        Table,
+        Memory,
+        Global,
+        Tag
+    }
 
     private readonly record struct ItemRef(int Module, int Index);
 
@@ -1069,7 +1076,17 @@ public static class ModuleMerger
 }
 
 /// <summary>An index space an instruction immediate names.</summary>
-internal enum IndexSpace { Type, Function, Table, Memory, Global, Tag, Data, Element }
+internal enum IndexSpace
+{
+    Type,
+    Function,
+    Table,
+    Memory,
+    Global,
+    Tag,
+    Data,
+    Element
+}
 
 /// <summary>
 /// Re-encodes a function body (instructions only, no locals) with every index immediate passed

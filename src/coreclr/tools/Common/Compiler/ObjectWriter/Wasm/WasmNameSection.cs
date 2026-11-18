@@ -3,9 +3,9 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using Internal.Text;
+using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
@@ -22,11 +22,8 @@ namespace ILCompiler.ObjectWriter
     /// </remarks>
     internal sealed class WasmNameSection : IWasmSection
     {
-        private const byte FunctionNameSubsectionId = 1;
-        private static ReadOnlySpan<byte> SectionName => "name"u8;
-
         private readonly WasmSymbol[] _functionSymbols;
-        private readonly long _subsectionSize;
+        private readonly long _entriesSize;
 
         public WasmNameSection(IEnumerable<WasmSymbol> functionSymbols)
         {
@@ -35,16 +32,10 @@ namespace ILCompiler.ObjectWriter
             // Sized in a first pass so that the payload can be written straight to the output stream.
             // At framework scale the payload is tens of megabytes, so buffering it would put several
             // copies of it on the large object heap.
-            long nameMapSize = 0;
             foreach (WasmSymbol symbol in _functionSymbols)
             {
-                int nameLength = symbol.Name.Length;
-                nameMapSize += WasmLeb128.GetULeb128Size((ulong)symbol.Index)
-                    + WasmLeb128.GetULeb128Size((ulong)nameLength)
-                    + nameLength;
+                _entriesSize += NameMapWriter.GetEntrySize((uint)symbol.Index, symbol.Name.Length);
             }
-
-            _subsectionSize = WasmLeb128.GetULeb128Size((ulong)_functionSymbols.Length) + nameMapSize;
         }
 
         /// <summary>Number of functions named by this section.</summary>
@@ -54,33 +45,19 @@ namespace ILCompiler.ObjectWriter
 
         public int Emit(WasmModuleWriter writer)
         {
-            long payloadSize = 1 + WasmLeb128.GetULeb128Size((ulong)_subsectionSize) + _subsectionSize;
-            int index = writer.BeginCustomSection(SectionName, payloadSize);
-            Span<byte> buffer = stackalloc byte[WasmLeb128.MaxLength];
-            buffer[0] = FunctionNameSubsectionId;
-            writer.Write(buffer.Slice(0, 1));
-            WriteULeb128(writer, buffer, (ulong)_subsectionSize);
-            WriteULeb128(writer, buffer, (ulong)_functionSymbols.Length);
+            int index = writer.BeginCustomSection("name"u8, NameMapWriter.GetSubsectionSize(_functionSymbols.Length, _entriesSize));
 
-            // The name map must be sorted by index and free of duplicates. GetDefinitions already
-            // orders by index, so this only asserts rather than re-sorting a very large sequence.
-            int previousIndex = -1;
+            // The name map must be sorted by index and free of duplicates, which NameMapWriter checks. GetDefinitions
+            // already orders by index.
+            NameMapWriter functionNames = new(writer, NameSubsectionId.Function, _functionSymbols.Length, _entriesSize);
             foreach (WasmSymbol symbol in _functionSymbols)
             {
-                Debug.Assert(symbol.Index > previousIndex, "Function name map must be sorted by index and duplicate-free");
-                previousIndex = symbol.Index;
-
-                WriteULeb128(writer, buffer, (ulong)symbol.Index);
-                ReadOnlySpan<byte> name = symbol.Name.AsSpan();
-                WriteULeb128(writer, buffer, (ulong)name.Length);
-                writer.Write(name);
+                functionNames.Write((uint)symbol.Index, symbol.Name.AsSpan());
             }
 
+            functionNames.Complete();
             writer.EndSection();
             return index;
         }
-
-        private static void WriteULeb128(WasmModuleWriter writer, Span<byte> buffer, ulong value) =>
-            writer.Write(buffer.Slice(0, WasmLeb128.WriteULeb128(buffer, value)));
     }
 }

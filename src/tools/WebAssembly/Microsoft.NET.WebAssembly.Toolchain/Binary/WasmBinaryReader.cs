@@ -1,8 +1,10 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
+using System.Text.Unicode;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace Microsoft.NET.WebAssembly.Binary;
@@ -185,19 +187,64 @@ public sealed class WasmBinaryReader
         public uint Current => 0;
     }
 
+    /// <summary>The message for a name (§5.2.4) whose bytes are not valid UTF-8.</summary>
+    internal const string InvalidUtf8NameMessage = "Invalid UTF-8 encoding in name";
+
     /// <summary>Read a UTF-8 name (§5.2.4) — length-prefixed string.</summary>
     public string ReadName()
     {
-        uint length = ReadU32Leb128();
-        Span<byte> buf = length <= 256 ? stackalloc byte[(int)length] : new byte[(int)length];
+        int length = ReadNameLength();
+        Span<byte> buf = length <= 256 ? stackalloc byte[length] : new byte[length];
         ReadBytes(buf);
+        return DecodeName(buf);
+    }
+
+    /// <summary>Decodes a name's bytes, rejecting invalid UTF-8 as <see cref="ReadName"/> does.</summary>
+    internal static string DecodeName(ReadOnlySpan<byte> utf8)
+    {
         try
         {
-            return StrictUtf8.GetString(buf);
+            return StrictUtf8.GetString(utf8);
         }
         catch (DecoderFallbackException ex)
         {
-            throw new WasmFormatException("Invalid UTF-8 encoding in name", ex);
+            throw new WasmFormatException(InvalidUtf8NameMessage, ex);
+        }
+    }
+
+    /// <summary>
+    /// Reads a name's length, rejecting one longer than the rest of the input (when its length is known) before any
+    /// buffer of that size is allocated.
+    /// </summary>
+    private int ReadNameLength()
+    {
+        uint length = ReadU32Leb128();
+        if (_length is { } total && length > total - _position)
+            throw new WasmFormatException($"Unexpected end of stream: expected {length} bytes but only {total - _position} available");
+        if (length > Array.MaxLength)
+            throw new WasmFormatException($"Name length {length} is too large");
+        return (int)length;
+    }
+
+    /// <summary>
+    /// Skip a UTF-8 name (§5.2.4) without decoding it. The bytes are still validated: a name that is not valid
+    /// UTF-8 makes the binary malformed whether or not anyone reads it.
+    /// </summary>
+    public void SkipName()
+    {
+        int length = ReadNameLength();
+        byte[]? rented = null;
+        Span<byte> buf = length <= 256 ? stackalloc byte[length] : (rented = ArrayPool<byte>.Shared.Rent(length)).AsSpan(0, length);
+        try
+        {
+            ReadBytes(buf);
+            if (!Utf8.IsValid(buf))
+                throw new WasmFormatException(InvalidUtf8NameMessage);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
         }
     }
 

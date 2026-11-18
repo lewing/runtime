@@ -3,7 +3,9 @@
 
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
+using System.Buffers;
 using System.Text;
+using System.Text.Unicode;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 
@@ -118,17 +120,32 @@ internal sealed class CtReader(byte[] bytes, int start, int end)
         _ => new FormatException($"{type} LEB128 too long."),
     };
 
-    public string ReadName()
+    /// <summary>Reads a name and decodes it. Invalid UTF-8 is rejected, as the core and component readers do.</summary>
+    public string ReadName() => Encoding.UTF8.GetString(ReadNameBytes());
+
+    /// <summary>Reads a name as its validated UTF-8 bytes, for callers that only compare or copy it.</summary>
+    public ReadOnlySpan<byte> ReadNameBytes() => ReadNameMemory().Span;
+
+    /// <summary>Reads a name as its validated UTF-8 bytes, which stay valid as long as the underlying buffer.</summary>
+    public ReadOnlyMemory<byte> ReadNameMemory()
     {
-        int length = checked((int)ReadU32());
-        if (Position + length > End)
+        uint length = ReadU32();
+        if (length > (uint)(End - Position))
             throw new FormatException("Name extends past the end of the component data.");
-        string name = Encoding.UTF8.GetString(_bytes, Position, length);
-        Position += length;
+        var name = new ReadOnlyMemory<byte>(_bytes, Position, (int)length);
+        if (!Utf8.IsValid(name.Span))
+            throw new FormatException(WasmBinaryReader.InvalidUtf8NameMessage);
+        Position += (int)length;
         return name;
     }
 
+    /// <summary>Skips a name. Its bytes are still validated; only the decode is skipped.</summary>
+    public void SkipName() => ReadNameBytes();
+
     public byte[] Slice(int from) => _bytes[from..Position];
+
+    /// <summary>The bytes from <paramref name="from"/> to the current position, without copying.</summary>
+    public ReadOnlySpan<byte> SpanFrom(int from) => _bytes.AsSpan(from, Position - from);
 
     public CtReader Sub(int length)
     {
@@ -155,7 +172,25 @@ internal sealed class CtWriter
 
     public void Name(string name)
     {
-        byte[] utf8 = Encoding.UTF8.GetBytes(name);
+        int length = Encoding.UTF8.GetByteCount(name);
+        U32((uint)length);
+        byte[]? rented = null;
+        Span<byte> utf8 = length <= 256 ? stackalloc byte[length] : (rented = ArrayPool<byte>.Shared.Rent(length)).AsSpan(0, length);
+        try
+        {
+            Encoding.UTF8.GetBytes(name, utf8);
+            Bytes(utf8);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Writes a name that is already UTF-8: a <c>u8</c> literal or bytes copied from a <see cref="CtReader"/>.</summary>
+    public void Name(ReadOnlySpan<byte> utf8)
+    {
         U32((uint)utf8.Length);
         Bytes(utf8);
     }
@@ -477,10 +512,10 @@ internal static class ComponentTypeCodec
                     byte kind = r.ReadByte();
                     switch ((CoreModuleDeclKind)kind)
                     {
-                        case CoreModuleDeclKind.Import: r.ReadName(); r.ReadName(); SkipCoreImportDesc(r); break;
+                        case CoreModuleDeclKind.Import: r.SkipName(); r.SkipName(); SkipCoreImportDesc(r); break;
                         case CoreModuleDeclKind.Type: ReadRawCoreType(r); break;
                         case CoreModuleDeclKind.Alias: r.ReadByte(); r.ReadByte(); r.ReadU32(); r.ReadU32(); break;
-                        case CoreModuleDeclKind.Export: r.ReadName(); SkipCoreImportDesc(r); break;
+                        case CoreModuleDeclKind.Export: r.SkipName(); SkipCoreImportDesc(r); break;
                         default: throw new FormatException($"Unknown core module type declaration 0x{kind:X2}.");
                     }
                 }
@@ -583,17 +618,22 @@ internal static class ComponentTypeCodec
         return new CtExportDecl(name, ReadExternDesc(r), raw);
     }
 
-    public static string ReadExternName(CtReader r)
+    public static string ReadExternName(CtReader r) => Encoding.UTF8.GetString(ReadExternNameBytes(r));
+
+    /// <summary>Skips an <c>importname'</c>/<c>exportname'</c>, validating every name in it.</summary>
+    public static void SkipExternName(CtReader r) => ReadExternNameBytes(r);
+
+    private static ReadOnlySpan<byte> ReadExternNameBytes(CtReader r)
     {
         byte prefix = r.ReadByte();
-        string name = r.ReadName();
+        ReadOnlySpan<byte> name = r.ReadNameBytes();
         if (prefix == 0x02)
         {
             uint options = r.ReadU32();
             for (uint i = 0; i < options; i++)
             {
                 r.ReadByte();
-                r.ReadName();
+                r.SkipName();
             }
         }
         else if (prefix > 0x02)

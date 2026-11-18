@@ -79,18 +79,26 @@ public static partial class WasmLeb128
         }
     }
 
-    /// <summary>Writes the minimal unsigned LEB128 encoding of <paramref name="value"/> to <paramref name="stream"/>.</summary>
-    public static void WriteULeb128(Stream stream, ulong value)
+    /// <summary>
+    /// Writes the minimal unsigned LEB128 encoding of <paramref name="value"/> to <paramref name="stream"/> and returns its length.
+    /// </summary>
+    public static int WriteULeb128(Stream stream, ulong value)
     {
         Span<byte> buffer = stackalloc byte[MaxLength];
-        stream.Write(buffer[..WriteULeb128(buffer, value)]);
+        int length = WriteULeb128(buffer, value);
+        stream.Write(buffer[..length]);
+        return length;
     }
 
-    /// <summary>Writes the minimal signed LEB128 encoding of <paramref name="value"/> to <paramref name="stream"/>.</summary>
-    public static void WriteSLeb128(Stream stream, long value)
+    /// <summary>
+    /// Writes the minimal signed LEB128 encoding of <paramref name="value"/> to <paramref name="stream"/> and returns its length.
+    /// </summary>
+    public static int WriteSLeb128(Stream stream, long value)
     {
         Span<byte> buffer = stackalloc byte[MaxLength];
-        stream.Write(buffer[..WriteSLeb128(buffer, value)]);
+        int length = WriteSLeb128(buffer, value);
+        stream.Write(buffer[..length]);
+        return length;
     }
 
     /// <summary>

@@ -27,6 +27,7 @@ using Internal.TypeSystem;
 using Internal.TypeSystem.Ecma;
 
 using Xunit;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ReadyToRun.Tests;
 
@@ -83,16 +84,16 @@ public class ReadyToRunLibraryRootProviderTests
             {
                 bytes.AddRange([(byte)localCount, (byte)localType]);
             }
-            EmitRelocation(WasmExprKind.I32Const, RelocType.WASM_METHOD_FRAME_IDENTITY_SLEB, callerIdentity);
+            EmitRelocation(WasmOp.I32Const, RelocType.WASM_METHOD_FRAME_IDENTITY_SLEB, callerIdentity);
             bytes.Add(DropOpcode);
             if (i == 0)
             {
                 variables[0].startOffset = (uint)bytes.Count;
             }
-            bytes.AddRange([(byte)WasmExprKind.LocalGet, 0, (byte)WasmExprKind.LocalGet, 0]);
-            EmitRelocation(WasmExprKind.I32Const, RelocType.WASM_METHOD_FRAME_IDENTITY_SLEB, targetIdentity);
+            bytes.AddRange([(byte)WasmOp.LocalGet, 0, (byte)WasmOp.LocalGet, 0]);
+            EmitRelocation(WasmOp.I32Const, RelocType.WASM_METHOD_FRAME_IDENTITY_SLEB, targetIdentity);
             bool returnsValue = i < 3;
-            EmitRelocation(tailCall && returnsValue ? WasmExprKind.ReturnCall : WasmExprKind.Call,
+            EmitRelocation(tailCall && returnsValue ? WasmOp.ReturnCall : WasmOp.Call,
                 RelocType.WASM_FUNCTION_INDEX_LEB, call);
             locations[i] = new OffsetMapping { nativeOffset = (uint)bytes.Count, ilOffset = (uint)i };
             if (i == 0)
@@ -103,7 +104,7 @@ public class ReadyToRunLibraryRootProviderTests
             {
                 bytes.Add(DropOpcode);
             }
-            bytes.Add((byte)WasmExprKind.End);
+            bytes.Add((byte)WasmOp.End);
             byte[] size = new byte[5];
             DwarfHelper.WritePaddedULEB128(size, (ulong)(bytes.Count - start - size.Length));
             for (int j = 0; j < size.Length; j++)
@@ -143,31 +144,31 @@ public class ReadyToRunLibraryRootProviderTests
                 AssertImmediate(1);
                 Assert.Equal((byte)WasmValueType.I32, rewritten.Data[position++]);
             }
-            AssertInstruction(WasmExprKind.I32Const);
+            AssertInstruction(WasmOp.I32Const);
             AssertImmediate(0, RelocType.WASM_METHOD_FRAME_IDENTITY_SLEB, callerIdentity);
             Assert.Equal(DropOpcode, rewritten.Data[position++]);
             if (i == 0)
             {
                 expectedVariables[0].startOffset = (uint)position;
             }
-            AssertInstruction(WasmExprKind.LocalGet);
+            AssertInstruction(WasmOp.LocalGet);
             AssertImmediate(0);
-            AssertInstruction(WasmExprKind.LocalGet);
+            AssertInstruction(WasmOp.LocalGet);
             AssertImmediate(0);
-            AssertInstruction(WasmExprKind.GlobalGet);
+            AssertInstruction(WasmOp.GlobalGet);
             AssertImmediate(0, RelocType.WASM_GLOBAL_INDEX_LEB, imageBase);
-            AssertInstruction(WasmExprKind.I32Load);
+            AssertInstruction(WasmOp.I32Load);
             AssertImmediate(2);
             AssertImmediate(0, RelocType.WASM_MEMORY_ADDR_REL_LEB, fallback);
-            AssertInstruction(WasmExprKind.LocalTee);
+            AssertInstruction(WasmOp.LocalTee);
             AssertImmediate((uint)(parameterCounts[i] + localCount));
-            AssertInstruction(WasmExprKind.LocalGet);
+            AssertInstruction(WasmOp.LocalGet);
             AssertImmediate((uint)(parameterCounts[i] + localCount));
-            AssertInstruction(WasmExprKind.I32Load);
+            AssertInstruction(WasmOp.I32Load);
             AssertImmediate(2);
             AssertImmediate(0);
             bool returnsValue = i < 3;
-            AssertInstruction(tailCall && returnsValue ? WasmExprKind.ReturnCallIndirect : WasmExprKind.CallIndirect);
+            AssertInstruction(tailCall && returnsValue ? WasmOp.ReturnCallIndirect : WasmOp.CallIndirect);
             AssertImmediate(0, RelocType.WASM_TYPE_INDEX_LEB, signature);
             AssertImmediate(0);
             expectedLocations[i] = new OffsetMapping { nativeOffset = (uint)position, ilOffset = (uint)i };
@@ -179,7 +180,7 @@ public class ReadyToRunLibraryRootProviderTests
             {
                 Assert.Equal(DropOpcode, rewritten.Data[position++]);
             }
-            AssertInstruction(WasmExprKind.End);
+            AssertInstruction(WasmOp.End);
             Assert.Equal(frame.EndOffset, position);
         }
         Assert.Equal(rewritten.Data.Length, position);
@@ -194,7 +195,7 @@ public class ReadyToRunLibraryRootProviderTests
         Assert.Equal(expectedDebugInfo.DebugLocInfos, caller.DebugLocInfos);
         Assert.Equal(expectedDebugInfo.DebugVarInfos, caller.DebugVarInfos);
 
-        int EmitRelocation(WasmExprKind instruction, RelocType type, ISymbolNode symbol)
+        int EmitRelocation(WasmOp instruction, RelocType type, ISymbolNode symbol)
         {
             bytes.Add((byte)instruction);
             int offset = bytes.Count;
@@ -203,7 +204,7 @@ public class ReadyToRunLibraryRootProviderTests
             return offset;
         }
 
-        void AssertInstruction(WasmExprKind instruction) => Assert.Equal((byte)instruction, rewritten.Data[position++]);
+        void AssertInstruction(WasmOp instruction) => Assert.Equal((byte)instruction, rewritten.Data[position++]);
 
         void AssertImmediate(uint expected, RelocType? type = null, ISymbolNode? symbol = null)
         {
@@ -284,8 +285,8 @@ public class ReadyToRunLibraryRootProviderTests
         byte[] code = new byte[64];
         for (int i = 0; i < callCount; i++)
         {
-            code[7 + i * 12] = (byte)WasmExprKind.I32Const;
-            code[13 + i * 12] = (byte)(i == 0 ? WasmExprKind.Call : WasmExprKind.ReturnCall);
+            code[7 + i * 12] = (byte)WasmOp.I32Const;
+            code[13 + i * 12] = (byte)(i == 0 ? WasmOp.Call : WasmOp.ReturnCall);
         }
         ObjectNode.ObjectData original = new(code, relocations, 16, [caller]);
         caller.SetCode(original);

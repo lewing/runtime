@@ -247,7 +247,7 @@ public sealed class SectionMerger
     private static TypeDefinition RemapTypeDefinition(
         TypeDefinition definition,
         int mergedIndex,
-        IReadOnlyDictionary<uint, uint> typeMap,
+        Dictionary<uint, uint> typeMap,
         int moduleIndex)
     {
         int Map(int index) => (uint)index < uint.MaxValue && typeMap.TryGetValue((uint)index, out uint mapped)
@@ -1430,7 +1430,7 @@ public sealed class SectionMerger
 
     private static void WriteProducersSection(Stream stream, ProducersSection producers)
     {
-        WriteName(stream, "producers");
+        WriteName(stream, "producers"u8);
 
         WasmEncoder.WriteU32Leb(stream, (uint)producers.Fields.Count);
         foreach (var (fieldName, values) in producers.Fields)
@@ -2594,8 +2594,8 @@ public sealed class SectionMerger
     /// </remarks>
     private static void WriteTypeSection(
         Stream stream,
-        IReadOnlyList<FuncType> types,
-        IReadOnlyList<TypeDefinition>? typeDefinitions = null)
+        List<FuncType> types,
+        List<TypeDefinition>? typeDefinitions = null)
     {
         bool exact = typeDefinitions is { Count: > 0 };
         if (exact)
@@ -2667,9 +2667,9 @@ public sealed class SectionMerger
         }
     }
 
-    private static void WriteValTypes(Stream stream, IReadOnlyList<ValType> types)
+    private static void WriteValTypes(Stream stream, ReadOnlySpan<ValType> types)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)types.Count);
+        WasmEncoder.WriteU32Leb(stream, (uint)types.Length);
         foreach (var type in types)
             stream.WriteByte((byte)type);
     }
@@ -2771,7 +2771,7 @@ public sealed class SectionMerger
 
     private static void WriteImportSection(
         Stream stream,
-        IReadOnlyList<Import> imports,
+        List<Import> imports,
         IReadOnlyList<TypeDefinition>? typeDefinitions = null)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)imports.Count);
@@ -2809,7 +2809,7 @@ public sealed class SectionMerger
         }
     }
 
-    private static void WriteFunctionSection(Stream stream, IReadOnlyList<WasmFunction> functions)
+    private static void WriteFunctionSection(Stream stream, List<WasmFunction> functions)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)functions.Count);
         foreach (var function in functions)
@@ -2818,7 +2818,7 @@ public sealed class SectionMerger
 
     private static void WriteTableSection(
         Stream stream,
-        IReadOnlyList<TableType> tables,
+        List<TableType> tables,
         IReadOnlyList<TypeDefinition>? typeDefinitions = null)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)tables.Count);
@@ -2826,14 +2826,14 @@ public sealed class SectionMerger
             WriteTableDefinition(stream, table, typeDefinitions);
     }
 
-    private static void WriteMemorySection(Stream stream, IReadOnlyList<MemoryType> memories)
+    private static void WriteMemorySection(Stream stream, List<MemoryType> memories)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)memories.Count);
         foreach (var memory in memories)
             WriteMemoryLimits(stream, memory.Limits, memory.Shared);
     }
 
-    private static void WriteTagSection(Stream stream, IReadOnlyList<Tag> tags)
+    private static void WriteTagSection(Stream stream, List<Tag> tags)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)tags.Count);
         foreach (var tag in tags)
@@ -2845,7 +2845,7 @@ public sealed class SectionMerger
 
     private static void WriteGlobalSection(
         Stream stream,
-        IReadOnlyList<WasmGlobal> globals,
+        List<WasmGlobal> globals,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)globals.Count);
@@ -2893,7 +2893,7 @@ public sealed class SectionMerger
 
     private static void WriteElementSection(
         Stream stream,
-        IReadOnlyList<Element> elements,
+        List<Element> elements,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
         WasmEncoder.WriteU32Leb(stream, (uint)elements.Count);
@@ -2947,7 +2947,7 @@ public sealed class SectionMerger
             if (flags != 0)
                 stream.WriteByte(0x00);
 
-            IReadOnlyList<int> functionIndices =
+            List<int> functionIndices =
                 element.Mode == ElementMode.Declarative && element.DeclaredFunctionIndices.Count > 0
                     ? element.DeclaredFunctionIndices
                     : element.FunctionIndices;
@@ -3379,6 +3379,13 @@ public sealed class SectionMerger
         WasmEncoder.WriteU32Leb(stream, (uint)limits.Min);
         if (limits.Max.HasValue)
             WasmEncoder.WriteU32Leb(stream, (uint)limits.Max.Value);
+    }
+
+    /// <summary>Writes a name that is already UTF-8, such as a <c>u8</c> literal.</summary>
+    private static void WriteName(Stream stream, ReadOnlySpan<byte> utf8)
+    {
+        WasmEncoder.WriteU32Leb(stream, (uint)utf8.Length);
+        stream.Write(utf8);
     }
 
     private static void WriteName(Stream stream, string value)

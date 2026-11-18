@@ -16,7 +16,13 @@ namespace Microsoft.NET.WebAssembly.Linker;
 /// </summary>
 internal sealed class CodeAddressMap
 {
-    internal enum Outcome { Mapped, Removed, Special, Invalid }
+    internal enum Outcome
+    {
+        Mapped,
+        Removed,
+        Special,
+        Invalid
+    }
 
     /// <summary>An instruction whose length changed: its old and new extent, relative to the body start.</summary>
     internal readonly record struct Resized(int OldStart, int OldEnd, int NewStart, int NewEnd);

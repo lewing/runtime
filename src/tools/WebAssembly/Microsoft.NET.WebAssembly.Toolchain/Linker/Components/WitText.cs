@@ -61,7 +61,13 @@ internal sealed record WitOwnKind(WitTDef Resource) : WitKind;
 internal sealed record WitBorrowKind(WitTDef Resource) : WitKind;
 internal sealed record WitAliasKind(WitVal Target) : WitKind;
 
-internal enum WitFunctionKind { Freestanding, Method, Static, Constructor }
+internal enum WitFunctionKind
+{
+    Freestanding,
+    Method,
+    Static,
+    Constructor
+}
 
 internal sealed record WitFunction(
     string Name, bool Async, WitFunctionKind Kind, WitTDef? Resource, List<(string Name, WitVal Type)> Params, WitVal? Result);
@@ -1250,7 +1256,7 @@ internal sealed class WitResolver(List<WitAstPackage> packages)
         _ => Anonymous(package, ResolveKind(package, lookup, type)),
     };
 
-    private WitVal Value(WitAstPackage package, WitTDef def)
+    private WitRef Value(WitAstPackage package, WitTDef def)
     {
         if (!IsResource(def))
             return new WitRef(def);
@@ -1260,7 +1266,7 @@ internal sealed class WitResolver(List<WitAstPackage> packages)
         return new WitRef(handle);
     }
 
-    private WitVal Anonymous(WitAstPackage package, WitKind kind)
+    private WitRef Anonymous(WitAstPackage package, WitKind kind)
     {
         var interned = Cache(_anonymous, package.Name);
         string key = WitKindKey.Of(kind);

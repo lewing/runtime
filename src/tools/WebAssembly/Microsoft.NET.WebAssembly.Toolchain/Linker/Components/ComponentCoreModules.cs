@@ -3,6 +3,7 @@
 
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
+using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 
@@ -79,9 +80,10 @@ public static class ComponentCoreModules
         var after = ModuleInfo.Read(replacement);
         var errors = new List<string>();
 
-        var originalImports = before.Imports.ToLookup(i => (i.Module, i.Field), i => i.Entity);
-        foreach (var (moduleName, field, entity) in after.Imports)
+        var originalImports = before.Imports.ToLookup(i => (Decode(i.Module), Decode(i.Field)), i => i.Entity);
+        foreach (var (moduleBytes, fieldBytes, entity) in after.Imports)
         {
+            string moduleName = Decode(moduleBytes), field = Decode(fieldBytes);
             // Whatever satisfied the original import must satisfy this one.
             if (!originalImports.Contains((moduleName, field)))
                 errors.Add($"it imports '{moduleName}' '{field}', which core module {index} does not import");
@@ -89,9 +91,10 @@ public static class ComponentCoreModules
                 errors.Add($"its import '{moduleName}' '{field}' has a type the original import does not satisfy");
         }
 
-        var replacementExports = after.Exports.ToDictionary(e => e.Name, e => e.Entity, StringComparer.Ordinal);
-        foreach (var (name, entity) in before.Exports)
+        var replacementExports = after.Exports.ToDictionary(e => Decode(e.Name), e => e.Entity, StringComparer.Ordinal);
+        foreach (var (nameBytes, entity) in before.Exports)
         {
+            string name = Decode(nameBytes);
             if (!replacementExports.TryGetValue(name, out var export))
                 errors.Add($"it does not export '{name}'");
             else if (!IsSubtype(after, export, before, entity))
@@ -103,6 +106,9 @@ public static class ComponentCoreModules
             throw new LinkerException(
                 $"the replacement cannot stand in for core module {index}: " + string.Join("; ", errors) + ".");
         }
+
+        // ModuleInfo has already validated the names; they are decoded only to key and report them.
+        static string Decode(ReadOnlyMemory<byte> name) => Encoding.UTF8.GetString(name.Span);
     }
 
     /// <summary>Core-module external subtyping: <paramref name="actual"/> (of <paramref name="actualModule"/>) can be used as <paramref name="expected"/>.</summary>
@@ -255,11 +261,11 @@ public static class ComponentCoreModules
                     CheckImports(r);
                     w.Bytes(component.AsSpan(sectionStart, end - sectionStart));
                     break;
-                case ComponentSectionId.Custom when r.ReadName() == "component-name":
+                case ComponentSectionId.Custom when r.ReadNameBytes().SequenceEqual("component-name"u8):
                     int payload = r.Position;
                     w.Section(ComponentSectionId.Custom, s =>
                     {
-                        s.Name("component-name");
+                        s.Name("component-name"u8);
                         RewriteNames(new CtReader(component, payload, end), s, extraModules, extraTypes);
                     });
                     break;
@@ -311,7 +317,7 @@ public static class ComponentCoreModules
                 w.U32(args);
                 for (uint a = 0; a < args; a++)
                 {
-                    w.Name(r.ReadName());
+                    w.Name(r.ReadNameBytes());
                     w.Byte(r.ReadByte());
                     w.U32(r.ReadU32());
                 }
@@ -322,7 +328,7 @@ public static class ComponentCoreModules
                 w.U32(exports);
                 for (uint e = 0; e < exports; e++)
                 {
-                    w.Name(r.ReadName());
+                    w.Name(r.ReadNameBytes());
                     w.Byte(r.ReadByte());
                     w.U32(r.ReadU32());
                 }
@@ -349,7 +355,7 @@ public static class ComponentCoreModules
                 w.U32(args);
                 for (uint a = 0; a < args; a++)
                 {
-                    w.Name(r.ReadName());
+                    w.Name(r.ReadNameBytes());
                     RewriteSortIndex(r, w, extraModules);
                 }
             }
@@ -417,7 +423,7 @@ public static class ComponentCoreModules
             for (uint i = 0; i < count; i++)
             {
                 body.U32(sub.ReadU32() + shift);
-                body.Name(sub.ReadName());
+                body.Name(sub.ReadNameBytes());
             }
 
             w.Byte(id);
@@ -441,8 +447,8 @@ public static class ComponentCoreModules
     private static void CopyNameAttributes(CtReader r, CtWriter w)
     {
         int start = r.Position;
-        ComponentTypeCodec.ReadExternName(r);
-        w.Bytes(r.Slice(start));
+        ComponentTypeCodec.SkipExternName(r);
+        w.Bytes(r.SpanFrom(start));
     }
 
     private static void CheckImports(CtReader r)
@@ -450,7 +456,7 @@ public static class ComponentCoreModules
         uint count = r.ReadU32();
         for (uint i = 0; i < count; i++)
         {
-            ComponentTypeCodec.ReadExternName(r);
+            ComponentTypeCodec.SkipExternName(r);
             if (ComponentTypeCodec.ReadExternDesc(r).Kind == ComponentExternKind.CoreModule)
                 throw new NotSupportedException("unbundling a component that imports core modules is not supported.");
         }
@@ -547,8 +553,8 @@ public static class ComponentCoreModules
             byte[] type = EntityType(entity);
             var d = new CtWriter();
             d.Byte((byte)CoreModuleDeclKind.Import);
-            d.Name(moduleName);
-            d.Name(field);
+            d.Name(moduleName.Span);
+            d.Name(field.Span);
             d.Bytes(type);
             decls.Add(d.ToArray());
         }
@@ -558,7 +564,7 @@ public static class ComponentCoreModules
             byte[] type = EntityType(entity);
             var d = new CtWriter();
             d.Byte((byte)CoreModuleDeclKind.Export);
-            d.Name(name);
+            d.Name(name.Span);
             d.Bytes(type);
             decls.Add(d.ToArray());
         }
@@ -577,8 +583,8 @@ public static class ComponentCoreModules
         public sealed record Entity(byte Kind, int TypeIndex, byte[] Raw);
 
         public List<byte[]> Types { get; } = [];
-        public List<(string Module, string Field, Entity Entity)> Imports { get; } = [];
-        public List<(string Name, Entity Entity)> Exports { get; } = [];
+        public List<(ReadOnlyMemory<byte> Module, ReadOnlyMemory<byte> Field, Entity Entity)> Imports { get; } = [];
+        public List<(ReadOnlyMemory<byte> Name, Entity Entity)> Exports { get; } = [];
 
         public static ModuleInfo Read(byte[] module)
         {
@@ -590,7 +596,7 @@ public static class ComponentCoreModules
             var memories = new List<byte[]>();
             var globals = new List<byte[]>();
             var tags = new List<int>();
-            var exports = new List<(string Name, byte Kind, uint Index)>();
+            var exports = new List<(ReadOnlyMemory<byte> Name, byte Kind, uint Index)>();
             foreach (var (id, start, end, _) in Sections(module))
             {
                 var r = new CtReader(module, start, end);
@@ -613,8 +619,8 @@ public static class ComponentCoreModules
                         uint importCount = r.ReadU32();
                         for (uint i = 0; i < importCount; i++)
                         {
-                            string moduleName = r.ReadName();
-                            string field = r.ReadName();
+                            ReadOnlyMemory<byte> moduleName = r.ReadNameMemory();
+                            ReadOnlyMemory<byte> field = r.ReadNameMemory();
                             byte kind = r.ReadByte();
                             int rawStart = r.Position;
                             Entity entity;
@@ -695,7 +701,7 @@ public static class ComponentCoreModules
                     case WasmSectionId.Export:
                         uint exportCount = r.ReadU32();
                         for (uint i = 0; i < exportCount; i++)
-                            exports.Add((r.ReadName(), r.ReadByte(), r.ReadU32()));
+                            exports.Add((r.ReadNameMemory(), r.ReadByte(), r.ReadU32()));
                         break;
                     case WasmSectionId.Tag:
                         uint tagCount = r.ReadU32();

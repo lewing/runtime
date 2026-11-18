@@ -1,63 +1,66 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using Microsoft.NET.WebAssembly.Binary.Writing;
+
 namespace Microsoft.NET.WebAssembly.Binary;
 
 /// <summary>
 /// WebAssembly opcode bytes: the prefix bytes of multi-byte instructions and the single-byte opcodes that code
 /// outside the interpreters' dispatch switches matches by value (control flow, calls, locals, constants).
-/// Constants rather than an enum, because they are compared with raw instruction bytes everywhere.
+/// Constants rather than an enum, because they are compared with raw instruction bytes everywhere. The opcodes are
+/// <see cref="WasmOp"/>'s values, so there is one definition; the prefixes are bytes no <see cref="WasmOp"/> names alone.
 /// </summary>
 internal static class WasmOpcode
 {
-    public const byte Unreachable = 0x00;
-    public const byte Nop = 0x01;
-    public const byte Block = 0x02;
-    public const byte Loop = 0x03;
-    public const byte If = 0x04;
-    public const byte Else = 0x05;
-    public const byte Try = 0x06;
-    public const byte Catch = 0x07;
-    public const byte Throw = 0x08;
-    public const byte Rethrow = 0x09;
-    public const byte ThrowRef = 0x0A;
-    public const byte End = 0x0B;
-    public const byte Br = 0x0C;
-    public const byte BrIf = 0x0D;
-    public const byte BrTable = 0x0E;
-    public const byte Return = 0x0F;
-    public const byte Call = 0x10;
-    public const byte CallIndirect = 0x11;
-    public const byte ReturnCall = 0x12;
-    public const byte ReturnCallIndirect = 0x13;
-    public const byte CallRef = 0x14;
-    public const byte ReturnCallRef = 0x15;
-    public const byte Delegate = 0x18;
-    public const byte CatchAll = 0x19;
-    public const byte Drop = 0x1A;
-    public const byte Select = 0x1B;
-    public const byte SelectTyped = 0x1C;
-    public const byte TryTable = 0x1F;
-    public const byte LocalGet = 0x20;
-    public const byte LocalSet = 0x21;
-    public const byte LocalTee = 0x22;
-    public const byte GlobalGet = 0x23;
-    public const byte GlobalSet = 0x24;
-    public const byte I32Const = 0x41;
-    public const byte I64Const = 0x42;
-    public const byte F32Const = 0x43;
-    public const byte F64Const = 0x44;
-    public const byte I32Add = 0x6A;
-    public const byte I32Sub = 0x6B;
-    public const byte I32Mul = 0x6C;
-    public const byte I64Add = 0x7C;
-    public const byte I64Sub = 0x7D;
-    public const byte I64Mul = 0x7E;
-    public const byte RefNull = 0xD0;
-    public const byte RefIsNull = 0xD1;
-    public const byte RefFunc = 0xD2;
-    public const byte BrOnNull = 0xD5;
-    public const byte BrOnNonNull = 0xD6;
+    public const byte Unreachable = (byte)WasmOp.Unreachable;
+    public const byte Nop = (byte)WasmOp.Nop;
+    public const byte Block = (byte)WasmOp.Block;
+    public const byte Loop = (byte)WasmOp.Loop;
+    public const byte If = (byte)WasmOp.If;
+    public const byte Else = (byte)WasmOp.Else;
+    public const byte Try = (byte)WasmOp.Try;
+    public const byte Catch = (byte)WasmOp.Catch;
+    public const byte Throw = (byte)WasmOp.Throw;
+    public const byte Rethrow = (byte)WasmOp.Rethrow;
+    public const byte ThrowRef = (byte)WasmOp.ThrowRef;
+    public const byte End = (byte)WasmOp.End;
+    public const byte Br = (byte)WasmOp.Br;
+    public const byte BrIf = (byte)WasmOp.BrIf;
+    public const byte BrTable = (byte)WasmOp.BrTable;
+    public const byte Return = (byte)WasmOp.Return;
+    public const byte Call = (byte)WasmOp.Call;
+    public const byte CallIndirect = (byte)WasmOp.CallIndirect;
+    public const byte ReturnCall = (byte)WasmOp.ReturnCall;
+    public const byte ReturnCallIndirect = (byte)WasmOp.ReturnCallIndirect;
+    public const byte CallRef = (byte)WasmOp.CallRef;
+    public const byte ReturnCallRef = (byte)WasmOp.ReturnCallRef;
+    public const byte Delegate = (byte)WasmOp.Delegate;
+    public const byte CatchAll = (byte)WasmOp.CatchAll;
+    public const byte Drop = (byte)WasmOp.Drop;
+    public const byte Select = (byte)WasmOp.Select;
+    public const byte SelectTyped = (byte)WasmOp.SelectTyped;
+    public const byte TryTable = (byte)WasmOp.TryTable;
+    public const byte LocalGet = (byte)WasmOp.LocalGet;
+    public const byte LocalSet = (byte)WasmOp.LocalSet;
+    public const byte LocalTee = (byte)WasmOp.LocalTee;
+    public const byte GlobalGet = (byte)WasmOp.GlobalGet;
+    public const byte GlobalSet = (byte)WasmOp.GlobalSet;
+    public const byte I32Const = (byte)WasmOp.I32Const;
+    public const byte I64Const = (byte)WasmOp.I64Const;
+    public const byte F32Const = (byte)WasmOp.F32Const;
+    public const byte F64Const = (byte)WasmOp.F64Const;
+    public const byte I32Add = (byte)WasmOp.I32Add;
+    public const byte I32Sub = (byte)WasmOp.I32Sub;
+    public const byte I32Mul = (byte)WasmOp.I32Mul;
+    public const byte I64Add = (byte)WasmOp.I64Add;
+    public const byte I64Sub = (byte)WasmOp.I64Sub;
+    public const byte I64Mul = (byte)WasmOp.I64Mul;
+    public const byte RefNull = (byte)WasmOp.RefNull;
+    public const byte RefIsNull = (byte)WasmOp.RefIsNull;
+    public const byte RefFunc = (byte)WasmOp.RefFunc;
+    public const byte BrOnNull = (byte)WasmOp.BrOnNull;
+    public const byte BrOnNonNull = (byte)WasmOp.BrOnNonNull;
 
     /// <summary>Stack-switching instructions (<c>cont.*</c>, <c>resume</c>, <c>suspend</c>, ...), as nesm decodes them.</summary>
     public const byte StackSwitchingPrefix = 0xE0;

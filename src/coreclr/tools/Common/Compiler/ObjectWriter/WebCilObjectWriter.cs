@@ -293,7 +293,7 @@ namespace ILCompiler.ObjectWriter
         private protected override void WriteGlobalSection()
         {
             WriteGlobal("webcilVersion", WasmValueType.I32, WasmMutabilityType.Const,
-                new WasmInstructionGroup([new WasmConstExpr(WasmExprKind.I32Const, WebcilConstants.WASM_WRAPPER_VERSION_SELF_INSTALLING)]));
+                new WasmInstructionGroup([I32.Const(WebcilConstants.WASM_WRAPPER_VERSION_SELF_INSTALLING)]));
         }
 
         private static readonly ObjectNodeSection WebcilRelocSection = new ObjectNodeSection("reloc", SectionType.ReadOnly);
@@ -385,7 +385,7 @@ namespace ILCompiler.ObjectWriter
                 }
 
                 sourceStream.Position = relocation.Offset;
-                uint locationOffset = ReadULEB128(sourceStream);
+                uint locationOffset = WasmLeb128.ReadU32(sourceStream);
                 uint fixupRva = checked(targetSection.Header.VirtualAddress +
                     (uint)definedSymbol.Value +
                     (uint)relocation.Addend +
@@ -399,8 +399,8 @@ namespace ILCompiler.ObjectWriter
 
                 sourcePosition = relocation.Offset + Relocation.GetSize(relocation.Type);
                 sourceStream.Position = sourcePosition;
-                uint count = ReadULEB128(sourceStream);
-                uint stride = ReadULEB128(sourceStream);
+                uint count = WasmLeb128.ReadU32(sourceStream);
+                uint stride = WasmLeb128.ReadU32(sourceStream);
                 if (count == 0)
                 {
                     throw new InvalidDataException("Wasm async resume info fixup chunks must not be empty.");
@@ -427,27 +427,6 @@ namespace ILCompiler.ObjectWriter
                     destination.Write(buffer.Slice(0, bytesToRead));
                     count -= bytesToRead;
                 }
-            }
-
-            static uint ReadULEB128(Stream stream)
-            {
-                uint value = 0;
-                int shift = 0;
-                byte current;
-                do
-                {
-                    int nextByte = stream.ReadByte();
-                    if (nextByte < 0)
-                    {
-                        throw new EndOfStreamException();
-                    }
-
-                    current = (byte)nextByte;
-                    value |= (uint)(current & 0x7F) << shift;
-                    shift += 7;
-                } while ((current & 0x80) != 0);
-
-                return value;
             }
 
         }
@@ -670,8 +649,10 @@ namespace ILCompiler.ObjectWriter
             List<CodeBlob> blobs = new();
             while (true)
             {
-                ulong? decoded = DwarfHelper.ReadULEB128(sectionStream, out _);
-                if (decoded is null) break; // end of stream
+                Leb128Status status = WasmLeb128.DecodeU32(sectionStream, out uint decoded, out int length);
+                if (length == 0) break; // end of stream
+                if (status != Leb128Status.Ok)
+                    throw new InvalidDataException($"Malformed code blob size in the code section ({status}).");
 
                 Debug.Assert(sectionStream.Position + (long)decoded <= sectionStream.Length);
                 blobs.Add(new CodeBlob((long)decoded, sectionStream.Position, sectionStream.Position + (long)decoded));

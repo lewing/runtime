@@ -1914,7 +1914,7 @@ internal sealed class ObjectFileLinker
         return new WasmFunction { TypeIndex = TypeIndexOf(s_voidType), Locals = [], Body = body.ToArray() };
     }
 
-    private FuncType FunctionTypeOf(Sym sym)
+    private static FuncType FunctionTypeOf(Sym sym)
     {
         if (sym.DefFile is ObjFile file)
             return file.Module.Types[file.Module.Functions[(int)(sym.DefIndex - file.FuncImports)].TypeIndex];
@@ -2042,7 +2042,7 @@ internal sealed class ObjectFileLinker
         return result;
     }
 
-    private ulong? DebugValue(
+    private static ulong? DebugValue(
         ObjFile file,
         Relocation reloc,
         uint[] codeOffsets,

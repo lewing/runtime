@@ -158,7 +158,7 @@ internal sealed class DeadCodeEliminator
     /// check is affirmative — every index exactly once — so a malformed permutation is a loud failure
     /// rather than a quieter version of the bug this seam exists to rule out.
     /// </remarks>
-    private IReadOnlyList<Func<bool>> Permute(Func<bool>[] passes)
+    private Func<bool>[] Permute(Func<bool>[] passes)
     {
         if (DiscoveryPassOrder is not { } order)
             return passes;
@@ -752,7 +752,7 @@ internal sealed class DeadCodeEliminator
     /// and this keeps the target.
     /// </remarks>
     private static void CloseOverTypeReferences(
-        HashSet<uint> liveTypes, IReadOnlyList<TypeDefinition> definitions)
+        HashSet<uint> liveTypes, List<TypeDefinition> definitions)
     {
         var queue = new Queue<uint>(liveTypes);
         while (queue.Count > 0)

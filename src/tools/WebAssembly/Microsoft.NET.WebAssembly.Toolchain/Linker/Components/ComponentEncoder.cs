@@ -45,18 +45,17 @@ public sealed record ComponentAdapter(string Name, byte[] Module);
 /// </remarks>
 public static class ComponentEncoder
 {
-    private const string ComponentTypeSection = "component-type";
 
     /// <summary>Returns whether <paramref name="module"/> carries a <c>component-type</c> custom section.</summary>
     public static bool HasComponentType(byte[] module) =>
-        CoreModule.Parse(module).Customs.Any(c => IsComponentType(c.Name));
+        CoreModule.Parse(module).Customs.Any(c => c.IsComponentType);
 
     public static byte[] Encode(byte[] coreModule, ComponentEncoderOptions? options = null)
     {
         options ??= new ComponentEncoderOptions();
         CoreModule core = CoreModule.Parse(coreModule);
         var world = new WitWorld();
-        foreach (var custom in core.Customs.Where(c => IsComponentType(c.Name)))
+        foreach (var custom in core.Customs.Where(c => c.IsComponentType))
             world.Add(coreModule[custom.PayloadStart..custom.End], options.MergeImportsBasedOnSemver);
         foreach (byte[] extra in options.ComponentTypes)
             world.Add(extra, options.MergeImportsBasedOnSemver);
@@ -67,7 +66,7 @@ public static class ComponentEncoder
             if (adapter.Name == MainModuleName || units.Any(u => u.Name == adapter.Name))
                 throw new LinkerException($"adapter name `{adapter.Name}` is used more than once.");
             CoreModule module = CoreModule.Parse(adapter.Module);
-            var payloads = module.Customs.Where(c => IsComponentType(c.Name)).Select(c => adapter.Module[c.PayloadStart..c.End]).ToList();
+            var payloads = module.Customs.Where(c => c.IsComponentType).Select(c => adapter.Module[c.PayloadStart..c.End]).ToList();
             var adapterWorld = new WitWorld();
             foreach (byte[] payload in payloads)
                 adapterWorld.Add(payload, options.MergeImportsBasedOnSemver);
@@ -114,7 +113,7 @@ public static class ComponentEncoder
         w.Bytes(core.Bytes.AsSpan(0, 8));
         foreach (CoreModule.Section section in core.Sections)
         {
-            if (section.Id == (byte)WasmSectionId.Custom && IsComponentType(section.Name))
+            if (section.IsComponentType)
                 continue;
             w.Bytes(core.Bytes.AsSpan(section.Start, section.End - section.Start));
         }
@@ -146,7 +145,7 @@ public static class ComponentEncoder
             if (bytes[4] == 0x0D)
                 return [bytes];
             CoreModule module = CoreModule.Parse(bytes);
-            var payloads = module.Customs.Where(c => IsComponentType(c.Name)).Select(c => bytes[c.PayloadStart..c.End]).ToList();
+            var payloads = module.Customs.Where(c => c.IsComponentType).Select(c => bytes[c.PayloadStart..c.End]).ToList();
             if (payloads.Count == 0)
                 throw new LinkerException("the component type module has no component-type custom section.");
             return payloads;
@@ -157,13 +156,17 @@ public static class ComponentEncoder
         return [WitWorldEncoder.EncodePayload(WitText.ResolveWorld(text))];
     }
 
-    private static bool IsComponentType(string name) =>
-        name == ComponentTypeSection || name.StartsWith(ComponentTypeSection + ":", StringComparison.Ordinal);
+    /// <summary>Whether a custom section named <paramref name="name"/> is <c>component-type</c> or <c>component-type:*</c>.</summary>
+    private static bool IsComponentType(ReadOnlySpan<byte> name)
+    {
+        ReadOnlySpan<byte> prefix = "component-type"u8;
+        return name.StartsWith(prefix) && (name.Length == prefix.Length || name[prefix.Length] == (byte)':');
+    }
 
     /// <summary>The parts of a core module the encoder needs: its sections, function types, imports and exports.</summary>
     internal sealed class CoreModule
     {
-        public sealed record Section(byte Id, int Start, int PayloadStart, int End, string Name);
+        public sealed record Section(byte Id, int Start, int PayloadStart, int End, bool IsComponentType);
         public sealed record FuncType(byte[] Params, byte[] Results)
         {
             public bool Matches(CanonicalAbi.Lowering lowering) =>
@@ -230,11 +233,11 @@ public static class ComponentEncoder
                 int size = checked((int)r.ReadU32());
                 int payload = r.Position;
                 CtReader body = r.Sub(size);
-                string name = "";
+                bool isComponentType = false;
                 switch ((WasmSectionId)id)
                 {
                     case WasmSectionId.Custom:
-                        name = body.ReadName();
+                        isComponentType = IsComponentType(body.ReadNameBytes());
                         payload = body.Position;
                         break;
                     case WasmSectionId.Type:
@@ -255,7 +258,7 @@ public static class ComponentEncoder
                         break;
                 }
 
-                module.Sections.Add(new Section(id, start, payload, r.Position, name));
+                module.Sections.Add(new Section(id, start, payload, r.Position, isComponentType));
             }
 
             return module;
@@ -334,7 +337,14 @@ public static class ComponentEncoder
         private Unit Main => units[0];
         private WitWorld World => world;
 
-        private enum ImportKind { Lowered, ResourceDrop, FromAdapter, MainExport, Memory }
+        private enum ImportKind
+        {
+            Lowered,
+            ResourceDrop,
+            FromAdapter,
+            MainExport,
+            Memory
+        }
 
         private sealed record ImportPlan(Unit Owner, CoreModule.Import Import, ImportKind Kind,
             WitInterface? Interface = null, CtFunc? Func = null, CanonicalAbi.Lowering? Lowering = null, Unit? Adapter = null)
@@ -781,10 +791,10 @@ public static class ComponentEncoder
                 w.Byte((byte)InstanceExprKind.Instantiate);
                 w.U32(fixupModule);
                 w.U32(2);
-                w.Name("actual");
+                w.Name("actual"u8);
                 w.Byte((byte)CoreSort.Instance);
                 w.U32(actual);
-                w.Name("shim");
+                w.Name("shim"u8);
                 w.Byte((byte)CoreSort.Instance);
                 w.U32(shimInstance);
             });
@@ -894,7 +904,7 @@ public static class ComponentEncoder
                     s.U32(i);
                 }
 
-                s.Name("$imports");
+                s.Name("$imports"u8);
                 s.Byte((byte)CoreSort.Table);
                 s.U32(0);
             });
@@ -939,14 +949,14 @@ public static class ComponentEncoder
                 s.U32(n + 1);
                 for (int i = 0; i < indirect.Count; i++)
                 {
-                    s.Name("actual");
+                    s.Name("actual"u8);
                     s.Name(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
                     s.Byte((byte)CoreSort.Func);
                     s.U32((uint)types.IndexOf(TypeOf(indirect[i])));
                 }
 
-                s.Name("shim");
-                s.Name("$imports");
+                s.Name("shim"u8);
+                s.Name("$imports"u8);
                 s.Byte((byte)CoreSort.Table);
                 s.Byte(0x70);
                 s.Byte(0x01);
@@ -982,7 +992,7 @@ public static class ComponentEncoder
 
         private static void WriteNameSection(CtWriter w, IEnumerable<string> functionNames) => w.Section(WasmSectionId.Custom, s =>
         {
-            s.Name("name");
+            s.Name("name"u8);
             var names = functionNames.ToList();
             var sub = new CtWriter();
             sub.U32((uint)names.Count);

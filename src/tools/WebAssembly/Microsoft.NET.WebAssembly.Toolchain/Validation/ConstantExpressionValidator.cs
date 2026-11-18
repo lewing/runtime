@@ -348,7 +348,7 @@ internal static class ConstantExpressionValidator
             return context.TypeDefinitions[(int)index];
         }
 
-        private ExactValueType CastType(long heapType, Nullability nullability)
+        private ExactValueType.Reference CastType(long heapType, Nullability nullability)
         {
             var heap = HeapTypeFromSigned(heapType);
             if (heap is DefinedHeapType defined)
@@ -356,13 +356,13 @@ internal static class ConstantExpressionValidator
             return new ExactValueType.Reference(nullability, heap);
         }
 
-        private ExactValueType NonNullableDefinedRef(uint typeIndex)
+        private ExactValueType.Reference NonNullableDefinedRef(uint typeIndex)
         {
             _ = TypeDefinition(typeIndex);
             return new ExactValueType.Reference(Nullability.NonNullable, new DefinedHeapType(checked((int)typeIndex)));
         }
 
-        private void EnsureDefaultable(FieldType field)
+        private static void EnsureDefaultable(FieldType field)
         {
             if (field.StorageType is StorageType.Value value && value.Type is ExactValueType.Reference { Nullability: Nullability.NonNullable })
                 throw Failure(WasmValidationCode.FunctionBodyTypeMismatch, "default allocation requires defaultable field types");
@@ -463,7 +463,7 @@ internal static class ConstantExpressionValidator
 
         public int TotalGlobalCount => _globalTypes.Count;
 
-        public IReadOnlyList<TypeDefinition> TypeDefinitions => _module.TypeDefinitions;
+        public List<TypeDefinition> TypeDefinitions => _module.TypeDefinitions;
 
         public SubtypeRelation Subtype { get; }
 

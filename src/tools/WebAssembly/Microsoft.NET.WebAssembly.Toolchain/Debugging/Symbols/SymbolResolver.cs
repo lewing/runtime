@@ -191,7 +191,7 @@ internal sealed class SymbolResolver(IReadOnlyList<SymbolScope> scopes)
         return list;
     }
 
-    private ResolveResult Classify(List<SymbolCandidate> candidates, IReadOnlyList<ProviderStatus> consulted) =>
+    private static ResolveResult Classify(List<SymbolCandidate> candidates, IReadOnlyList<ProviderStatus> consulted) =>
         candidates.Count == 1
             ? new ResolveResult(ResolveStatus.Unique, candidates[0], candidates, consulted, [])
             : new ResolveResult(ResolveStatus.Ambiguous, null, candidates, consulted, []);
