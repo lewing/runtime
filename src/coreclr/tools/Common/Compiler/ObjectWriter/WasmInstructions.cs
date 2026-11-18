@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using ILCompiler.DependencyAnalysis;
 using ILCompiler.DependencyAnalysis.Wasm;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 // This namespace implements encodings for certain Wasm expressions (instructions)
 // which are used in the object writer.
@@ -61,14 +62,14 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
 
                 // Now we've written the local data, and know the count of locals chunks
                 // Build the actual locals
-                _locals = new byte[DwarfHelper.SizeOfULEB128(localChunks) + localWriter.WrittenSpan.Length];
-                int pos = DwarfHelper.WriteULEB128(_locals.AsSpan(), localChunks);
+                _locals = new byte[WasmLeb128.GetULeb128Size(localChunks) + localWriter.WrittenSpan.Length];
+                int pos = WasmLeb128.WriteULeb128(_locals.AsSpan(), localChunks);
                 localWriter.WrittenSpan.CopyTo(_locals.AsSpan(pos));
 
 
                 static void WriteLocalType(ArrayBufferWriter<byte> writer, ulong localCount, WasmValueType localType)
                 {
-                    DwarfHelper.WriteULEB128(writer, (ulong)localCount);
+                    writer.Advance(WasmLeb128.WriteULeb128(writer.GetSpan(WasmLeb128.MaxLength), localCount));
                     byte localTypeByte = (byte)localType;
                     writer.Write(new ReadOnlySpan<byte>(ref localTypeByte));
                 }
@@ -86,14 +87,14 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public int EncodeSize()
         {
             int bodySize = BodyContentSize();
-            int sizePrefixLength = (int)DwarfHelper.SizeOfULEB128((ulong)bodySize);
+            int sizePrefixLength = (int)WasmLeb128.GetULeb128Size((ulong)bodySize);
             return sizePrefixLength + bodySize;
         }
 
         public int Encode(Span<byte> buffer)
         {
             int contentSize = BodyContentSize();
-            int pos = DwarfHelper.WriteULEB128(buffer, (ulong)contentSize);
+            int pos = WasmLeb128.WriteULeb128(buffer, (ulong)contentSize);
             _locals.CopyTo(buffer.Slice(pos));
             pos += _locals.Length;
             pos += _body.Encode(buffer.Slice(pos));
@@ -109,7 +110,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public int EncodeRelocations(Span<Relocation> buffer)
         {
             uint bodySize = (uint)BodyContentSize();
-            int bodySizePrefixLength = (int)DwarfHelper.SizeOfULEB128(bodySize);
+            int bodySizePrefixLength = (int)WasmLeb128.GetULeb128Size(bodySize);
             int relocsEncoded = _body.EncodeRelocations(buffer);
             WasmExpr.OffsetRelocationsByOffset(buffer.Slice(0, relocsEncoded), bodySizePrefixLength + _locals.Length);
             return relocsEncoded;
@@ -278,13 +279,13 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
             _kind = kind;
         }
 
-        public virtual int EncodeSize() => _kind.IsVariableLengthInstruction() ? 1 + (int)DwarfHelper.SizeOfULEB128(((uint)_kind) & 0xFFFFFF) : 1;
+        public virtual int EncodeSize() => _kind.IsVariableLengthInstruction() ? 1 + (int)WasmLeb128.GetULeb128Size(((uint)_kind) & 0xFFFFFF) : 1;
         public virtual int Encode(Span<byte> buffer)
         {
             if (_kind.IsVariableLengthInstruction())
             {
                 buffer[0] = (byte)((uint)_kind >> 24);
-                return 1 + DwarfHelper.WriteULEB128(buffer.Slice(1), ((uint)_kind) & 0xFFFFFF);
+                return 1 + WasmLeb128.WriteULeb128(buffer.Slice(1), ((uint)_kind) & 0xFFFFFF);
             }
             else
             {
@@ -318,11 +319,11 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         }
         public int EncodeSize()
         {
-            return (int)DwarfHelper.SizeOfULEB128(_value);
+            return (int)WasmLeb128.GetULeb128Size(_value);
         }
         public int Encode(Span<byte> buffer)
         {
-            return DwarfHelper.WriteULEB128(buffer, _value);
+            return WasmLeb128.WriteULeb128(buffer, _value);
         }
         public int EncodeRelocationCount() => 0;
         public int EncodeRelocations(Span<Relocation> buffer) => 0;
@@ -357,12 +358,12 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
                 case RelocType.WASM_TYPE_INDEX_LEB:
                 case RelocType.WASM_GLOBAL_INDEX_LEB:
                 case RelocType.WASM_CLR_RESTORE_CONTEXT_EXCEPTION_TAG_LEB:
-                    DwarfHelper.WritePaddedULEB128(buffer.Slice(0, relocSize), 0);
+                    WasmLeb128.WritePaddedULeb128(buffer.Slice(0, relocSize), 0);
                     break;
 
                 case RelocType.WASM_TABLE_INDEX_SLEB:
                 case RelocType.WASM_MEMORY_ADDR_REL_SLEB:
-                    DwarfHelper.WritePaddedSLEB128(buffer.Slice(0, relocSize), 0);
+                    WasmLeb128.WritePaddedSLeb128(buffer.Slice(0, relocSize), 0);
                     break;
 
                 default:
@@ -402,14 +403,14 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
 
         public override int EncodeSize()
         {
-            int valSize = (int)DwarfHelper.SizeOfULEB128(_align) + _offset.EncodeSize();
+            int valSize = (int)WasmLeb128.GetULeb128Size(_align) + _offset.EncodeSize();
             return base.EncodeSize() + (int)valSize;
         }
 
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), _align);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), _align);
             pos += _offset.Encode(buffer.Slice(pos));
             return pos;
         }
@@ -418,7 +419,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         {
             int relocsEncoded = _offset.EncodeRelocations(buffer);
             if (relocsEncoded > 0)
-                WasmExpr.OffsetRelocationsByOffset(buffer.Slice(0, relocsEncoded), base.EncodeSize() + (int)DwarfHelper.SizeOfULEB128(_align));
+                WasmExpr.OffsetRelocationsByOffset(buffer.Slice(0, relocsEncoded), base.EncodeSize() + (int)WasmLeb128.GetULeb128Size(_align));
             return relocsEncoded;
         }
     }
@@ -441,14 +442,13 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
 
         public override int EncodeSize()
         {
-            uint valSize = DwarfHelper.SizeOfSLEB128(ConstValue);
-            return base.EncodeSize() + (int)valSize;
+            return base.EncodeSize() + WasmLeb128.GetSLeb128Size(ConstValue);
         }
 
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteSLEB128(buffer.Slice(pos), ConstValue);
+            pos += WasmLeb128.WriteSLeb128(buffer.Slice(pos), ConstValue);
 
             return pos;
         }
@@ -468,7 +468,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            DwarfHelper.WritePaddedSLEB128(buffer.Slice(pos, Relocation.WASM_PADDED_RELOC_SIZE_32), _value);
+            WasmLeb128.WritePaddedSLeb128(buffer.Slice(pos, Relocation.WASM_PADDED_RELOC_SIZE_32), _value);
             return pos + Relocation.WASM_PADDED_RELOC_SIZE_32;
         }
     }
@@ -486,17 +486,16 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
 
         public override int EncodeSize()
         {
-            uint tableSize = DwarfHelper.SizeOfULEB128(_tableIndex);
-            return base.EncodeSize() + Relocation.GetSize(RelocType.WASM_TYPE_INDEX_LEB) + (int)tableSize;
+            return base.EncodeSize() + Relocation.GetSize(RelocType.WASM_TYPE_INDEX_LEB) + WasmLeb128.GetULeb128Size(_tableIndex);
         }
 
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
             int relocSize = Relocation.GetSize(RelocType.WASM_TYPE_INDEX_LEB);
-            DwarfHelper.WritePaddedULEB128(buffer.Slice(pos, relocSize), 0);
+            WasmLeb128.WritePaddedULeb128(buffer.Slice(pos, relocSize), 0);
             pos += relocSize;
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), _tableIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), _tableIndex);
 
             return pos;
         }
@@ -549,14 +548,14 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)LocalIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)LocalIndex);
 
             return pos;
         }
 
         public override int EncodeSize()
         {
-            return base.EncodeSize() + (int)DwarfHelper.SizeOfULEB128((uint)LocalIndex);
+            return base.EncodeSize() + (int)WasmLeb128.GetULeb128Size((uint)LocalIndex);
         }
     }
 
@@ -574,13 +573,13 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)GlobalIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)GlobalIndex);
             return pos;
         }
 
         public override int EncodeSize()
         {
-            return base.EncodeSize() + (int)DwarfHelper.SizeOfULEB128((uint)GlobalIndex);
+            return base.EncodeSize() + (int)WasmLeb128.GetULeb128Size((uint)GlobalIndex);
         }
     }
 
@@ -622,8 +621,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)DstMemoryIndex);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)SrcMemoryIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)DstMemoryIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)SrcMemoryIndex);
 
             return pos;
         }
@@ -631,8 +630,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int EncodeSize()
         {
             return base.EncodeSize()
-                + (int)DwarfHelper.SizeOfULEB128((uint)DstMemoryIndex)
-                + (int)DwarfHelper.SizeOfULEB128((uint)SrcMemoryIndex);
+                + (int)WasmLeb128.GetULeb128Size((uint)DstMemoryIndex)
+                + (int)WasmLeb128.GetULeb128Size((uint)SrcMemoryIndex);
         }
     }
 
@@ -652,7 +651,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)MemoryIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)MemoryIndex);
 
             return pos;
         }
@@ -660,7 +659,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int EncodeSize()
         {
             return base.EncodeSize()
-                + (int)DwarfHelper.SizeOfULEB128((uint)MemoryIndex);
+                + (int)WasmLeb128.GetULeb128Size((uint)MemoryIndex);
         }
     }
 
@@ -681,8 +680,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)DataSegmentIndex);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)MemoryIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)DataSegmentIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)MemoryIndex);
 
             return pos;
         }
@@ -690,8 +689,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int EncodeSize()
         {
             return base.EncodeSize()
-                + (int)DwarfHelper.SizeOfULEB128((uint)DataSegmentIndex)
-                + (int)DwarfHelper.SizeOfULEB128((uint)MemoryIndex);
+                + (int)WasmLeb128.GetULeb128Size((uint)DataSegmentIndex)
+                + (int)WasmLeb128.GetULeb128Size((uint)MemoryIndex);
         }
     }
 
@@ -713,8 +712,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)ElemIndex);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), (uint)TableIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)ElemIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), (uint)TableIndex);
 
             return pos;
         }
@@ -722,8 +721,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int EncodeSize()
         {
             return base.EncodeSize()
-                + (int)DwarfHelper.SizeOfULEB128((uint)TableIndex)
-                + (int)DwarfHelper.SizeOfULEB128((uint)ElemIndex);
+                + (int)WasmLeb128.GetULeb128Size((uint)TableIndex)
+                + (int)WasmLeb128.GetULeb128Size((uint)ElemIndex);
         }
     }
 
@@ -739,12 +738,12 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public override int Encode(Span<byte> buffer)
         {
             int pos = base.Encode(buffer);
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), TableIndex);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), TableIndex);
             return pos;
         }
         public override int EncodeSize()
         {
-            return base.EncodeSize() + (int)DwarfHelper.SizeOfULEB128(TableIndex);
+            return base.EncodeSize() + (int)WasmLeb128.GetULeb128Size(TableIndex);
         }
     }
 

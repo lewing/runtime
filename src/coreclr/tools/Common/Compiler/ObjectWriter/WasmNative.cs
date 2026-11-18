@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using ILCompiler.DependencyAnalysis;
 using ILCompiler.DependencyAnalysis.Wasm;
 using ILCompiler.ObjectWriter.WasmInstructions;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -17,24 +18,6 @@ namespace ILCompiler.ObjectWriter
         int Encode(Span<byte> buffer);
         int EncodeRelocationCount();
         int EncodeRelocations(Span<Relocation> buffer);
-    }
-
-    public enum WasmSectionType
-    {
-        Custom = 0,
-        Type = 1,
-        Import = 2,
-        Function = 3,
-        Table = 4,
-        Memory = 5,
-        Global = 6,
-        Export = 7,
-        Start = 8,
-        Element = 9,
-        Code = 10,
-        Data = 11,
-        DataCount = 12,
-        Tag = 13,
     }
 
     public static class PlaceholderValues
@@ -92,8 +75,8 @@ namespace ILCompiler.ObjectWriter
             _typeIndex = typeIndex;
         }
 
-        public override int Encode(Span<byte> buffer) => DwarfHelper.WriteULEB128(buffer, (ulong)_typeIndex);
-        public override int EncodeSize() => (int)DwarfHelper.SizeOfULEB128((ulong)_typeIndex);
+        public override int Encode(Span<byte> buffer) => WasmLeb128.WriteULeb128(buffer, (ulong)_typeIndex);
+        public override int EncodeSize() => (int)WasmLeb128.GetULeb128Size((ulong)_typeIndex);
         public override int EncodeRelocationCount() => 0;
         public override int EncodeRelocations(Span<Relocation> buffer) => 0;
     }
@@ -132,11 +115,11 @@ namespace ILCompiler.ObjectWriter
             int pos = 0;
             buffer[pos++] = (byte)0x70; // element type: funcref
             buffer[pos++] = (byte)0; // table limits: flags (0 = min-only, 1 = min+max)
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), 1); // Requires 1 table entry
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), 1); // Requires 1 table entry
             return pos;
         }
 
-        public override int EncodeSize() => 2 + (int)DwarfHelper.SizeOfULEB128(1); // The 2 is the element type and table limit flags
+        public override int EncodeSize() => 2 + (int)WasmLeb128.GetULeb128Size(1); // The 2 is the element type and table limit flags
         public override int EncodeRelocationCount() => 0;
         public override int EncodeRelocations(Span<Relocation> buffer) => 0;
     }
@@ -169,22 +152,22 @@ namespace ILCompiler.ObjectWriter
         {
             int pos = 0;
             buffer[pos++] = (byte)_limitType;
-            pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), _min);
+            pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), _min);
             if (_limitType == WasmLimitType.HasMinAndMax)
             {
-                pos += DwarfHelper.WriteULEB128(buffer.Slice(pos), _max!.Value);
+                pos += WasmLeb128.WriteULeb128(buffer.Slice(pos), _max!.Value);
             }
             return pos;
         }
 
         public override int EncodeSize()
         {
-            uint size = 1 + DwarfHelper.SizeOfULEB128(_min);
+            int size = 1 + WasmLeb128.GetULeb128Size(_min);
             if (_limitType == WasmLimitType.HasMinAndMax)
             {
-                size += DwarfHelper.SizeOfULEB128(_max!.Value);
+                size += WasmLeb128.GetULeb128Size(_max!.Value);
             }
-            return (int)size;
+            return size;
         }
 
         public override int EncodeRelocationCount() => 0;
@@ -207,10 +190,10 @@ namespace ILCompiler.ObjectWriter
         {
             buffer[0] = ExceptionAttribute;
 
-            return 1 + DwarfHelper.WriteULEB128(buffer.Slice(1), (ulong)_typeIndex);
+            return 1 + WasmLeb128.WriteULeb128(buffer.Slice(1), (ulong)_typeIndex);
         }
 
-        public override int EncodeSize() => 1 + (int)DwarfHelper.SizeOfULEB128((ulong)_typeIndex);
+        public override int EncodeSize() => 1 + (int)WasmLeb128.GetULeb128Size((ulong)_typeIndex);
         public override int EncodeRelocationCount() => 0;
         public override int EncodeRelocations(Span<Relocation> buffer) => 0;
     }

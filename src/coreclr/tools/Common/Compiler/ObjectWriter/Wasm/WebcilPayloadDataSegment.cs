@@ -81,28 +81,24 @@ namespace ILCompiler.ObjectWriter
             Debug.Assert(headerSize == HeaderSize);
             outputFileStream.Write(headerBuffer);
 
-            long payloadStart = outputFileStream.Position;
-            WebcilEncoder.EmitHeader(_header, outputFileStream);
+            // Offsets are tracked here rather than read from the stream, which may not be seekable.
+            long payloadOffset = WebcilEncoder.EmitHeader(_header, outputFileStream);
 
             foreach (WebcilSection section in _sections)
             {
-                WebcilEncoder.EncodeSectionHeader(section.Header, outputFileStream);
+                payloadOffset += WebcilEncoder.EncodeSectionHeader(section.Header, outputFileStream);
             }
 
             foreach (WebcilSection section in _sections)
             {
-                long sectionStart = payloadStart + section.Header.PointerToRawData;
-                Debug.Assert(outputFileStream.Position <= sectionStart);
-                int padding = (int)(sectionStart - outputFileStream.Position);
-                WasmDataSegmentEncoding.EmitPadding(outputFileStream, padding);
-                section.EmitToStream(outputFileStream);
+                long sectionStart = section.Header.PointerToRawData;
+                Debug.Assert(payloadOffset <= sectionStart);
+                WasmDataSegmentEncoding.EmitPadding(outputFileStream, (int)(sectionStart - payloadOffset));
+                payloadOffset = sectionStart + section.EmitToStream(outputFileStream);
             }
 
-            long payloadEnd = payloadStart + RawContentSize;
-            Debug.Assert(outputFileStream.Position <= payloadEnd);
-            WasmDataSegmentEncoding.EmitPadding(
-                outputFileStream,
-                (int)(payloadEnd - outputFileStream.Position));
+            Debug.Assert(payloadOffset <= RawContentSize);
+            WasmDataSegmentEncoding.EmitPadding(outputFileStream, (int)(RawContentSize - payloadOffset));
             WasmDataSegmentEncoding.EmitPadding(outputFileStream, _paddingBytesCount);
 
             return EncodeSize();

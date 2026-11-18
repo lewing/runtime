@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using ILCompiler.DependencyAnalysis;
 using ILCompiler.ObjectWriter.WasmInstructions;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -84,11 +85,11 @@ namespace ILCompiler.ObjectWriter
             return type switch
             {
                 WasmDataSegmentType.Active =>
-                    (int)DwarfHelper.SizeOfULEB128((ulong)type) +
+                    WasmLeb128.GetULeb128Size((ulong)type) +
                     initExpr.EncodeSize() +
                     Relocation.WASM_PADDED_RELOC_SIZE_32,
                 WasmDataSegmentType.Passive =>
-                    (int)DwarfHelper.SizeOfULEB128((ulong)type) +
+                    WasmLeb128.GetULeb128Size((ulong)type) +
                     Relocation.WASM_PADDED_RELOC_SIZE_32,
                 _ => throw new NotSupportedException(),
             };
@@ -100,7 +101,7 @@ namespace ILCompiler.ObjectWriter
             WasmInstructionGroup initExpr,
             int contentSize)
         {
-            int length = DwarfHelper.WriteULEB128(headerBuffer, (ulong)type);
+            int length = WasmLeb128.WriteULeb128(headerBuffer, (ulong)type);
             Debug.Assert(length == 1);
             if (type == WasmDataSegmentType.Active)
             {
@@ -110,7 +111,7 @@ namespace ILCompiler.ObjectWriter
             Debug.Assert(headerBuffer.Slice(length).Length == Relocation.WASM_PADDED_RELOC_SIZE_32);
             // File alignment of data segments requires that the header doesn't change size based on the content size,
             // so we use a padded ULEB128 here.
-            DwarfHelper.WritePaddedULEB128(headerBuffer.Slice(length), (ulong)contentSize);
+            WasmLeb128.WritePaddedULeb128(headerBuffer.Slice(length), (ulong)contentSize);
             return headerBuffer.Length;
         }
 

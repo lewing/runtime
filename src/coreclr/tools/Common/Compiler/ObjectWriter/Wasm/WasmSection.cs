@@ -5,36 +5,33 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Numerics;
 using ILCompiler.ObjectWriter.WasmInstructions;
 using Internal.Text;
 using Internal.TypeSystem;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
     /// <summary>
     /// Interface for section-like objects that can be emitted to a wasm module stream.
     /// </summary>
+    /// <summary>Content written inside a section: a data segment, or a Webcil section within the payload segment.</summary>
     internal interface IWasmEmittable
     {
         int EmitToStream(Stream outputFileStream);
         int EncodeSize();
     }
 
-    /// <summary>
-    /// Interface for types that represent a WebAssembly section.
-    /// </summary>
-    internal interface IWasmSection : IWasmEmittable
+    /// <summary>A module section, framed and written by the WebAssembly toolchain's <see cref="WasmModuleWriter"/>.</summary>
+    internal interface IWasmSection
     {
-        WasmSectionType Type { get; }
+        WasmSectionId Type { get; }
+
+        /// <summary>Writes the section and returns its file section index.</summary>
+        int Emit(WasmModuleWriter writer);
     }
 
-    /// <summary>
-    /// A read-only view of a SectionWriter's Stream.
-    /// The section should be written to via the SectionWriter, and SectionDataEmitter implementations
-    /// handle copying the data to the output stream and adding any required headers and padding.
-    /// </summary>
-    internal abstract class SectionDataEmitter : IWasmEmittable
+    internal abstract class SectionDataEmitter
     {
         public SectionDataEmitter(Stream stream, Utf8String name, int sectionIndex)
         {
@@ -46,208 +43,63 @@ namespace ILCompiler.ObjectWriter
         public int SectionIndex { get; }
         public Utf8String SectionName { get; }
         public Stream ContentReadStream { get; set; }
-
-        public abstract int EmitToStream(Stream outputFileStream);
-        public abstract int EncodeSize();
     }
 
-    /// <summary>
-    /// The base class for WebAssembly sections that are not composed of subsections.
-    /// </summary>
     internal class WasmSection : SectionDataEmitter, IWasmSection
     {
-        public WasmSectionType Type { get; }
+        public WasmSectionId Type { get; }
 
+        // The bytes written ahead of the content stream, such as a vector section's entry count.
         internal virtual int ContentPrefixSize => 0;
 
         protected virtual int EncodeContentPrefix(Span<byte> destination) => 0;
 
-        public virtual int HeaderSize
+        public virtual int Emit(WasmModuleWriter writer)
         {
-            get
-            {
-                uint sizeEncodeLength = DwarfHelper.SizeOfULEB128((ulong)ContentSize);
-                return 1 + (int)sizeEncodeLength;
-            }
-        }
-
-        public virtual int ContentSize => (int)ContentReadStream.Length + ContentPrefixSize;
-
-        public override int EncodeSize()
-        {
-            return HeaderSize + ContentSize;
-        }
-
-        protected virtual int EncodeHeader(Span<byte> headerBuffer)
-        {
-            ulong contentSize = (ulong)ContentSize;
-            uint encodeLength = DwarfHelper.SizeOfULEB128(contentSize);
-
-            // Section header consists of:
-            // 1 byte: section type
-            // ULEB128: size of section
-            headerBuffer[0] = (byte)Type;
-            DwarfHelper.WriteULEB128(headerBuffer.Slice(1), contentSize);
-
-            return 1 + (int)encodeLength;
-        }
-
-        public override int EmitToStream(Stream outputFileStream)
-        {
-            Span<byte> headerBuffer = stackalloc byte[HeaderSize];
-            EncodeHeader(headerBuffer);
-
-            outputFileStream.Write(headerBuffer);
-
-            if (ContentPrefixSize > 0)
-            {
-                Span<byte> contentPrefix = stackalloc byte[ContentPrefixSize];
-                int encodedSize = EncodeContentPrefix(contentPrefix);
-                Debug.Assert(encodedSize == contentPrefix.Length);
-                outputFileStream.Write(contentPrefix);
-            }
-
+            Span<byte> contentPrefix = stackalloc byte[ContentPrefixSize];
+            int encodedSize = EncodeContentPrefix(contentPrefix);
+            Debug.Assert(encodedSize == contentPrefix.Length);
             ContentReadStream.Position = 0;
-            ContentReadStream.CopyTo(outputFileStream);
-
-            return HeaderSize + ContentSize;
+            return writer.WriteSection(Type, ContentReadStream, contentPrefix);
         }
 
-        public WasmSection(WasmSectionType type, Stream stream, Utf8String name, int sectionIndex) : base(stream, name, sectionIndex)
+        public WasmSection(WasmSectionId type, Stream stream, Utf8String name, int sectionIndex) : base(stream, name, sectionIndex)
         {
             Type = type;
         }
     }
 
-    internal class WasmCustomSection : WasmSection
+    internal sealed class WasmCustomSection : WasmSection
     {
         public WasmCustomSection(Stream stream, Utf8String customSectionName, int sectionIndex)
-            : base(WasmSectionType.Custom, stream, customSectionName, sectionIndex)
+            : base(WasmSectionId.Custom, stream, customSectionName, sectionIndex)
         {
             Debug.Assert(stream is not null);
             Debug.Assert(!customSectionName.IsNull);
         }
 
-        internal sealed override int ContentPrefixSize => checked(
-            (int)DwarfHelper.SizeOfULEB128((ulong)SectionName.Length) +
-            SectionName.Length +
-            CustomPayloadPrefixSize);
-
-        protected sealed override int EncodeContentPrefix(Span<byte> destination)
+        public override int Emit(WasmModuleWriter writer)
         {
-            int bytesWritten = DwarfHelper.WriteULEB128(destination, (ulong)SectionName.Length);
-            SectionName.AsSpan().CopyTo(destination.Slice(bytesWritten));
-            bytesWritten += SectionName.Length;
-            return bytesWritten + EncodeCustomPayloadPrefix(destination.Slice(bytesWritten));
+            ContentReadStream.Position = 0;
+            return writer.WriteCustomSection(SectionName.AsSpan(), ContentReadStream);
         }
-
-        protected virtual int CustomPayloadPrefixSize => 0;
-
-        protected virtual int EncodeCustomPayloadPrefix(Span<byte> destination) => 0;
-    }
-
-    /// <summary>
-    /// A custom section containing relocations for another WebAssembly section.
-    /// </summary>
-    internal sealed class WasmRelocationSection : WasmCustomSection
-    {
-        private readonly int _targetSectionIndex;
-        private readonly int _relocationCount;
-
-        public WasmRelocationSection(
-            Stream stream,
-            Utf8String name,
-            int sectionIndex,
-            int targetSectionIndex,
-            int relocationCount)
-            : base(stream, name, sectionIndex)
-        {
-            Debug.Assert(targetSectionIndex >= 0);
-            Debug.Assert(relocationCount >= 0);
-            _targetSectionIndex = targetSectionIndex;
-            _relocationCount = relocationCount;
-        }
-
-        protected override int CustomPayloadPrefixSize => checked(
-            (int)DwarfHelper.SizeOfULEB128((ulong)_targetSectionIndex) +
-            (int)DwarfHelper.SizeOfULEB128((ulong)_relocationCount));
-
-        protected override int EncodeCustomPayloadPrefix(Span<byte> destination)
-        {
-            int written = DwarfHelper.WriteULEB128(destination, (ulong)_targetSectionIndex); // section: the index of the target section.
-            return written + DwarfHelper.WriteULEB128(destination.Slice(written), (ulong)_relocationCount); // count: count of entries to follow.
-        }
-    }
-
-    internal sealed class PaddingWasmSection : IWasmSection
-    {
-        private const int MinimumSectionSize = 3;
-
-        private readonly int _size;
-        public PaddingWasmSection(int followingSectionAlignment, long currentOffset)
-        {
-            if (followingSectionAlignment is 1 or 0 || currentOffset % followingSectionAlignment == 0)
-            {
-                _size = 0;
-                return;
-            }
-
-            int padding = (int)(AlignmentHelper.AlignUp(currentOffset, followingSectionAlignment) - currentOffset);
-            if (padding < MinimumSectionSize)
-            {
-                padding += followingSectionAlignment;
-            }
-            _size = padding;
-            Debug.Assert(DwarfHelper.SizeOfULEB128((ulong)_size) <= 5);
-        }
-
-        public WasmSectionType Type => WasmSectionType.Custom;
-
-        public int EmitToStream(Stream outputFileStream)
-        {
-            if (_size == 0)
-            {
-                return 0;
-            }
-            int sectionSizeEncodingLength = 1;
-            int sectionPayloadLength = 0;
-            for (; sectionSizeEncodingLength <= 5; sectionSizeEncodingLength++)
-            {
-                sectionPayloadLength = _size - 1 - sectionSizeEncodingLength;
-                if (DwarfHelper.SizeOfULEB128((ulong)sectionPayloadLength) <= sectionSizeEncodingLength)
-                {
-                    break;
-                }
-            }
-
-            Span<byte> header = stackalloc byte[1 + sectionSizeEncodingLength];
-            header[0] = (byte)WasmSectionType.Custom;
-            DwarfHelper.WritePaddedULEB128(header.Slice(1), (ulong)sectionPayloadLength);
-            outputFileStream.Write(header);
-            WasmDataSegmentEncoding.EmitPadding(outputFileStream, sectionPayloadLength);
-
-            Debug.Assert(header.Length + sectionPayloadLength == _size);
-            return _size;
-        }
-
-        public int EncodeSize() => _size;
     }
 
     internal abstract class WasmVectorSection : WasmSection
     {
         public int EntryCount { get; protected set; }
 
-        internal override int ContentPrefixSize => (int)DwarfHelper.SizeOfULEB128((ulong)EntryCount);
+        internal override int ContentPrefixSize => WasmLeb128.GetULeb128Size((ulong)EntryCount);
 
         protected override int EncodeContentPrefix(Span<byte> destination) =>
-            DwarfHelper.WriteULEB128(destination, (ulong)EntryCount);
+            WasmLeb128.WriteULeb128(destination, (ulong)EntryCount);
 
         protected void CompleteEntry()
         {
             EntryCount++;
         }
 
-        protected WasmVectorSection(WasmSectionType type, Stream stream, Utf8String name, int sectionIndex)
+        protected WasmVectorSection(WasmSectionId type, Stream stream, Utf8String name, int sectionIndex)
             : base(type, stream, name, sectionIndex)
         {
         }
@@ -259,15 +111,15 @@ namespace ILCompiler.ObjectWriter
     {
         private bool _entryCountSet;
 
-        public WasmExternallyCountedSection(WasmSectionType type, Stream stream, Utf8String name, int sectionIndex)
+        public WasmExternallyCountedSection(WasmSectionId type, Stream stream, Utf8String name, int sectionIndex)
             : base(type, stream, name, sectionIndex)
         {
         }
 
-        public override int EmitToStream(Stream outputFileStream)
+        public override int Emit(WasmModuleWriter writer)
         {
             Debug.Assert(_entryCountSet);
-            return base.EmitToStream(outputFileStream);
+            return base.Emit(writer);
         }
 
         public void SetEntryCount(int entryCount)
@@ -297,7 +149,7 @@ namespace ILCompiler.ObjectWriter
             writer.Buffer.Advance(bytesWritten);
         }
 
-        protected WasmSection(WasmSectionType type, Stream stream, Utf8String name, int sectionIndex)
+        protected WasmSection(WasmSectionId type, Stream stream, Utf8String name, int sectionIndex)
             : base(type, stream, name, sectionIndex)
         {
         }
@@ -306,7 +158,7 @@ namespace ILCompiler.ObjectWriter
     internal sealed class WasmImportSection : WasmSection<WasmImport>
     {
         public WasmImportSection(Stream stream, Utf8String name, int sectionIndex)
-            : base(WasmSectionType.Import, stream, name, sectionIndex)
+            : base(WasmSectionId.Import, stream, name, sectionIndex)
         {
         }
 
@@ -322,7 +174,7 @@ namespace ILCompiler.ObjectWriter
     internal sealed class WasmFunctionSection : WasmSection<int>
     {
         public WasmFunctionSection(Stream stream, Utf8String name, int sectionIndex)
-            : base(WasmSectionType.Function, stream, name, sectionIndex)
+            : base(WasmSectionId.Function, stream, name, sectionIndex)
         {
         }
 
@@ -335,7 +187,7 @@ namespace ILCompiler.ObjectWriter
     internal sealed class WasmGlobalSection : WasmSection<WasmGlobal>
     {
         public WasmGlobalSection(Stream stream, Utf8String name, int sectionIndex)
-            : base(WasmSectionType.Global, stream, name, sectionIndex)
+            : base(WasmSectionId.Global, stream, name, sectionIndex)
         {
         }
 
@@ -363,7 +215,7 @@ namespace ILCompiler.ObjectWriter
     internal sealed class WasmExportSection : WasmSection<WasmExport>
     {
         public WasmExportSection(Stream stream, Utf8String name, int sectionIndex)
-            : base(WasmSectionType.Export, stream, name, sectionIndex)
+            : base(WasmSectionId.Export, stream, name, sectionIndex)
         {
         }
 
@@ -394,7 +246,7 @@ namespace ILCompiler.ObjectWriter
     internal sealed class WasmElementSection : WasmSection<WasmElementSegment>
     {
         public WasmElementSection(Stream stream, Utf8String name, int sectionIndex)
-            : base(WasmSectionType.Element, stream, name, sectionIndex)
+            : base(WasmSectionId.Element, stream, name, sectionIndex)
         {
         }
 

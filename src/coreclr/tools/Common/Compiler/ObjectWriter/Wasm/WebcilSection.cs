@@ -33,12 +33,7 @@ namespace ILCompiler.ObjectWriter
             Alignment = Math.Max(Alignment, alignment);
         }
 
-        public override int EncodeSize()
-        {
-            return (int)ContentReadStream.Length;
-        }
-
-        public override int EmitToStream(Stream outputFileStream)
+        public int EmitToStream(Stream outputFileStream)
         {
             // Emit the raw contents of this Webcil section followed by any required padding.
             ContentReadStream.Position = 0;

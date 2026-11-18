@@ -86,23 +86,30 @@ Mono is out of scope. It is being removed.
 | `wasm-opt -Oz`/`-O2` (opt-in) | Browser CoreCLR relink and ReadyToRun images | Optimizer; not a replacement target. |
 | `emcc` / `clang -c` | Native compiles | C compiler; not a replacement target. |
 
-## Overlap with ILCompiler's ObjectWriter
+## ILCompiler and crossgen2 ObjectWriter
 
-`src/coreclr/tools/Common/Compiler/ObjectWriter/Wasm*` partly duplicates this library: section and LEB encoding,
-the `linking` and `reloc.*` sections, and the name section. The ILCompiler front end, which maps nodes to symbols and
-relocations, and the Webcil layout are not redundant. This library's instruction encoder works from the WAT AST and
-has no programmatic instruction builder.
+`src/coreclr/tools/Common/Compiler/ObjectWriter` (`WasmRelocatableObjectWriter` for ILCompiler `.o` files,
+`WebCilObjectWriter` for crossgen2's Webcil images) serializes through this library's `Binary.Writing` API:
 
-Current state:
+- `WasmModuleWriter` writes the header and frames every section, including Webcil's alignment padding section.
+- `SymbolTableEncoder`, `SegmentInfoEncoder` and `LinkingSectionEncoder` write the `linking` section, and
+  `RelocationSectionEncoder` writes the `reloc.*` sections.
+- `WasmLeb128` is used for LEB128 encoding and `WasmSectionId` for section IDs.
 
+Runtime's own section framing, padding section, linking and relocation encoding, and `WasmSectionType` were deleted.
+The node-to-symbol front end, relocation resolution, data-segment layout, Webcil layout and the instruction encoder
+stay in runtime.
+
+- `ILCompiler.Compiler` and `ILCompiler.ReadyToRun` have a `ProjectReference` to this library, not linked source. The
+  library's types are public, so linking its source would collide in tests that reference both. ilc and crossgen2
+  are NativeAOT-published with no trim or AOT warnings. Compared with builds before either referenced the library,
+  ilc grew 31 KB (36,562,356 to 36,593,652 bytes) and crossgen2 20.5 KB (32,984,282 to 33,004,794 bytes).
+- Output is byte-identical before and after. `artifacts/objcmp/run.sh` (a local script, not committed) runs ilc on
+  the 14 NativeAOT WASI smoke-test response files, and crossgen2 on CoreLib, five framework libraries and a
+  composite. `TrimmingBehaviors.o` also differs between two runs of the same ilc, so it's excluded.
 - `ILCompiler.ReadyToRun.Tests` validates every crossgen2 wasm output with `ModuleReader.ReadModuleAndValidate`.
-- `ILCompiler.Compiler` has a `ProjectReference` to this library, not linked source. The library's types are public,
-  so linking its source into shipping assemblies would collide in tests that reference both. ilc is published with
-  NativeAOT, so only the used parts are kept: the reference grew ilc by about 9 KB, with no trim or AOT warnings.
-  crossgen2 doesn't reference the library yet, because its Webcil writer doesn't use these types.
-- `WasmRelocatableObjectWriter` uses this library's linking model (`SymbolType`, `SymbolFlags`, `RelocationType`)
-  instead of its own copies. Its output is byte-identical before and after.
-- The section, `linking`/`reloc.*` and name-section encoding stays in ObjectWriter. This library has no
-  producer-side API that can reproduce that output byte for byte while streaming large objects
-  ([nesm#581](https://github.com/Blazor-Playground/nesm/issues/581); instruction builder:
-  [nesm#570](https://github.com/Blazor-Playground/nesm/issues/570)).
+  Nesm's `ObjectWriterReferenceTests` re-encode runtime outputs when `NESM_OBJCMP_DIR` points at an objcmp `out`
+  directory.
+- Still runtime-only, tracked in [nesm#592](https://github.com/Blazor-Playground/nesm/issues/592): data-segment
+  headers, the name section's subsection ID, and LEB128 over `IBufferWriter` or streams. The instruction encoder
+  (`WasmInstructions.cs`) is tracked in [nesm#570](https://github.com/Blazor-Playground/nesm/issues/570).

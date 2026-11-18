@@ -14,6 +14,7 @@ using Internal.IL;
 using Internal.JitInterface;
 using Internal.Text;
 using Internal.TypeSystem;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -22,19 +23,19 @@ namespace ILCompiler.ObjectWriter
     /// </summary>
     internal abstract partial class WasmObjectWriter : ObjectWriter
     {
-        private readonly Dictionary<ObjectNodeSection, WasmSectionType> _sectionToType = new()
+        private readonly Dictionary<ObjectNodeSection, WasmSectionId> _sectionToType = new()
         {
-            { WasmObjectNodeSection.MemorySection, WasmSectionType.Memory },
-            { WasmObjectNodeSection.FunctionSection, WasmSectionType.Function },
-            { WasmObjectNodeSection.TableSection, WasmSectionType.Table },
-            { WasmObjectNodeSection.ElementSection, WasmSectionType.Element },
-            { WasmObjectNodeSection.ExportSection, WasmSectionType.Export },
-            { WasmObjectNodeSection.ImportSection, WasmSectionType.Import },
-            { WasmObjectNodeSection.GlobalSection, WasmSectionType.Global },
-            { ObjectNodeSection.WasmTypeSection, WasmSectionType.Type },
-            { ObjectNodeSection.WasmCodeSection, WasmSectionType.Code },
-            { WasmObjectNodeSection.DataCountSection, WasmSectionType.DataCount },
-            { WasmObjectNodeSection.DataSection, WasmSectionType.Data },
+            { WasmObjectNodeSection.MemorySection, WasmSectionId.Memory },
+            { WasmObjectNodeSection.FunctionSection, WasmSectionId.Function },
+            { WasmObjectNodeSection.TableSection, WasmSectionId.Table },
+            { WasmObjectNodeSection.ElementSection, WasmSectionId.Element },
+            { WasmObjectNodeSection.ExportSection, WasmSectionId.Export },
+            { WasmObjectNodeSection.ImportSection, WasmSectionId.Import },
+            { WasmObjectNodeSection.GlobalSection, WasmSectionId.Global },
+            { ObjectNodeSection.WasmTypeSection, WasmSectionId.Type },
+            { ObjectNodeSection.WasmCodeSection, WasmSectionId.Code },
+            { WasmObjectNodeSection.DataCountSection, WasmSectionId.DataCount },
+            { WasmObjectNodeSection.DataSection, WasmSectionId.Data },
         };
 
         // Sections emitted before data segments.
@@ -171,12 +172,6 @@ namespace ILCompiler.ObjectWriter
             }
         }
 
-        private protected static void EmitWasmHeader(Stream outputFileStream)
-        {
-            outputFileStream.Write("\0asm"u8);
-            outputFileStream.Write([0x1, 0x0, 0x0, 0x0]);
-        }
-
         private protected override void CreateSection(
             ObjectNodeSection section,
             Utf8String comdatName,
@@ -184,7 +179,7 @@ namespace ILCompiler.ObjectWriter
             int sectionIndex,
             Stream sectionStream)
         {
-            WasmSectionType sectionType = GetWasmSectionType(section);
+            WasmSectionId sectionType = GetWasmSectionId(section);
             SectionDataEmitter wasmSection;
             if (section.Type == SectionType.Debug)
             {
@@ -192,7 +187,7 @@ namespace ILCompiler.ObjectWriter
                 wasmSection = new WasmCustomSection(sectionStream, sectionName, sectionIndex);
                 EmitSymbolDefinition(sectionIndex, sectionName);
             }
-            else if (sectionType == WasmSectionType.Data)
+            else if (sectionType == WasmSectionId.Data)
             {
                 wasmSection = CreateDataSection(section, sectionIndex, sectionStream);
             }
@@ -201,12 +196,12 @@ namespace ILCompiler.ObjectWriter
                 Utf8String sectionName = new(section.Name);
                 wasmSection = sectionType switch
                 {
-                    WasmSectionType.Type or WasmSectionType.Code => new WasmExternallyCountedSection(sectionType, sectionStream, sectionName, sectionIndex),
-                    WasmSectionType.Import => new WasmImportSection(sectionStream, sectionName, sectionIndex),
-                    WasmSectionType.Function => new WasmFunctionSection(sectionStream, sectionName, sectionIndex),
-                    WasmSectionType.Global => new WasmGlobalSection(sectionStream, sectionName, sectionIndex),
-                    WasmSectionType.Export => new WasmExportSection(sectionStream, sectionName, sectionIndex),
-                    WasmSectionType.Element => new WasmElementSection(sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Type or WasmSectionId.Code => new WasmExternallyCountedSection(sectionType, sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Import => new WasmImportSection(sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Function => new WasmFunctionSection(sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Global => new WasmGlobalSection(sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Export => new WasmExportSection(sectionStream, sectionName, sectionIndex),
+                    WasmSectionId.Element => new WasmElementSection(sectionStream, sectionName, sectionIndex),
                     _ => new WasmSection(sectionType, sectionStream, sectionName, sectionIndex),
                 };
             }
@@ -460,13 +455,13 @@ namespace ILCompiler.ObjectWriter
             return _sections.GetSection<TSection>(writer.SectionIndex);
         }
 
-        private WasmSectionType GetWasmSectionType(ObjectNodeSection section)
+        private WasmSectionId GetWasmSectionId(ObjectNodeSection section)
         {
-            if (!_sectionToType.TryGetValue(section, out WasmSectionType sectionType))
+            if (!_sectionToType.TryGetValue(section, out WasmSectionId sectionType))
             {
                 // All other sections map to generic data segments in Wasm.
                 // TODO-WASM: Consider making the mapping explicit for every possible node type.
-                return WasmSectionType.Data;
+                return WasmSectionId.Data;
             }
 
             return sectionType;
