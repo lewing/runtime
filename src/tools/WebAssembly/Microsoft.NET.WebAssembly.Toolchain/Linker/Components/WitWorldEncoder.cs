@@ -6,6 +6,8 @@ namespace Microsoft.NET.WebAssembly.Linker.Components;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
 /// Encodes a resolved WIT world as a <c>component-type</c> payload, porting wit-component's
@@ -53,26 +55,26 @@ internal sealed class WitWorldEncoder
         var outer = new List<CtDecl>
         {
             new CtTypeDecl(new CtComponentType(worldType)),
-            new CtExportDecl(world.World.Package.InterfaceId(world.World.Name), new CtExternDesc(CtExternDesc.Component, 0)),
+            new CtExportDecl(world.World.Package.InterfaceId(world.World.Name), new CtExternDesc(ComponentExternKind.Component, 0)),
         };
 
         var w = new CtWriter();
         w.Bytes([0x00, 0x61, 0x73, 0x6D, 0x0D, 0x00, 0x01, 0x00]);
-        w.Section(0, s =>
+        w.Section(ComponentSectionId.Custom, s =>
         {
             s.Name("wit-component-encoding");
             s.Bytes([EncodingVersion, Utf8]);
         });
-        w.Section(7, s =>
+        w.Section(ComponentSectionId.Type, s =>
         {
             s.U32(1);
             ComponentTypeCodec.WriteDefType(s, new CtComponentType(outer));
         });
-        w.Section(11, s =>
+        w.Section(ComponentSectionId.Export, s =>
         {
             s.U32(1);
             ComponentTypeCodec.WriteExternName(s, world.World.Name);
-            s.Byte(CtSort.Type);
+            s.Byte((byte)ComponentSort.Type);
             s.U32(0);
             s.Byte(0x00);
         });
@@ -88,11 +90,11 @@ internal sealed class WitWorldEncoder
             {
                 case WitWorldInterface i:
                     _interface = i.Interface;
-                    desc = new CtExternDesc(CtExternDesc.Instance, EncodeInstance(i.Interface));
+                    desc = new CtExternDesc(ComponentExternKind.Instance, EncodeInstance(i.Interface));
                     break;
                 case WitWorldFunction f:
                     _interface = null;
-                    desc = new CtExternDesc(CtExternDesc.Func, EncodeFuncType(f.Function));
+                    desc = new CtExternDesc(ComponentExternKind.Func, EncodeFuncType(f.Function));
                     break;
                 case WitWorldType t:
                     _interface = null;
@@ -124,13 +126,13 @@ internal sealed class WitWorldEncoder
     private CtExternDesc EncodeExportedInstance(WitIface iface)
     {
         _interface = iface;
-        return new CtExternDesc(CtExternDesc.Instance, EncodeInstance(iface));
+        return new CtExternDesc(ComponentExternKind.Instance, EncodeInstance(iface));
     }
 
     private CtExternDesc EncodeExportedFunc(WitFunction function)
     {
         _interface = null;
-        return new CtExternDesc(CtExternDesc.Func, EncodeFuncType(function));
+        return new CtExternDesc(ComponentExternKind.Func, EncodeFuncType(function));
     }
 
     private uint EncodeInstance(WitIface iface)
@@ -155,7 +157,7 @@ internal sealed class WitWorldEncoder
         foreach (var function in functions)
         {
             uint type = EncodeFuncType(function);
-            _instance.Add(new CtExportDecl(function.Name, new CtExternDesc(CtExternDesc.Func, type)));
+            _instance.Add(new CtExportDecl(function.Name, new CtExternDesc(ComponentExternKind.Func, type)));
         }
 
         var instance = _instance;
@@ -333,7 +335,7 @@ internal sealed class WitWorldEncoder
 
     private uint? ExportType(uint index, string name)
     {
-        var desc = new CtExternDesc(CtExternDesc.Type, index);
+        var desc = new CtExternDesc(ComponentExternKind.Type, index);
         if (_instance is { } instance)
             return instance.Add(new CtExportDecl(name, desc));
         return _outer.Add(_importTypes ? new CtImportDecl(name, desc) : new CtExportDecl(name, desc));
@@ -341,7 +343,7 @@ internal sealed class WitWorldEncoder
 
     private uint ExportResource(string name)
     {
-        var desc = new CtExternDesc(CtExternDesc.Type, 0, SubResource: true);
+        var desc = new CtExternDesc(ComponentExternKind.Type, 0, SubResource: true);
         if (_instance is { } instance)
             return instance.Add(new CtExportDecl(name, desc));
         return _outer.Add(_importTypes ? new CtImportDecl(name, desc) : new CtExportDecl(name, desc));

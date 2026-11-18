@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Wat;
 
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 
@@ -43,43 +44,43 @@ public sealed class WasmEncoder
 
         // Section 1: Type
         if (_module.Types.Count > 0)
-            WriteSection(output, 1, WriteTypeSection);
+            WriteSection(output, WasmSectionId.Type, WriteTypeSection);
 
         // Section 2: Import
         if (_module.Imports.Count > 0)
-            WriteSection(output, 2, WriteImportSection);
+            WriteSection(output, WasmSectionId.Import, WriteImportSection);
 
         // Section 3: Function
         if (_module.Funcs.Count > 0)
-            WriteSection(output, 3, WriteFunctionSection);
+            WriteSection(output, WasmSectionId.Function, WriteFunctionSection);
 
         // Section 4: Table
         if (_module.Tables.Count > 0)
-            WriteSection(output, 4, WriteTableSection);
+            WriteSection(output, WasmSectionId.Table, WriteTableSection);
 
         // Section 5: Memory
         if (_module.Memories.Count > 0)
-            WriteSection(output, 5, WriteMemorySection);
+            WriteSection(output, WasmSectionId.Memory, WriteMemorySection);
 
         // Section 13: Tag (between memory and global per exception handling spec)
         if (_module.Tags.Count > 0)
-            WriteSection(output, 13, WriteTagSection);
+            WriteSection(output, WasmSectionId.Tag, WriteTagSection);
 
         // Section 6: Global
         if (_module.Globals.Count > 0)
-            WriteSection(output, 6, WriteGlobalSection);
+            WriteSection(output, WasmSectionId.Global, WriteGlobalSection);
 
         // Section 7: Export
         if (_module.Exports.Count > 0)
-            WriteSection(output, 7, WriteExportSection);
+            WriteSection(output, WasmSectionId.Export, WriteExportSection);
 
         // Section 8: Start
         if (_module.StartFunction.HasValue)
-            WriteSection(output, 8, s => WriteU32Leb(s, (uint)_module.StartFunction.Value));
+            WriteSection(output, WasmSectionId.Start, s => WriteU32Leb(s, (uint)_module.StartFunction.Value));
 
         // Section 9: Element
         if (_module.Elements.Count > 0)
-            WriteSection(output, 9, WriteElementSection);
+            WriteSection(output, WasmSectionId.Element, WriteElementSection);
 
         // Branch metadata is canonically emitted immediately before code. Function bodies are
         // encoded once into temporary buffers so metadata offsets describe the exact bytes written.
@@ -93,12 +94,12 @@ public sealed class WasmEncoder
                     BranchHintMetadataReader.SectionName,
                     BuildBranchHintSection(encodedFunctions));
             }
-            WriteSection(output, 10, s => WriteCodeSection(s, encodedFunctions));
+            WriteSection(output, WasmSectionId.Code, s => WriteCodeSection(s, encodedFunctions));
         }
 
         // Section 11: Data
         if (_module.DataSegments.Count > 0)
-            WriteSection(output, 11, WriteDataSection);
+            WriteSection(output, WasmSectionId.Data, WriteDataSection);
 
         // Custom section: .debug_line (emitted when source location info was collected)
         if (_debugLineEntries is { Count: > 0 })
@@ -128,7 +129,7 @@ public sealed class WasmEncoder
         {
             var sub = new MemoryStream();
             WriteName(sub, moduleName);
-            ms.WriteByte(0);
+            ms.WriteByte((byte)NameSubsectionId.Module);
             WriteU32Leb(ms, (uint)sub.Length);
             sub.WriteTo(ms);
         }
@@ -144,7 +145,7 @@ public sealed class WasmEncoder
                 WriteU32Leb(sub, (uint)idx);
                 WriteName(sub, name);
             }
-            ms.WriteByte(1);
+            ms.WriteByte((byte)NameSubsectionId.Function);
             WriteU32Leb(ms, (uint)sub.Length);
             sub.WriteTo(ms);
         }
@@ -166,7 +167,7 @@ public sealed class WasmEncoder
                     WriteName(sub, name);
                 }
             }
-            ms.WriteByte(2);
+            ms.WriteByte((byte)NameSubsectionId.Local);
             WriteU32Leb(ms, (uint)sub.Length);
             sub.WriteTo(ms);
         }
@@ -182,7 +183,7 @@ public sealed class WasmEncoder
                 WriteU32Leb(sub, (uint)idx);
                 WriteName(sub, name);
             }
-            ms.WriteByte(4);
+            ms.WriteByte((byte)NameSubsectionId.Type);
             WriteU32Leb(ms, (uint)sub.Length);
             sub.WriteTo(ms);
         }
@@ -198,19 +199,18 @@ public sealed class WasmEncoder
         sectionBody.Write(nameBytes);
         sectionBody.Write(content);
         var bodyBytes = sectionBody.ToArray();
-        output.WriteByte(0); // section ID 0 = custom
+        output.WriteByte((byte)WasmSectionId.Custom);
         WriteU32Leb(output, (uint)bodyBytes.Length);
         output.Write(bodyBytes);
     }
 
-    private static void WriteSection(Stream output, byte sectionId, Action<Stream> writer)
+    private static void WriteSection(Stream output, WasmSectionId sectionId, Action<Stream> writer)
     {
-        var content = new MemoryStream();
+        using var content = new MemoryStream();
         writer(content);
-        var bytes = content.ToArray();
-        output.WriteByte(sectionId);
-        WriteU32Leb(output, (uint)bytes.Length);
-        output.Write(bytes);
+        output.WriteByte((byte)sectionId);
+        WriteU32Leb(output, (uint)content.Length);
+        output.Write(content.GetBuffer(), 0, (int)content.Length);
     }
 
     private void WriteTypeSection(Stream s)
@@ -957,52 +957,15 @@ public sealed class WasmEncoder
 
     // ── LEB128 encoding ──
 
-    internal static void WriteU32Leb(Stream s, uint value)
-    {
-        do
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            if (value != 0) b |= 0x80;
-            s.WriteByte(b);
-        } while (value != 0);
-    }
+    internal static void WriteU32Leb(Stream s, uint value) => WasmLeb128.WriteULeb128(s, value);
 
-    internal static void WriteS32Leb(Stream s, int value)
-    {
-        bool more = true;
-        while (more)
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            if ((value == 0 && (b & 0x40) == 0) ||
-                (value == -1 && (b & 0x40) != 0))
-                more = false;
-            else
-                b |= 0x80;
-            s.WriteByte(b);
-        }
-    }
+    internal static void WriteS32Leb(Stream s, int value) => WasmLeb128.WriteSLeb128(s, value);
 
-    internal static void WriteS64Leb(Stream s, long value)
-    {
-        bool more = true;
-        while (more)
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            if ((value == 0 && (b & 0x40) == 0) ||
-                (value == -1 && (b & 0x40) != 0))
-                more = false;
-            else
-                b |= 0x80;
-            s.WriteByte(b);
-        }
-    }
+    internal static void WriteS64Leb(Stream s, long value) => WasmLeb128.WriteSLeb128(s, value);
 
     internal static void WriteS33Leb(Stream stream, long value)
     {
-        if (!S33Leb128.IsInRange(value))
+        if (!WasmLeb128.IsS33(value))
             throw new ArgumentOutOfRangeException(nameof(value), value, "Value is outside the signed 33-bit range.");
         WriteS64Leb(stream, value);
     }

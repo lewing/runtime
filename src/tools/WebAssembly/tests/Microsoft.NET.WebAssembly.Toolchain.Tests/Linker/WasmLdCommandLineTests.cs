@@ -80,6 +80,19 @@ public class WasmLdCommandLineTests
         Assert.Equal(expected, WasmLdCommandLine.Parse(args).Options.StackFirst);
     }
 
+    [Theory]
+    [InlineData(new[] { "a.o", "-o", "out/app.wasm" }, "app.wasm", true)]
+    [InlineData(new[] { "a.o" }, "a.out", true)]
+    [InlineData(new[] { "a.o", "-o", "app.wasm", "--soname=libapp.so" }, "libapp.so", true)]
+    [InlineData(new[] { "a.o", "--soname", "libapp.so", "-o", "app.wasm", "--no-demangle" }, "libapp.so", false)]
+    [InlineData(new[] { "a.o", "--no-demangle", "--demangle" }, "a.out", true)]
+    public void NameSectionOptions_FollowWasmLd(string[] args, string moduleName, bool demangle)
+    {
+        var options = WasmLdCommandLine.Parse(args).Options;
+        Assert.Equal(moduleName, options.ModuleName);
+        Assert.Equal(demangle, options.Demangle);
+    }
+
     [Fact]
     public void WholeArchive_AppliesToInputsInsideTheRegion()
     {

@@ -6,6 +6,7 @@ namespace Microsoft.NET.WebAssembly.Linker;
 using System.Buffers.Binary;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Wat;
@@ -35,6 +36,12 @@ internal sealed class ObjectFileLinker
     private const string IndirectFunctionTableName = "__indirect_function_table";
     private const string StackPointerName = "__stack_pointer";
     private const string CallCtorsName = "__wasm_call_ctors";
+
+    // Name-section names of synthetic functions and globals (never mutated).
+    private static readonly byte[] s_callCtorsUtf8 = "__wasm_call_ctors"u8.ToArray();
+    private static readonly byte[] s_initMemoryUtf8 = "__wasm_init_memory"u8.ToArray();
+    private static readonly byte[] s_stackPointerUtf8 = "__stack_pointer"u8.ToArray();
+    private static readonly byte[] s_mainUtf8 = "main"u8.ToArray();
     private const string MemoryBaseName = "__memory_base";
     private const string TableBaseName = "__table_base";
     private const string TlsBaseName = "__tls_base";
@@ -742,9 +749,10 @@ internal sealed class ObjectFileLinker
     {
         var imports = new List<Import>();
         var functions = new List<WasmFunction>();
-        var functionNames = new List<string?>();
+        // Name-section names as wasm-ld writes them: UTF-8 bytes (a demangled name can hold bytes that are not UTF-8).
+        var functionNames = new List<byte[]?>();
         var globals = new List<WasmGlobal>();
-        var globalNames = new List<string?>();
+        var globalNames = new List<byte[]?>();
         var tables = new List<TableType>();
         var tags = new List<Tag>();
 
@@ -820,7 +828,7 @@ internal sealed class ObjectFileLinker
                     imports.Add(new Import(import.ModuleName, import.Name, new ImportDescriptor.Func(TypeIndexOf(type))));
                     sym.OutIndex = funcImportCount++;
                     sym.HasOutIndex = true;
-                    functionNames.Add(sym.Name);
+                    functionNames.Add(DisplayName(sym.Name));
                     break;
                 }
                 case SymbolType.Global:
@@ -829,7 +837,7 @@ internal sealed class ObjectFileLinker
                     imports.Add(import);
                     sym.OutIndex = globalImportCount++;
                     sym.HasOutIndex = true;
-                    globalNames.Add(sym.Name);
+                    globalNames.Add(DisplayName(sym.Name));
                     break;
                 }
                 case SymbolType.Table:
@@ -864,7 +872,7 @@ internal sealed class ObjectFileLinker
             _callCtors.HasOutIndex = true;
             callCtorsSlot = functions.Count;
             functions.Add(null!);
-            functionNames.Add(CallCtorsName);
+            functionNames.Add(s_callCtorsUtf8);
         }
 
         // Synthetic functions come first in wasm-ld's creation order: __wasm_call_ctors, undefined-weak stubs,
@@ -877,13 +885,13 @@ internal sealed class ObjectFileLinker
             stub.HasOutIndex = true;
             stubSlots.Add((stub, stub.RefFile.Module.Types[((ImportDescriptor.Func)import.Descriptor).TypeIndex], functions.Count));
             functions.Add(null!);
-            functionNames.Add("undefined_weak:" + stub.Name);
+            functionNames.Add(Concat("undefined_weak:"u8, DisplayName(stub.Name)));
         }
         if (zeroBssAtStart)
         {
             initMemorySlot = functions.Count;
             functions.Add(null!);
-            functionNames.Add("__wasm_init_memory");
+            functionNames.Add(s_initMemoryUtf8);
             nextFunc++;
         }
 
@@ -915,7 +923,7 @@ internal sealed class ObjectFileLinker
             _stackPointer.OutIndex = nextGlobal++;
             _stackPointer.HasOutIndex = true;
             globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Var), InitExpr = ConstI32(layout.StackPointer) });
-            globalNames.Add(StackPointerName);
+            globalNames.Add(s_stackPointerUtf8);
         }
         // wasm-ld (LLD 23+) creates these in a fixed order after __stack_pointer.
         foreach (string baseName in (ReadOnlySpan<string>)[MemoryBaseName, TableBaseName, TlsBaseName])
@@ -931,11 +939,12 @@ internal sealed class ObjectFileLinker
                     _ => 0,
                 };
                 globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
-                globalNames.Add(sym.Name);
+                globalNames.Add(System.Text.Encoding.UTF8.GetBytes(sym.Name));
             }
         }
         foreach (ObjFile file in _files)
         {
+            string?[] definedGlobalNames = FirstDefiningNames(file, SymbolType.Global, file.GlobalImports, file.Module.Globals.Count);
             file.GlobalOut = new int[file.Module.Globals.Count];
             for (int g = 0; g < file.GlobalOut.Length; g++)
             {
@@ -947,7 +956,7 @@ internal sealed class ObjectFileLinker
                 file.GlobalOut[g] = (int)nextGlobal++;
                 WasmGlobal global = file.Module.Globals[g];
                 globals.Add(new WasmGlobal { Type = global.Type, InitExpr = [.. global.InitExpr] });
-                globalNames.Add(file.Symbols.FirstOrDefault(s => s.Kind == SymbolType.Global && s.DefFile == file && s.DefIndex == file.GlobalImports + (uint)g)?.Name);
+                globalNames.Add(DisplayName(definedGlobalNames[g]));
             }
         }
 
@@ -1078,7 +1087,7 @@ internal sealed class ObjectFileLinker
                     sym.GotIndex = nextGlobal++;
                     sym.HasGot = true;
                     globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(value) });
-                    globalNames.Add((sym.Kind == SymbolType.Function ? "GOT.func.internal." : "GOT.data.internal.") + sym.Name);
+                    globalNames.Add(Concat(sym.Kind == SymbolType.Function ? "GOT.func.internal."u8 : "GOT.data.internal."u8, DisplayName(sym.Name)));
                 }
             }
         }
@@ -1086,6 +1095,7 @@ internal sealed class ObjectFileLinker
         // ── Function bodies ──
         foreach (ObjFile file in _files)
         {
+            string?[] definedFunctionNames = FirstDefiningNames(file, SymbolType.Function, file.FuncImports, file.FuncOut.Length);
             for (int f = 0; f < file.FuncOut.Length; f++)
             {
                 if (file.FuncOut[f] < 0)
@@ -1109,7 +1119,7 @@ internal sealed class ObjectFileLinker
                 };
                 function.CopyBranchHintsFrom(source);
                 functions.Add(function);
-                functionNames.Add(FunctionName(file, file.FuncImports + (uint)f));
+                functionNames.Add(DisplayName(definedFunctionNames[f]));
             }
         }
         foreach ((_, FuncType type, int slot) in stubSlots)
@@ -1222,7 +1232,8 @@ internal sealed class ObjectFileLinker
                     break;
                 case SymbolType.Data:
                     globals.Add(new WasmGlobal { Type = new GlobalType(ValType.I32, Mutability.Const), InitExpr = ConstI32(sym.Address) });
-                    globalNames.Add(sym.Name);
+                    // wasm-ld's name section skips these address globals (GlobalSection::dataAddressGlobals).
+                    globalNames.Add(null);
                     exports[exportName] = new Export(exportName, new ExportDescriptor.Global((int)nextGlobal++));
                     break;
             }
@@ -1237,7 +1248,12 @@ internal sealed class ObjectFileLinker
         var customSections = new List<CustomSection>();
         customSections.AddRange(BuildDebugSections(functions, funcImportCount));
         if (!_options.NoNameSection && !_options.StripAll)
-            customSections.Add(BuildNameSection(functionNames, globalNames, [.. emitted.Select(static s => s.Name)]));
+        {
+            var segmentNames = new List<byte[]?>(emitted.Count);
+            foreach (OutSegment segment in emitted)
+                segmentNames.Add(System.Text.Encoding.UTF8.GetBytes(segment.Name));
+            customSections.Add(BuildNameSection(_options.ModuleName, functionNames, globalNames, segmentNames));
+        }
         if (!_options.StripAll && BuildTargetFeatures() is { } targetFeatures)
             customSections.Add(targetFeatures);
 
@@ -1260,22 +1276,100 @@ internal sealed class ObjectFileLinker
             Elements = elements,
             DataSegments = dataSegments,
             CustomSections = customSections,
-            ProducersSection = _options.StripAll ? null : SectionMerger.MergeProducers([.. _files.Select(static f => f.Module)]),
+            ProducersSection = _options.StripAll ? null : MergeProducers(),
         };
     }
 
-    private string? FunctionName(ObjFile file, uint functionIndex)
+    /// <summary>
+    /// wasm-ld's producers section: per field (written as <c>language</c>, <c>processed-by</c>, <c>sdk</c>), the first
+    /// version seen for each name across the objects in link order wins, and the linker adds no entry of its own.
+    /// </summary>
+    private ProducersSection? MergeProducers()
     {
-        string? local = null;
-        foreach (Sym sym in file.Symbols)
+        ReadOnlySpan<string> fieldOrder = ["language", "processed-by", "sdk"];
+        var fields = new List<(string Name, string Version)>[fieldOrder.Length];
+        for (int i = 0; i < fields.Length; i++)
+            fields[i] = [];
+        foreach (ObjFile file in _files)
         {
-            if (sym.Kind != SymbolType.Function || sym.DefFile != file || sym.DefIndex != functionIndex)
+            if (file.Module.ProducersSection is not { } producers)
                 continue;
-            if (!sym.IsLocal)
-                return sym.Name;
-            local ??= sym.Name;
+            for (int i = 0; i < fieldOrder.Length; i++)
+            {
+                if (!producers.Fields.TryGetValue(fieldOrder[i], out var values))
+                    continue;
+                List<(string Name, string Version)> merged = fields[i];
+                foreach (var entry in values)
+                {
+                    if (!ContainsName(merged, entry.Name))
+                        merged.Add(entry);
+                }
+            }
         }
-        return local;
+
+        var result = new ProducersSection();
+        for (int i = 0; i < fieldOrder.Length; i++)
+        {
+            if (fields[i].Count > 0)
+                result.Fields[fieldOrder[i]] = fields[i];
+        }
+
+        return result.Fields.Count == 0 ? null : result;
+
+        static bool ContainsName(List<(string Name, string Version)> entries, string name)
+        {
+            foreach (var entry in entries)
+            {
+                if (entry.Name == name)
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The names of the file's defined functions or globals (by index past the imports) as LLVM's object reader gives
+    /// them: the first symbol in the symbol table that defines each, whatever its binding (so a static alias declared
+    /// first names a function its global alias also defines), and regardless of resolution (a discarded COMDAT copy
+    /// kept by --no-gc-sections keeps its own name).
+    /// </summary>
+    private static string?[] FirstDefiningNames(ObjFile file, SymbolType type, uint imports, int count)
+    {
+        var names = new string?[count];
+        var named = new bool[count];
+        foreach (WasmSymbol sym in file.Module.LinkingSection!.Symbols)
+        {
+            if (sym.Type != type || (sym.Flags & SymbolFlags.Undefined) != 0 || sym.Index is not int symbolIndex)
+                continue;
+            long index = (long)symbolIndex - imports;
+            if (index < 0 || index >= count || named[index])
+                continue;
+            named[index] = true;
+            names[index] = sym.Name;
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// wasm-ld's <c>maybeDemangleSymbol</c>, as the UTF-8 it writes: <c>__main_argc_argv</c> (the mangled
+    /// <c>main(argc, argv)</c>) reads as <c>main</c>, and other names are demangled unless <c>--no-demangle</c>.
+    /// </summary>
+    [return: System.Diagnostics.CodeAnalysis.NotNullIfNotNull(nameof(name))]
+    private byte[]? DisplayName(string? name) => name switch
+    {
+        null => null,
+        "__main_argc_argv" => s_mainUtf8,
+        _ => _options.Demangle ? Demangling.Demangler.DemangleToUtf8(name) : System.Text.Encoding.UTF8.GetBytes(name),
+    };
+
+    private static byte[] Concat(ReadOnlySpan<byte> prefix, byte[] name)
+    {
+        var result = new byte[prefix.Length + name.Length];
+        prefix.CopyTo(result);
+        name.CopyTo(result.AsSpan(prefix.Length));
+        return result;
     }
 
     private readonly Dictionary<uint, uint> _tableSlotByFunction = [];
@@ -1347,7 +1441,7 @@ internal sealed class ObjectFileLinker
             {
                 int bits = 7 * width;
                 long signedValue = bits < 64 ? (long)(value << (64 - bits)) >> (64 - bits) : (long)value;
-                WasmEncoder.WriteS64Leb(output, signedValue);
+                WasmLeb128.WriteSLeb128(output, signedValue);
             }
             else
             {
@@ -1455,14 +1549,14 @@ internal sealed class ObjectFileLinker
                 RelocationEngine.WritePaddedLeb128S32(buffer, at, unchecked((int)(uint)value));
                 break;
             case RelocationType.R_WASM_MEMORY_ADDR_LEB64:
-                WritePaddedLeb(buffer, at, value, signed: false);
+                WasmLeb128.WritePaddedULeb128(buffer.AsSpan(at, WasmLeb128.PaddedLength64), value);
                 break;
             case RelocationType.R_WASM_TABLE_INDEX_SLEB64:
             case RelocationType.R_WASM_TABLE_INDEX_REL_SLEB64:
             case RelocationType.R_WASM_MEMORY_ADDR_SLEB64:
             case RelocationType.R_WASM_MEMORY_ADDR_TLS_SLEB64:
             case RelocationType.R_WASM_MEMORY_ADDR_REL_SLEB64:
-                WritePaddedLeb(buffer, at, value, signed: true);
+                WasmLeb128.WritePaddedSLeb128(buffer.AsSpan(at, WasmLeb128.PaddedLength64), unchecked((long)value));
                 break;
             case RelocationType.R_WASM_TABLE_INDEX_I32:
             case RelocationType.R_WASM_MEMORY_ADDR_I32:
@@ -1482,17 +1576,6 @@ internal sealed class ObjectFileLinker
             default:
                 throw new LinkerException($"Relocation type {type} cannot be patched.");
         }
-    }
-
-    /// <summary>Writes a ten-byte padded (S)LEB128, the width the 64-bit relocation types reserve.</summary>
-    private static void WritePaddedLeb(byte[] buffer, int at, ulong value, bool signed)
-    {
-        for (int i = 0; i < 9; i++)
-        {
-            buffer[at + i] = (byte)((value & 0x7F) | 0x80);
-            value = signed ? (ulong)((long)value >> 7) : value >> 7;
-        }
-        buffer[at + 9] = (byte)(value & 0x7F);
     }
 
     // ── Memory layout ─────────────────────────────────────────────────────────
@@ -1819,15 +1902,15 @@ internal sealed class ObjectFileLinker
         {
             if (!sym.HasOutIndex)
                 continue;
-            body.WriteByte(0x10);
-            WasmEncoder.WriteU32Leb(body, sym.OutIndex);
+            body.WriteByte(WasmOpcode.Call);
+            WasmLeb128.WriteULeb128(body, sym.OutIndex);
             FuncType type = FunctionTypeOf(sym);
             if (type.Parameters.Length != 0)
                 throw new LinkerException($"Constructor '{sym.Name}' takes parameters.");
             for (int i = 0; i < type.Results.Length; i++)
-                body.WriteByte(0x1A);
+                body.WriteByte(WasmOpcode.Drop);
         }
-        body.WriteByte(0x0B);
+        body.WriteByte(WasmOpcode.End);
         return new WasmFunction { TypeIndex = TypeIndexOf(s_voidType), Locals = [], Body = body.ToArray() };
     }
 
@@ -1846,24 +1929,24 @@ internal sealed class ObjectFileLinker
         {
             if (!segment.IsBss || segment.Size == 0)
                 continue;
-            body.WriteByte(0x41);
-            WasmEncoder.WriteS32Leb(body, unchecked((int)segment.Address));
-            body.WriteByte(0x41);
+            body.WriteByte(WasmOpcode.I32Const);
+            WasmLeb128.WriteSLeb128(body, unchecked((int)segment.Address));
+            body.WriteByte(WasmOpcode.I32Const);
             body.WriteByte(0x00);
-            body.WriteByte(0x41);
-            WasmEncoder.WriteS32Leb(body, unchecked((int)segment.Size));
-            body.Write([0xFC, 0x0B, 0x00]);
+            body.WriteByte(WasmOpcode.I32Const);
+            WasmLeb128.WriteSLeb128(body, unchecked((int)segment.Size));
+            body.Write([WasmOpcode.MiscPrefix, 0x0B, 0x00]); // memory.fill, memory 0
         }
-        body.WriteByte(0x0B);
+        body.WriteByte(WasmOpcode.End);
         return new WasmFunction { TypeIndex = TypeIndexOf(s_voidType), Locals = [], Body = body.ToArray() };
     }
 
     private static byte[] ConstI32(uint value)
     {
         using var stream = new MemoryStream(7);
-        stream.WriteByte(0x41);
-        WasmEncoder.WriteS32Leb(stream, unchecked((int)value));
-        stream.WriteByte(0x0B);
+        stream.WriteByte(WasmOpcode.I32Const);
+        WasmLeb128.WriteSLeb128(stream, unchecked((int)value));
+        stream.WriteByte(WasmOpcode.End);
         return stream.ToArray();
     }
 
@@ -1896,12 +1979,12 @@ internal sealed class ObjectFileLinker
         // Function code offsets as DWARF sees them: the locals vector of each body in the output code section.
         IReadOnlyList<SectionMerger.EncodedFunctionBody> encoded = SectionMerger.EncodeFunctionBodies(functions, null);
         var codeOffsets = new uint[encoded.Count];
-        uint offset = LebLength((uint)encoded.Count);
+        uint offset = (uint)WasmLeb128.GetULeb128Size((uint)encoded.Count);
         for (int i = 0; i < encoded.Count; i++)
         {
             uint length = (uint)encoded[i].Bytes.Length;
-            codeOffsets[i] = offset + LebLength(length);
-            offset += LebLength(length) + length;
+            codeOffsets[i] = offset + (uint)WasmLeb128.GetULeb128Size(length);
+            offset += (uint)WasmLeb128.GetULeb128Size(length) + length;
         }
 
         // Each file's contribution offset within each combined section. String sections are merged instead (as
@@ -2037,52 +2120,62 @@ internal sealed class ObjectFileLinker
         }
 
         using var content = new MemoryStream();
-        WasmEncoder.WriteU32Leb(content, (uint)used.Count);
+        WasmLeb128.WriteULeb128(content, (uint)used.Count);
         foreach (string name in used)
         {
             content.WriteByte((byte)'+');
             byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(name);
-            WasmEncoder.WriteU32Leb(content, (uint)utf8.Length);
+            WasmLeb128.WriteULeb128(content, (uint)utf8.Length);
             content.Write(utf8);
         }
         return new CustomSection("target_features", content.ToArray());
     }
 
-    private static uint LebLength(uint value)
-    {
-        uint length = 1;
-        while ((value >>= 7) != 0)
-            length++;
-        return length;
-    }
-
-    private static CustomSection BuildNameSection(List<string?> functionNames, List<string?> globalNames, List<string> segmentNames)
+    private static CustomSection BuildNameSection(string? moduleName, List<byte[]?> functionNames, List<byte[]?> globalNames, List<byte[]?> segmentNames)
     {
         using var content = new MemoryStream();
-        WriteNameMap(content, 1, functionNames);
-        WriteNameMap(content, 7, globalNames);
-        WriteNameMap(content, 9, [.. segmentNames]);
+        if (moduleName is not null)
+        {
+            // wasm-ld always writes the module name subsection first (--soname, or else the output file's name).
+            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(moduleName);
+            using var body = new MemoryStream();
+            WasmLeb128.WriteULeb128(body, (uint)utf8.Length);
+            body.Write(utf8);
+            content.WriteByte((byte)NameSubsectionId.Module);
+            WasmLeb128.WriteULeb128(content, (uint)body.Length);
+            body.Position = 0;
+            body.CopyTo(content);
+        }
+
+        WriteNameMap(content, NameSubsectionId.Function, functionNames);
+        WriteNameMap(content, NameSubsectionId.Global, globalNames);
+        WriteNameMap(content, NameSubsectionId.DataSegment, segmentNames);
         return new CustomSection("name", content.ToArray());
     }
 
-    private static void WriteNameMap(Stream output, byte subsection, List<string?> names)
+    private static void WriteNameMap(Stream output, NameSubsectionId subsection, List<byte[]?> names)
     {
-        int count = names.Count(static n => n is not null);
+        int count = 0;
+        foreach (byte[]? name in names)
+        {
+            if (name is not null)
+                count++;
+        }
+
         if (count == 0)
             return;
         using var body = new MemoryStream();
-        WasmEncoder.WriteU32Leb(body, (uint)count);
+        WasmLeb128.WriteULeb128(body, (uint)count);
         for (int i = 0; i < names.Count; i++)
         {
-            if (names[i] is not string name)
+            if (names[i] is not byte[] name)
                 continue;
-            WasmEncoder.WriteU32Leb(body, (uint)i);
-            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(name);
-            WasmEncoder.WriteU32Leb(body, (uint)utf8.Length);
-            body.Write(utf8);
+            WasmLeb128.WriteULeb128(body, (uint)i);
+            WasmLeb128.WriteULeb128(body, (uint)name.Length);
+            body.Write(name);
         }
-        output.WriteByte(subsection);
-        WasmEncoder.WriteU32Leb(output, (uint)body.Length);
+        output.WriteByte((byte)subsection);
+        WasmLeb128.WriteULeb128(output, (uint)body.Length);
         body.Position = 0;
         body.CopyTo(output);
     }
@@ -2091,10 +2184,11 @@ internal sealed class ObjectFileLinker
     {
         foreach (ObjFile file in _files)
         {
+            string?[] definedFunctionNames = FirstDefiningNames(file, SymbolType.Function, file.FuncImports, file.FuncLive.Length);
             for (int f = 0; f < file.FuncLive.Length; f++)
             {
                 if (!file.FuncLive[f])
-                    Console.Error.WriteLine($"removing unused section {file.Name}:(function {FunctionName(file, file.FuncImports + (uint)f) ?? f.ToString(System.Globalization.CultureInfo.InvariantCulture)})");
+                    Console.Error.WriteLine($"removing unused section {file.Name}:(function {definedFunctionNames[f] ?? f.ToString(System.Globalization.CultureInfo.InvariantCulture)})");
             }
             List<SegmentInfo> infos = file.Module.LinkingSection!.SegmentInfos;
             for (int s = 0; s < file.SegLive.Length; s++)

@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
 /// Reduces a WASI adapter module (such as <c>wasi_snapshot_preview1.command.wasm</c>) to the exports a component
@@ -32,19 +33,19 @@ internal static class AdapterModule
             byte id = r.ReadByte();
             CtReader body = r.Sub(checked((int)r.ReadU32()));
             int start = body.Position;
-            string name = id == 0 ? body.ReadName() : "";
-            body.Position = id == 0 ? body.Position : start;
+            string name = id == (byte)WasmSectionId.Custom ? body.ReadName() : "";
+            body.Position = id == (byte)WasmSectionId.Custom ? body.Position : start;
             var payload = adapter[body.Position..body.End];
             sections.Add((id, payload, name));
         }
 
-        byte[]? Section(byte id) => sections.FirstOrDefault(s => s.Id == id).Payload;
-        if (Section(9) is not null || Section(11) is { Length: > 1 })
+        byte[]? Section(WasmSectionId id) => sections.FirstOrDefault(s => s.Id == (byte)id).Payload;
+        if (Section(WasmSectionId.Element) is not null || Section(WasmSectionId.Data) is { Length: > 1 })
             throw new NotSupportedException("adapter modules with element or data segments are not supported.");
 
         // ── Index spaces ──
         var types = new List<(byte[] Params, byte[] Results)>();
-        if (Section(1) is { } typeSection)
+        if (Section(WasmSectionId.Type) is { } typeSection)
         {
             var tr = new CtReader(typeSection);
             uint count = tr.ReadU32();
@@ -58,7 +59,7 @@ internal static class AdapterModule
 
         var funcImports = new List<FuncImport>();
         var otherImports = new List<byte[]>();
-        if (Section(2) is { } importSection)
+        if (Section(WasmSectionId.Import) is { } importSection)
         {
             var ir = new CtReader(importSection);
             uint count = ir.ReadU32();
@@ -68,7 +69,7 @@ internal static class AdapterModule
                 string module = ir.ReadName();
                 string field = ir.ReadName();
                 byte kind = ir.ReadByte();
-                if (kind == 0x00)
+                if (kind == (byte)CoreSort.Func)
                 {
                     funcImports.Add(new FuncImport(module, field, ir.ReadU32()));
                     continue;
@@ -80,7 +81,7 @@ internal static class AdapterModule
         }
 
         var localTypes = new List<uint>();
-        if (Section(3) is { } funcSection)
+        if (Section(WasmSectionId.Function) is { } funcSection)
         {
             var fr = new CtReader(funcSection);
             uint count = fr.ReadU32();
@@ -89,7 +90,7 @@ internal static class AdapterModule
         }
 
         var bodies = new List<byte[]>();
-        if (Section(10) is { } codeSection)
+        if (Section(WasmSectionId.Code) is { } codeSection)
         {
             var cr = new CtReader(codeSection);
             uint count = cr.ReadU32();
@@ -102,7 +103,7 @@ internal static class AdapterModule
         }
 
         var exports = new List<(string Name, byte Kind, uint Index)>();
-        if (Section(7) is { } exportSection)
+        if (Section(WasmSectionId.Export) is { } exportSection)
         {
             var er = new CtReader(exportSection);
             uint count = er.ReadU32();
@@ -119,10 +120,10 @@ internal static class AdapterModule
         exports.RemoveAll(e => !required.Contains(e.Name));
         if (exports.Any(e => e.Kind is not (0x00 or 0x03)))
             throw new NotSupportedException("adapter modules may only export functions and globals.");
-        if (Section(8) is not null)
+        if (Section(WasmSectionId.Start) is not null)
             throw new NotSupportedException("adapter modules with a start function are not supported.");
 
-        var (stackPointer, allocationState) = FindStackGlobals(sections.FirstOrDefault(s => s.Id == 0 && s.Name == "name").Payload);
+        var (stackPointer, allocationState) = FindStackGlobals(sections.FirstOrDefault(s => s.Id == (byte)WasmSectionId.Custom && s.Name == "name").Payload);
 
         // ── Liveness ──
         int importCount = funcImports.Count;
@@ -134,7 +135,7 @@ internal static class AdapterModule
                 work.Push(f);
         }
 
-        foreach (var e in exports.Where(e => e.Kind == 0x00))
+        foreach (var e in exports.Where(e => e.Kind == (byte)CoreSort.Func))
             Mark(e.Index);
         while (work.Count > 0)
         {
@@ -193,7 +194,7 @@ internal static class AdapterModule
 
         // Synthesized bodies already use new indices and are not remapped.
         var newLocals = new List<(uint Type, byte[]? Body, bool Exported, bool Synthesized)>();
-        var exportedFuncs = exports.Where(e => e.Kind == 0x00).Select(e => e.Index).ToHashSet();
+        var exportedFuncs = exports.Where(e => e.Kind == (byte)CoreSort.Func).Select(e => e.Index).ToHashSet();
         uint next = (uint)newImports.Count;
         for (int i = 0; i < bodies.Count; i++)
         {
@@ -229,7 +230,7 @@ internal static class AdapterModule
         // ── Encode ──
         var w = new CtWriter();
         w.Bytes([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]);
-        w.Section(1, s =>
+        w.Section(WasmSectionId.Type, s =>
         {
             s.U32((uint)types.Count);
             foreach (var (p, res) in types)
@@ -241,7 +242,7 @@ internal static class AdapterModule
                 s.Bytes(res);
             }
         });
-        w.Section(2, s =>
+        w.Section(WasmSectionId.Import, s =>
         {
             s.U32((uint)(otherImports.Count + newImports.Count));
             foreach (byte[] other in otherImports)
@@ -254,31 +255,31 @@ internal static class AdapterModule
                 s.U32(import.Type);
             }
         });
-        w.Section(3, s =>
+        w.Section(WasmSectionId.Function, s =>
         {
             s.U32((uint)newLocals.Count);
             foreach (var local in newLocals)
                 s.U32(local.Type);
         });
-        if (Section(4) is { } tables)
-            w.Section(4, s => s.Bytes(tables));
-        if (Section(5) is { } memories)
-            w.Section(5, s => s.Bytes(memories));
-        if (Section(6) is { } globals)
-            w.Section(6, s => s.Bytes(globals));
-        w.Section(7, s =>
+        if (Section(WasmSectionId.Table) is { } tables)
+            w.Section(WasmSectionId.Table, s => s.Bytes(tables));
+        if (Section(WasmSectionId.Memory) is { } memories)
+            w.Section(WasmSectionId.Memory, s => s.Bytes(memories));
+        if (Section(WasmSectionId.Global) is { } globals)
+            w.Section(WasmSectionId.Global, s => s.Bytes(globals));
+        w.Section(WasmSectionId.Export, s =>
         {
             s.U32((uint)exports.Count);
             foreach (var (name, kind, index) in exports)
             {
                 s.Name(name);
                 s.Byte(kind);
-                s.U32(kind == 0x00 ? map[index] : index);
+                s.U32(kind == (byte)CoreSort.Func ? map[index] : index);
             }
         });
         if (allocateStack is { } startFunction && !lazy)
-            w.Section(8, s => s.U32(startFunction));
-        w.Section(10, s =>
+            w.Section(WasmSectionId.Start, s => s.U32(startFunction));
+        w.Section(WasmSectionId.Code, s =>
         {
             s.U32((uint)newLocals.Count);
             foreach (var (_, body, exported, synthesized) in newLocals)
@@ -288,9 +289,9 @@ internal static class AdapterModule
                 s.Bytes(rewritten);
             }
         });
-        foreach (var custom in sections.Where(s => s.Id == 0 && s.Name == "producers"))
+        foreach (var custom in sections.Where(s => s.Id == (byte)WasmSectionId.Custom && s.Name == "producers"))
         {
-            w.Section(0, s =>
+            w.Section(WasmSectionId.Custom, s =>
             {
                 s.Name(custom.Name);
                 s.Bytes(custom.Payload);
@@ -345,7 +346,7 @@ internal static class AdapterModule
         {
             byte id = r.ReadByte();
             CtReader sub = r.Sub(checked((int)r.ReadU32()));
-            if (id != 7)
+            if (id != (byte)NameSubsectionId.Global)
                 continue;
             uint count = sub.ReadU32();
             for (uint i = 0; i < count; i++)
@@ -377,7 +378,7 @@ internal static class AdapterModule
         return r.Position;
     }
 
-    private static bool IsFunctionReference(byte opcode) => opcode is 0x10 or 0x12 or 0xD2;
+    private static bool IsFunctionReference(byte opcode) => opcode is WasmOpcode.Call or WasmOpcode.ReturnCall or WasmOpcode.RefFunc;
 
     private static List<uint> ReferencedFunctions(byte[] body)
     {

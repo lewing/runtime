@@ -5,6 +5,7 @@ namespace Microsoft.NET.WebAssembly.Binary;
 
 using System.Collections.Generic;
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>One source-line entry to encode into a DWARF .debug_line section.</summary>
 public readonly record struct DwarfLineEntry(
@@ -30,19 +31,6 @@ public static class DwarfLineWriter
     // Standard opcode lengths for opcodes 1–12 (DWARF spec §6.2.5.3)
     private static readonly byte[] StdOpcodeLengths =
         [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
-
-    // DW_LNS standard opcodes used in output
-    private const byte DW_LNS_copy             = 1;
-    private const byte DW_LNS_advance_pc       = 2;
-    private const byte DW_LNS_advance_line     = 3;
-    private const byte DW_LNS_set_file         = 4;
-    private const byte DW_LNS_set_column       = 5;
-    private const byte DW_LNS_negate_stmt      = 6;
-    private const byte DW_LNS_set_prologue_end = 10;
-
-    // DW_LNE extended opcodes
-    private const byte DW_LNE_end_sequence = 1;
-    private const byte DW_LNE_set_address  = 2;
 
     /// <summary>
     /// Emits a DWARF v4 .debug_line section from the given source line entries.
@@ -128,7 +116,7 @@ public static class DwarfLineWriter
             // Emit is_stmt toggle if needed
             if (entry.IsStatement != curIsStmt)
             {
-                buf.Add(DW_LNS_negate_stmt);
+                buf.Add(DwLns.NegateStmt);
                 curIsStmt = !curIsStmt;
             }
 
@@ -136,7 +124,7 @@ public static class DwarfLineWriter
             uint fileIdx = fileToIndex[entry.FileName];
             if (fileIdx != curFileIdx)
             {
-                buf.Add(DW_LNS_set_file);
+                buf.Add(DwLns.SetFile);
                 WriteUleb128(buf, fileIdx);
                 curFileIdx = fileIdx;
             }
@@ -144,14 +132,14 @@ public static class DwarfLineWriter
             // Emit column change
             if (entry.Column != curColumn)
             {
-                buf.Add(DW_LNS_set_column);
+                buf.Add(DwLns.SetColumn);
                 WriteUleb128(buf, (uint)entry.Column);
                 curColumn = entry.Column;
             }
 
             // Emit prologue_end marker
             if (entry.PrologueEnd)
-                buf.Add(DW_LNS_set_prologue_end);
+                buf.Add(DwLns.SetPrologueEnd);
 
             // Resolve address delta — use DW_LNE_set_address for the first row
             // or whenever the address moves backward (non-monotonic).
@@ -186,7 +174,7 @@ public static class DwarfLineWriter
             // Special opcode doesn't fit; advance the PC separately first.
             if (addrDelta > 0)
             {
-                buf.Add(DW_LNS_advance_pc);
+                buf.Add(DwLns.AdvancePc);
                 WriteUleb128(buf, addrDelta);
                 curAddress = entry.Address;
             }
@@ -201,17 +189,17 @@ public static class DwarfLineWriter
             else
             {
                 // Line delta is out of special-opcode range; use standard opcodes.
-                buf.Add(DW_LNS_advance_line);
+                buf.Add(DwLns.AdvanceLine);
                 WriteSleb128(buf, lineDelta);
                 curLine = entry.Line;
-                buf.Add(DW_LNS_copy);
+                buf.Add(DwLns.Copy);
             }
         }
 
         // End the sequence.
         buf.Add(0);                        // extended opcode marker
         WriteUleb128(buf, 1);              // operand length = 1
-        buf.Add(DW_LNE_end_sequence);
+        buf.Add(DwLne.EndSequence);
     }
 
     /// Emits DW_LNE_set_address for a 4-byte (wasm32) address.
@@ -219,7 +207,7 @@ public static class DwarfLineWriter
     {
         buf.Add(0);                        // extended opcode marker
         WriteUleb128(buf, 5);              // length: 1 (extOp) + 4 (address)
-        buf.Add(DW_LNE_set_address);
+        buf.Add(DwLne.SetAddress);
         WriteU32LE(buf, address);
     }
 
@@ -227,26 +215,14 @@ public static class DwarfLineWriter
 
     private static void WriteUleb128(List<byte> buf, uint value)
     {
-        do
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            if (value != 0) b |= 0x80;
-            buf.Add(b);
-        } while (value != 0);
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength32];
+        buf.AddRange(encoded[..WasmLeb128.WriteULeb128(encoded, value)]);
     }
 
     private static void WriteSleb128(List<byte> buf, int value)
     {
-        bool more;
-        do
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            more = !((value == 0 && (b & 0x40) == 0) || (value == -1 && (b & 0x40) != 0));
-            if (more) b |= 0x80;
-            buf.Add(b);
-        } while (more);
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength32];
+        buf.AddRange(encoded[..WasmLeb128.WriteSLeb128(encoded, value)]);
     }
 
     // ── Little-endian write helpers ───────────────────────────────────────────

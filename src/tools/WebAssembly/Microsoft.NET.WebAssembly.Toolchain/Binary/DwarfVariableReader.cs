@@ -3,6 +3,8 @@
 
 namespace Microsoft.NET.WebAssembly.Binary;
 
+using Microsoft.NET.WebAssembly.Binary.Writing;
+
 /// <summary>A DWARF variable or parameter mapped to a wasm local index.</summary>
 public sealed record DwarfVariable(string Name, string TypeName, int WasmLocalIndex, bool IsParameter);
 
@@ -22,20 +24,6 @@ public enum WasmLocationKind : byte
 /// </summary>
 public static class DwarfVariableReader
 {
-    // DWARF tags
-    private const ushort DW_TAG_compile_unit = 0x11;
-    private const ushort DW_TAG_subprogram = 0x2e;
-    private const ushort DW_TAG_formal_parameter = 0x05;
-    private const ushort DW_TAG_variable = 0x34;
-
-    // DWARF attributes
-    private const ushort DW_AT_name = 0x03;
-    private const ushort DW_AT_low_pc = 0x11;
-    private const ushort DW_AT_location = 0x02;
-
-    // Wasm DWARF extension
-    private const byte DW_OP_WASM_location = 0xED;
-
     /// <summary>
     /// Read DWARF variable/parameter entries for a given function.
     /// Returns variable-to-local mappings for the function at the given index.
@@ -217,11 +205,11 @@ public static class DwarfVariableReader
         for (int i = 0; i < dies.Count; i++)
         {
             var die = dies[i];
-            if (die.Tag != DW_TAG_subprogram)
+            if (die.Tag != DwTag.Subprogram)
                 continue;
 
             // Match by DW_AT_low_pc — resolve through range map if available
-            if (!die.Attributes.TryGetValue(DW_AT_low_pc, out var lowPcObj) || lowPcObj is not long lowPc)
+            if (!die.Attributes.TryGetValue(DwAt.LowPc, out var lowPcObj) || lowPcObj is not long lowPc)
                 continue;
 
             if (!SubprogramMatches(lowPc, funcIndex, funcRanges, fallback).Matched)
@@ -235,17 +223,17 @@ public static class DwarfVariableReader
                 if (child.Depth <= die.Depth) break;
                 if (child.Depth != die.Depth + 1) continue;
 
-                bool isParam = child.Tag == DW_TAG_formal_parameter;
-                bool isVar = child.Tag == DW_TAG_variable;
+                bool isParam = child.Tag == DwTag.FormalParameter;
+                bool isVar = child.Tag == DwTag.Variable;
                 if (!isParam && !isVar) continue;
 
-                string? name = child.Attributes.TryGetValue(DW_AT_name, out var nameObj)
+                string? name = child.Attributes.TryGetValue(DwAt.Name, out var nameObj)
                     ? nameObj?.ToString() : null;
                 if (string.IsNullOrEmpty(name)) continue;
 
                 // Parse DW_AT_location for DW_OP_WASM_location
                 int wasmLocalIndex = -1;
-                if (child.Attributes.TryGetValue(DW_AT_location, out var locObj) && locObj is byte[] locBytes)
+                if (child.Attributes.TryGetValue(DwAt.Location, out var locObj) && locObj is byte[] locBytes)
                 {
                     wasmLocalIndex = ParseWasmLocation(locBytes);
                 }
@@ -339,8 +327,8 @@ public static class DwarfVariableReader
         int count = 0;
         foreach (var die in dies)
         {
-            if (die.Tag != DW_TAG_subprogram) continue;
-            if (!die.Attributes.TryGetValue(DW_AT_low_pc, out var lowPcObj) || lowPcObj is not long lowPc) continue;
+            if (die.Tag != DwTag.Subprogram) continue;
+            if (!die.Attributes.TryGetValue(DwAt.LowPc, out var lowPcObj) || lowPcObj is not long lowPc) continue;
             if (SubprogramMatches(lowPc, funcIndex, funcRanges, fallback: true).Matched)
                 count++;
         }
@@ -362,11 +350,6 @@ public static class DwarfVariableReader
     // unrecognized trailing opcodes — is reported as Unknown rather than guessed.
     // Strictly additive: new public types + method; the legacy ReadVariables /
     // DwarfVariable API is untouched.
-
-    private const ushort DW_AT_frame_base = 0x40;
-    private const byte DW_OP_addr = 0x03;
-    private const byte DW_OP_fbreg = 0x91;
-    private const byte DW_OP_stack_value = 0x9F;
 
     /// <summary>How a DWARF variable is located.</summary>
     public enum DwarfVarLocationKind
@@ -533,8 +516,8 @@ public static class DwarfVariableReader
             long cuBaseLowPc = 0;
             foreach (var d in dies)
             {
-                if (d.Tag != DW_TAG_compile_unit) continue;
-                if (d.Attributes.TryGetValue(DW_AT_low_pc, out var cuLowObj) && cuLowObj is long cuLow)
+                if (d.Tag != DwTag.CompileUnit) continue;
+                if (d.Attributes.TryGetValue(DwAt.LowPc, out var cuLowObj) && cuLowObj is long cuLow)
                     cuBaseLowPc = cuLow;
                 break;
             }
@@ -577,9 +560,9 @@ public static class DwarfVariableReader
         for (int i = 0; i < dies.Count; i++)
         {
             var die = dies[i];
-            if (die.Tag != DW_TAG_subprogram)
+            if (die.Tag != DwTag.Subprogram)
                 continue;
-            if (!die.Attributes.TryGetValue(DW_AT_low_pc, out var lowPcObj) || lowPcObj is not long lowPc)
+            if (!die.Attributes.TryGetValue(DwAt.LowPc, out var lowPcObj) || lowPcObj is not long lowPc)
                 continue;
 
             var match = SubprogramMatches(lowPc, funcIndex, funcRanges, fallback);
@@ -587,7 +570,7 @@ public static class DwarfVariableReader
                 continue;
 
             int frameBaseLocal = -1;
-            if (die.Attributes.TryGetValue(DW_AT_frame_base, out var fbObj) && fbObj is byte[] fbBytes)
+            if (die.Attributes.TryGetValue(DwAt.FrameBase, out var fbObj) && fbObj is byte[] fbBytes)
                 frameBaseLocal = ParseWasmLocation(fbBytes); // -1 if not DW_OP_WASM_location(Local)
 
             // Address-space selection for location-list (.debug_loc) resolution. Loclist
@@ -622,11 +605,11 @@ public static class DwarfVariableReader
                 if (child.Depth <= die.Depth) break;
                 if (child.Depth != die.Depth + 1) continue;
 
-                bool isParam = child.Tag == DW_TAG_formal_parameter;
-                bool isVar = child.Tag == DW_TAG_variable;
+                bool isParam = child.Tag == DwTag.FormalParameter;
+                bool isVar = child.Tag == DwTag.Variable;
                 if (!isParam && !isVar) continue;
 
-                string? name = child.Attributes.TryGetValue(DW_AT_name, out var nameObj)
+                string? name = child.Attributes.TryGetValue(DwAt.Name, out var nameObj)
                     ? nameObj?.ToString() : null;
                 if (string.IsNullOrEmpty(name)) continue;
 
@@ -635,7 +618,7 @@ public static class DwarfVariableReader
                 // DW_FORM_sec_offset/data4/data8) into .debug_loc — a location LIST.
                 DwarfVarLocationKind kind = DwarfVarLocationKind.Unknown;
                 long value = 0L;
-                if (child.Attributes.TryGetValue(DW_AT_location, out var locObj))
+                if (child.Attributes.TryGetValue(DwAt.Location, out var locObj))
                 {
                     if (locObj is byte[] locBytes)
                         (kind, value) = ParseLocationExpression(locBytes, addrSize);
@@ -673,26 +656,26 @@ public static class DwarfVariableReader
 
         switch (op)
         {
-            case DW_OP_WASM_location:
+            case DwOp.WasmLocation:
             {
                 if (p >= loc.Length) return (DwarfVarLocationKind.Unknown, 0);
                 var wkind = (WasmLocationKind)loc[p++];
                 if (wkind != WasmLocationKind.Local) return (DwarfVarLocationKind.Unknown, 0);
-                if (!TryReadULeb128(loc, ref p, out ulong idx)) return (DwarfVarLocationKind.Unknown, 0);
+                if (!WasmLeb128.TryReadUnboundedU64(loc, ref p, out ulong idx)) return (DwarfVarLocationKind.Unknown, 0);
                 kind = DwarfVarLocationKind.WasmLocal;
                 value = (long)idx;
                 break;
             }
 
-            case DW_OP_fbreg:
+            case DwOp.Fbreg:
             {
-                if (!TryReadSleb128(loc, ref p, out long off)) return (DwarfVarLocationKind.Unknown, 0);
+                if (!WasmLeb128.TryReadUnboundedS64(loc, ref p, out long off)) return (DwarfVarLocationKind.Unknown, 0);
                 kind = DwarfVarLocationKind.FrameBaseOffset;
                 value = off;
                 break;
             }
 
-            case DW_OP_addr:
+            case DwOp.Addr:
             {
                 if (p + addrSize > loc.Length) return (DwarfVarLocationKind.Unknown, 0);
                 if (addrSize == 8) { value = (long)DwarfReaderHelpers.ReadU64LE(loc, p); p += 8; }
@@ -713,7 +696,7 @@ public static class DwarfVariableReader
         // meaning to "value == frame_base+X / == addr" (not stored AT that address),
         // which we don't model as FrameBaseOffset/MemoryAddress — leave it as the
         // leftover byte so the completeness check below yields Unknown.
-        if (p < loc.Length && loc[p] == DW_OP_stack_value && kind == DwarfVarLocationKind.WasmLocal)
+        if (p < loc.Length && loc[p] == DwOp.StackValue && kind == DwarfVarLocationKind.WasmLocal)
             p++;
 
         // The whole expression must be consumed. Anything left over means a
@@ -791,47 +774,11 @@ public static class DwarfVariableReader
     }
 
     /// <summary>Read an unsigned little-endian address of <paramref name="addrSize"/> bytes as a long.</summary>
-    private static long ReadAddr(byte[] d, ref int p, byte addrSize)
+    private static long ReadAddr(ReadOnlySpan<byte> d, ref int p, byte addrSize)
     {
         long v = addrSize == 8 ? (long)DwarfReaderHelpers.ReadU64LE(d, p) : DwarfReaderHelpers.ReadU32LE(d, p);
         p += addrSize;
         return v;
-    }
-
-    /// <summary>Read a ULEB128, returning false if the operand is truncated (runs off the end).</summary>
-    private static bool TryReadULeb128(byte[] d, ref int p, out ulong value)
-    {
-        value = 0;
-        int shift = 0;
-        while (true)
-        {
-            if (p >= d.Length) return false;
-            byte b = d[p++];
-            value |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return true;
-            shift += 7;
-            if (shift >= 64) return false;
-        }
-    }
-
-    /// <summary>Read a SLEB128, returning false if the operand is truncated (runs off the end).</summary>
-    private static bool TryReadSleb128(byte[] d, ref int p, out long value)
-    {
-        value = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            if (p >= d.Length) return false;
-            b = d[p++];
-            value |= (long)(b & 0x7F) << shift;
-            shift += 7;
-            if (shift > 64) return false;
-        } while ((b & 0x80) != 0);
-
-        if (shift < 64 && (b & 0x40) != 0)
-            value |= -(1L << shift);
-        return true;
     }
 
     /// <summary>
@@ -843,7 +790,7 @@ public static class DwarfVariableReader
     {
         if (locBytes.Length < 3) return -1;
 
-        if (locBytes[0] != DW_OP_WASM_location) return -1;
+        if (locBytes[0] != DwOp.WasmLocation) return -1;
 
         var kind = (WasmLocationKind)locBytes[1];
         if (kind != WasmLocationKind.Local) return -1;

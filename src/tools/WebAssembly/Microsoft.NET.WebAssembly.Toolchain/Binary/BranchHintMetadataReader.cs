@@ -214,7 +214,7 @@ internal static class BranchHintMetadataReader
                         encodedHint.Offset);
                 }
 
-                if (target.Opcode is not 0x04 and not 0x0D)
+                if (target.Opcode is not WasmOpcode.If and not WasmOpcode.BrIf)
                 {
                     throw new MetadataReadException(
                         WasmMetadataErrorKind.Invalid,

@@ -6,6 +6,7 @@ namespace Microsoft.NET.WebAssembly.Linker;
 using System.Collections.Generic;
 using System.IO;
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Wat;
 
@@ -100,19 +101,19 @@ internal static class ConstExprScanner
 
             switch (opcode)
             {
-                case 0x0B:
+                case WasmOpcode.End:
                     return output.ToArray();
-                case 0x41:
-                case 0x42:
+                case WasmOpcode.I32Const:
+                case WasmOpcode.I64Const:
                     CopyLebImmediate(expr, ref offset, output);
                     break;
-                case 0xD0:
+                case WasmOpcode.RefNull:
                 {
                     int immediateStart = offset;
                     long original;
                     try
                     {
-                        original = S33Leb128.Read(expr, ref offset);
+                        original = WasmLeb128.ReadS33(expr, ref offset);
                     }
                     catch (WasmFormatException ex)
                     {
@@ -126,29 +127,29 @@ internal static class ConstExprScanner
                     }
                     else
                     {
-                        if (!S33Leb128.IsInRange(rewritten))
+                        if (!WasmLeb128.IsS33(rewritten))
                             throw new LinkerException($"Heap type {rewritten} is outside the signed 33-bit range.");
                         WasmEncoder.WriteS33Leb(output, rewritten);
                     }
                     break;
                 }
-                case 0x43:
+                case WasmOpcode.F32Const:
                     CopyFixed(expr, ref offset, output, 4, "f32.const");
                     break;
-                case 0x44:
+                case WasmOpcode.F64Const:
                     CopyFixed(expr, ref offset, output, 8, "f64.const");
                     break;
-                case 0x23:
+                case WasmOpcode.GlobalGet:
                     WasmEncoder.WriteU32Leb(
                         output,
                         ToIndex(map(OperandKind.GlobalIndex, ReadU32Leb(expr, ref offset))));
                     break;
-                case 0xD2:
+                case WasmOpcode.RefFunc:
                     WasmEncoder.WriteU32Leb(
                         output,
                         ToIndex(map(OperandKind.FunctionIndex, ReadU32Leb(expr, ref offset))));
                     break;
-                case 0xFD:
+                case WasmOpcode.SimdPrefix:
                 {
                     // The reader admits exactly one SIMD constant expression, `v128.const`
                     // (sub-opcode 12), and copying the 16-byte payload after any other sub-opcode
@@ -166,15 +167,15 @@ internal static class ConstExprScanner
                     break;
                 }
 
-                case 0xFB:
+                case WasmOpcode.GcPrefix:
                     RewriteGcConstructor(expr, ref offset, output, map);
                     break;
-                case 0x6A:
-                case 0x6B:
-                case 0x6C:
-                case 0x7C:
-                case 0x7D:
-                case 0x7E:
+                case WasmOpcode.I32Add:
+                case WasmOpcode.I32Sub:
+                case WasmOpcode.I32Mul:
+                case WasmOpcode.I64Add:
+                case WasmOpcode.I64Sub:
+                case WasmOpcode.I64Mul:
                     break;
                 default:
                     throw new LinkerException(
@@ -250,44 +251,26 @@ internal static class ConstExprScanner
             ? (uint)value
             : throw new LinkerException($"Constant-expression index {value} is outside the u32 index space.");
 
-    private static void CopyFixed(byte[] expr, ref int offset, Stream output, int count, string what)
+    private static void CopyFixed(ReadOnlySpan<byte> expr, ref int offset, Stream output, int count, string what)
     {
         if (offset + count > expr.Length)
             throw new LinkerException($"Malformed {what} in const expression.");
-        output.Write(expr, offset, count);
+        output.Write(expr.Slice(offset, count));
         offset += count;
     }
 
-    private static void CopyLebImmediate(byte[] expr, ref int offset, Stream output)
+    private static void CopyLebImmediate(ReadOnlySpan<byte> expr, ref int offset, Stream output)
     {
-        while (offset < expr.Length)
-        {
-            byte b = expr[offset++];
-            output.WriteByte(b);
-            if ((b & 0x80) == 0)
-                return;
-        }
-
-        throw new LinkerException("Truncated LEB128 immediate in const expression.");
+        int start = offset;
+        if (!WasmLeb128.TrySkip(expr, ref offset))
+            throw new LinkerException("Truncated LEB128 immediate in const expression.");
+        output.Write(expr[start..offset]);
     }
 
-    private static uint ReadU32Leb(byte[] expr, ref int offset)
-    {
-        uint result = 0;
-        int shift = 0;
-        while (offset < expr.Length)
-        {
-            byte b = expr[offset++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
-            if (shift >= 35)
-                break;
-        }
-
-        throw new LinkerException("Truncated u32 LEB128 immediate in const expression.");
-    }
+    private static uint ReadU32Leb(ReadOnlySpan<byte> expr, ref int offset)
+        => WasmLeb128.TryReadU32(expr, ref offset, out uint value)
+            ? value
+            : throw new LinkerException("Truncated or malformed u32 LEB128 immediate in const expression.");
 
     /// <summary>
     /// Maps a negative s33 heap-type immediate onto the canonical code for the kind it denotes.

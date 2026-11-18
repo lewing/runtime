@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 
 namespace Microsoft.NET.WebAssembly.Binary;
@@ -63,7 +64,7 @@ internal static class WasmNameSectionReader
     }
 
     /// <summary>Parses raw <c>name</c> custom-section content.</summary>
-    public static NameSectionContents Read(byte[] data)
+    public static NameSectionContents Read(ReadOnlySpan<byte> data)
     {
         var functionNames = new Dictionary<int, string>();
         var functionNameList = new List<(int, string)>();
@@ -77,7 +78,7 @@ internal static class WasmNameSectionReader
         {
             int subStart = pos;
             byte subId = data[pos++];
-            if (!TryReadULEB128(data, ref pos, data.Length, out uint subLen)
+            if (!WasmLeb128.TryReadU32(data, ref pos, out uint subLen)
                 || subLen > data.Length - pos)
             {
                 malformation ??= $"subsection {subId} at offset {subStart} has a truncated or oversized length";
@@ -85,17 +86,18 @@ internal static class WasmNameSectionReader
             }
 
             int subEnd = pos + (int)subLen;
-            if (subId == 0)
+            ReadOnlySpan<byte> sub = data[..subEnd]; // positions stay section-relative
+            if (subId == (byte)NameSubsectionId.Module)
             {
-                if (TryReadName(data, ref pos, subEnd, out string? name))
+                if (TryReadName(sub, ref pos, out string? name))
                     moduleName = name;
                 else
                     malformation ??= $"module-name subsection at offset {subStart} is malformed";
             }
-            else if (subId == 1)
+            else if (subId == (byte)NameSubsectionId.Function)
             {
                 hasFunctionNames = true;
-                if (!TryReadULEB128(data, ref pos, subEnd, out uint count))
+                if (!WasmLeb128.TryReadU32(sub, ref pos, out uint count))
                 {
                     malformation ??= $"function-names subsection at offset {subStart} has a malformed count";
                 }
@@ -104,8 +106,8 @@ internal static class WasmNameSectionReader
                     for (uint i = 0; i < count; i++)
                     {
                         int entryStart = pos;
-                        if (!TryReadULEB128(data, ref pos, subEnd, out uint funcIndex)
-                            || !TryReadName(data, ref pos, subEnd, out string? name))
+                        if (!WasmLeb128.TryReadU32(sub, ref pos, out uint funcIndex)
+                            || !TryReadName(sub, ref pos, out string? name))
                         {
                             malformation ??= $"function-names entry {i} of {count} at offset {entryStart} is malformed";
                             break;
@@ -119,9 +121,9 @@ internal static class WasmNameSectionReader
                     }
                 }
             }
-            else if (subId == 2)
+            else if (subId == (byte)NameSubsectionId.Local)
             {
-                if (!TryReadULEB128(data, ref pos, subEnd, out uint functionCount))
+                if (!WasmLeb128.TryReadU32(sub, ref pos, out uint functionCount))
                 {
                     pos = subEnd;
                     continue;
@@ -129,16 +131,16 @@ internal static class WasmNameSectionReader
 
                 for (uint i = 0; i < functionCount && pos < subEnd; i++)
                 {
-                    if (!TryReadULEB128(data, ref pos, subEnd, out uint funcIndex)
-                        || !TryReadULEB128(data, ref pos, subEnd, out uint localCount))
+                    if (!WasmLeb128.TryReadU32(sub, ref pos, out uint funcIndex)
+                        || !WasmLeb128.TryReadU32(sub, ref pos, out uint localCount))
                         break;
 
                     var locals = new Dictionary<int, string>();
                     bool complete = true;
                     for (uint j = 0; j < localCount; j++)
                     {
-                        if (!TryReadULEB128(data, ref pos, subEnd, out uint localIndex)
-                            || !TryReadName(data, ref pos, subEnd, out string? name))
+                        if (!WasmLeb128.TryReadU32(sub, ref pos, out uint localIndex)
+                            || !TryReadName(sub, ref pos, out string? name))
                         {
                             complete = false;
                             break;
@@ -169,19 +171,18 @@ internal static class WasmNameSectionReader
     }
 
     private static bool TryReadName(
-        byte[] data,
+        ReadOnlySpan<byte> data,
         ref int pos,
-        int end,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? name)
     {
         name = null;
-        if (!TryReadULEB128(data, ref pos, end, out uint nameLen)
-            || nameLen > end - pos)
+        if (!WasmLeb128.TryReadU32(data, ref pos, out uint nameLen)
+            || nameLen > data.Length - pos)
             return false;
 
         try
         {
-            name = StrictUtf8.GetString(data, pos, (int)nameLen);
+            name = StrictUtf8.GetString(data.Slice(pos, (int)nameLen));
         }
         catch (DecoderFallbackException)
         {
@@ -189,20 +190,5 @@ internal static class WasmNameSectionReader
         }
         pos += (int)nameLen;
         return true;
-    }
-
-    private static bool TryReadULEB128(byte[] data, ref int pos, int end, out uint value)
-    {
-        value = 0;
-        int shift = 0;
-        while (pos < end && shift < 35)
-        {
-            byte b = data[pos++];
-            value |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return shift < 32 || (b & 0x70) == 0;
-            shift += 7;
-        }
-        return false;
     }
 }

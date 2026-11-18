@@ -957,6 +957,47 @@ diff -ruN a/Binary/ModuleReaderTests.cs b/Binary/ModuleReaderTests.cs
      }
  
      [Fact]
+diff -ruN a/Binary/ObjectWriterReferenceTests.cs b/Binary/ObjectWriterReferenceTests.cs
+--- a/Binary/ObjectWriterReferenceTests.cs
++++ b/Binary/ObjectWriterReferenceTests.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using Microsoft.DotNet.XUnitExtensions;
+ using Microsoft.NET.WebAssembly.Binary.Writing;
+ 
+ namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
+@@ -35,12 +36,12 @@
+         return data;
+     }
+ 
+-    [Theory]
++    [ConditionalTheory]
+     [MemberData(nameof(References))]
+     public void RuntimeObjectWriterOutputRebuildsByteIdentically(string relativePath)
+     {
+         if (relativePath.Length == 0)
+-            Assert.Skip("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
++            throw new SkipTestException("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
+ 
+         string path = Path.Combine(Environment.GetEnvironmentVariable("NESM_OBJCMP_DIR")!, relativePath);
+         byte[] original = File.ReadAllBytes(path);
+@@ -48,12 +49,12 @@
+         ObjectReencoder.AssertBytesEqual(original, ObjectReencoder.Reencode(original, WebcilSectionAlignment), relativePath);
+     }
+ 
+-    [Fact]
++    [ConditionalFact]
+     public void ReferenceDirectoryIsNotSilentlyEmpty()
+     {
+         string? dir = Environment.GetEnvironmentVariable("NESM_OBJCMP_DIR");
+         if (dir is null)
+-            Assert.Skip("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
++            throw new SkipTestException("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
+ 
+         Assert.True(Directory.Exists(dir), $"NESM_OBJCMP_DIR '{dir}' does not exist");
+         string[] objects = Directory.GetFiles(dir, "*.o", SearchOption.AllDirectories);
 diff -ruN a/Binary/WasmFeaturesTests.cs b/Binary/WasmFeaturesTests.cs
 --- a/Binary/WasmFeaturesTests.cs
 +++ b/Binary/WasmFeaturesTests.cs
@@ -1042,6 +1083,72 @@ diff -ruN a/Binary/WasmFeaturesTests.cs b/Binary/WasmFeaturesTests.cs
  
          Assert.Contains("nesm has not implemented", ex.Message, StringComparison.Ordinal);
          Assert.Contains("atomic (0xFE) instruction decoding", ex.Message, StringComparison.Ordinal);
+diff -ruN a/Binary/WasmObjectWriterApiTests.cs b/Binary/WasmObjectWriterApiTests.cs
+--- a/Binary/WasmObjectWriterApiTests.cs
++++ b/Binary/WasmObjectWriterApiTests.cs
+@@ -7,7 +7,6 @@
+ using Microsoft.NET.WebAssembly.Binary.Writing;
+ using Microsoft.NET.WebAssembly.Linker;
+ using Microsoft.NET.WebAssembly.Module;
+-using Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
+ 
+ namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
+ 
+@@ -467,54 +466,6 @@
+     }
+ 
+     // ── End to end ──────────────────────────────────────────────────────────
+-
+-    [Fact]
+-    public void ObjectWrittenThroughTheApiLinksWithWasmLdAndNesm()
+-    {
+-        byte[] obj = BuildAnswerObject();
+-        // The object itself parses with its relocation and symbols intact.
+-        WasmModule parsed = ModuleReader.ParseCoreModule(obj);
+-        Assert.Equal(["get", "answer"], parsed.LinkingSection!.Symbols.Select(s => s.Name));
+-        Assert.Equal(RelocationType.R_WASM_MEMORY_ADDR_LEB, Assert.Single(Assert.Single(parsed.RelocationSections).Entries).Type);
+-
+-        byte[] nesm = new WasmLinker().LinkToBinary([new LinkerInput(parsed, "answer.o")], new LinkerOptions { Exports = ["get"] });
+-        Assert.Equal(["get() = 42"], WasmLdParityTests.Execute(nesm, [new WasmLdParityTests.Call("get")]));
+-
+-        string bin = WasmLdParityTests.RequireWasiSdkBin();
+-        string dir = WasmLdParityTests.CreateTempDirectory();
+-        string objPath = Path.Combine(dir, "answer.o");
+-        File.WriteAllBytes(objPath, obj);
+-        string outPath = Path.Combine(dir, "answer.wasm");
+-        WasmLdParityTests.RunToolChecked(Path.Combine(bin, "wasm-ld"), ["--no-entry", "--export=get", objPath, "-o", outPath]);
+-        Assert.Equal(["get() = 42"], WasmLdParityTests.Execute(File.ReadAllBytes(outPath), [new WasmLdParityTests.Call("get")]));
+-    }
+-
+-    [Fact]
+-    public void ClangObjectsReencodeByteIdentically()
+-    {
+-        string bin = WasmLdParityTests.RequireWasiSdkBin();
+-        string dir = WasmLdParityTests.CreateTempDirectory();
+-        const string source = """
+-            extern int ext(int);
+-            extern int counter;
+-            int table_target(int x) { return x + 1; }
+-            int (*fp)(int) = table_target;
+-            static const char message[] = "hello";
+-            int global_value = 7;
+-            __attribute__((noinline)) inline int shared_inline(int x) { return x * 3; }
+-            struct Init { Init() { global_value += ext(2); } } init;
+-            __attribute__((constructor(200))) static void ctor() { counter++; }
+-            extern "C" int entry(int x) { return fp(x) + message[x & 3] + shared_inline(x) + counter; }
+-            """;
+-        string obj = WasmLdParityTests.Compile(bin, dir, "reencode", source, language: "c++", extraFlags: ["-g", "-ffunction-sections", "-fdata-sections"]);
+-        byte[] original = File.ReadAllBytes(obj);
+-        WasmModule module = ModuleReader.ParseCoreModule(original);
+-        Assert.NotEmpty(module.LinkingSection!.InitFunctions);
+-        Assert.NotEmpty(module.LinkingSection.ComdatGroups);
+-        Assert.Contains(module.RelocationSections, r => r.Name == "reloc..debug_info");
+-
+-        ObjectReencoder.AssertBytesEqual(original, ObjectReencoder.Reencode(original), "clang object");
+-    }
+ 
+     // ── Helpers ─────────────────────────────────────────────────────────────
+ 
 diff -ruN a/Linker/DebugAndNameSectionTests.cs b/Linker/DebugAndNameSectionTests.cs
 --- a/Linker/DebugAndNameSectionTests.cs
 +++ b/Linker/DebugAndNameSectionTests.cs

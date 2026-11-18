@@ -62,6 +62,8 @@ public sealed class WasmLdCommandLine
         bool printGcSections = false;
         bool stripDebug = false;
         bool noNameSection = false;
+        bool demangle = true;
+        string? soName = null;
         bool stripAll = false;
         bool compressRelocations = false;
         bool coalesceSegments = true;
@@ -193,6 +195,15 @@ public sealed class WasmLdCommandLine
                 case "-s":
                     stripAll = true;
                     break;
+                case "--demangle":
+                    demangle = true;
+                    break;
+                case "--no-demangle":
+                    demangle = false;
+                    break;
+                case "--soname":
+                    soName = Value();
+                    break;
                 case "--no-name-section":
                     noNameSection = true;
                     break;
@@ -272,6 +283,9 @@ public sealed class WasmLdCommandLine
             PrintGcSections = printGcSections,
             StripDebug = stripDebug,
             NoNameSection = noNameSection,
+            Demangle = demangle,
+            // wasm-ld names the module after --soname, or else the output file (a.out when there is no -o).
+            ModuleName = string.IsNullOrEmpty(soName) ? Path.GetFileName(outputPath ?? "a.out") : soName,
             StripAll = stripAll,
             CompressRelocations = compressRelocations,
             CoalesceSegments = coalesceSegments,

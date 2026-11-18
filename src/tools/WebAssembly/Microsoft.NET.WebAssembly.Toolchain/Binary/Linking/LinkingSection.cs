@@ -7,6 +7,9 @@ using System.Collections.Generic;
 
 public sealed class LinkingSection
 {
+    /// <summary>The <c>linking</c> section version LLVM writes and this toolchain reads and writes.</summary>
+    public const uint CurrentVersion = 2;
+
     public uint Version { get; init; }
     public List<WasmSymbol> Symbols { get; init; } = [];
     public List<SegmentInfo> SegmentInfos { get; init; } = [];
@@ -58,4 +61,20 @@ public enum ComdatKind : byte
     Tag = Event,
     Table = 4,
     Section = 5,
+}
+
+/// <summary>Subsection IDs of the <c>linking</c> custom section (LLVM <c>WasmSubsectionType</c>).</summary>
+public enum LinkingSubsectionId : byte
+{
+    /// <summary><c>WASM_SEGMENT_INFO</c>: name, alignment and flags of each data segment.</summary>
+    SegmentInfo = 5,
+
+    /// <summary><c>WASM_INIT_FUNCS</c>: constructors, by priority and symbol index.</summary>
+    InitFunctions = 6,
+
+    /// <summary><c>WASM_COMDAT_INFO</c>: COMDAT groups.</summary>
+    ComdatInfo = 7,
+
+    /// <summary><c>WASM_SYMBOL_TABLE</c>: the symbol table.</summary>
+    SymbolTable = 8,
 }

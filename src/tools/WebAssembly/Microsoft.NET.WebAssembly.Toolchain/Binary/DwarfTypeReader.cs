@@ -104,11 +104,11 @@ public static class DwarfTypeReader
                 int peekPos = diePos;
                 uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(infoData, ref peekPos);
                 if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
-                    && cuEntry.Tag == 0x11 /* DW_TAG_compile_unit */)
+                    && cuEntry.Tag == DwTag.CompileUnit)
                 {
                     foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
                     {
-                        if (attrName == 0x72 /* DW_AT_str_offsets_base */)
+                        if (attrName == DwAt.StrOffsetsBase)
                             strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(infoData, ref peekPos, attrForm, addrSize);
                         else
                             DwarfReaderHelpers.SkipFormValue(infoData, ref peekPos, attrForm, addrSize);
@@ -139,12 +139,12 @@ public static class DwarfTypeReader
         for (int i = 0; i < dies.Count && results.Count < maxResults; i++)
         {
             var die = dies[i];
-            if (die.Tag != DwarfReaderHelpers.DW_TAG_structure_type
-                && die.Tag != DwarfReaderHelpers.DW_TAG_class_type
-                && die.Tag != DwarfReaderHelpers.DW_TAG_union_type)
+            if (die.Tag != DwTag.StructureType
+                && die.Tag != DwTag.ClassType
+                && die.Tag != DwTag.UnionType)
                 continue;
 
-            if (!die.Attributes.TryGetValue(DwarfReaderHelpers.DW_AT_name, out var nameObj))
+            if (!die.Attributes.TryGetValue(DwAt.Name, out var nameObj))
                 continue;
             string name = nameObj?.ToString() ?? "";
             if (string.IsNullOrEmpty(name))
@@ -155,7 +155,7 @@ public static class DwarfTypeReader
                 continue;
 
             int byteSize = 0;
-            if (die.Attributes.TryGetValue(DwarfReaderHelpers.DW_AT_byte_size, out var sizeObj) && sizeObj is long sizeVal)
+            if (die.Attributes.TryGetValue(DwAt.ByteSize, out var sizeObj) && sizeObj is long sizeVal)
                 byteSize = (int)sizeVal;
 
             var members = new List<DwarfMember>();
@@ -164,13 +164,13 @@ public static class DwarfTypeReader
                 var child = dies[j];
                 if (child.Depth <= die.Depth) break;
                 if (child.Depth != die.Depth + 1) continue;
-                if (child.Tag != DwarfReaderHelpers.DW_TAG_member) continue;
+                if (child.Tag != DwTag.Member) continue;
 
-                string memberName = child.Attributes.TryGetValue(DwarfReaderHelpers.DW_AT_name, out var mn)
+                string memberName = child.Attributes.TryGetValue(DwAt.Name, out var mn)
                     ? mn?.ToString() ?? "(anon)" : "(anon)";
 
                 int memberOffset = 0;
-                if (child.Attributes.TryGetValue(DwarfReaderHelpers.DW_AT_data_member_location, out var locObj))
+                if (child.Attributes.TryGetValue(DwAt.DataMemberLocation, out var locObj))
                     memberOffset = (int)DwarfReaderHelpers.GetLongValue(locObj);
 
                 string typeName = DwarfReaderHelpers.ResolveTypeName(child, byOffset);
@@ -189,7 +189,7 @@ internal sealed class DwarfAbbrevEntry
 {
     public ushort Tag;
     public bool HasChildren;
-    public List<(ushort Name, ushort Form, long ImplicitConst)> Attributes = new();
+    public List<(ushort Name, uint Form, long ImplicitConst)> Attributes = new();
 }
 
 /// <summary>Parses DWARF .debug_abbrev sections.</summary>
@@ -204,7 +204,7 @@ internal static class DwarfAbbrevParser
 
         while (pos < data.Length)
         {
-            uint code = ReadULEB128(data, ref pos);
+            uint code = DwarfReaderHelpers.ReadULEB128(data, ref pos);
             if (code == 0)
             {
                 if (currentTable.Count > 0)
@@ -216,19 +216,19 @@ internal static class DwarfAbbrevParser
 
             var entry = new DwarfAbbrevEntry
             {
-                Tag = (ushort)ReadULEB128(data, ref pos),
+                Tag = (ushort)DwarfReaderHelpers.ReadULEB128(data, ref pos),
                 HasChildren = pos < data.Length && data[pos++] == 1
             };
 
             while (pos < data.Length)
             {
-                ushort attrName = (ushort)ReadULEB128(data, ref pos);
-                ushort attrForm = (ushort)ReadULEB128(data, ref pos);
+                ushort attrName = (ushort)DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                uint attrForm = DwarfReaderHelpers.ReadULEB128(data, ref pos);
                 if (attrName == 0 && attrForm == 0) break;
 
                 long implicitConst = 0;
-                if (attrForm == 0x21) // DW_FORM_implicit_const
-                    implicitConst = ReadSLEB128(data, ref pos);
+                if (attrForm == (uint)DwForm.ImplicitConst)
+                    implicitConst = DwarfReaderHelpers.ReadSLEB128(data, ref pos);
 
                 entry.Attributes.Add((attrName, attrForm, implicitConst));
             }
@@ -240,38 +240,5 @@ internal static class DwarfAbbrevParser
             tables[tableStart] = currentTable;
 
         return tables;
-    }
-
-    private static uint ReadULEB128(byte[] data, ref int pos)
-    {
-        uint result = 0;
-        int shift = 0;
-        while (pos < data.Length)
-        {
-            byte b = data[pos++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
-            shift += 7;
-            if (shift >= 35) break;
-        }
-        return result;
-    }
-
-    private static long ReadSLEB128(byte[] data, ref int pos)
-    {
-        long result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            if (pos >= data.Length) break;
-            b = data[pos++];
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-
-        if (shift < 64 && shift > 0 && pos > 0 && (data[pos - 1] & 0x40) != 0)
-            result |= -(1L << shift);
-        return result;
     }
 }

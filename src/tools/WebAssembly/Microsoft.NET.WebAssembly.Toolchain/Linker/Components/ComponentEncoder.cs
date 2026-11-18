@@ -4,6 +4,8 @@
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>Options for <see cref="ComponentEncoder"/>.</summary>
 public sealed class ComponentEncoderOptions
@@ -91,12 +93,12 @@ public static class ComponentEncoder
 
             foreach (string realloc in (string[])["cabi_import_realloc", "cabi_export_realloc"])
             {
-                if (module.Exports.TryGetValue(realloc, out var e) && e.Kind == 0x00)
+                if (module.Exports.TryGetValue(realloc, out var e) && e.Kind == CoreSort.Func)
                     required.Add(realloc);
             }
 
             string? mainRealloc = (string[])["cabi_realloc_adapter", "cabi_realloc"] is var names
-                ? names.FirstOrDefault(n => core.Exports.TryGetValue(n, out var e) && e.Kind == 0x00)
+                ? names.FirstOrDefault(n => core.Exports.TryGetValue(n, out var e) && e.Kind == CoreSort.Func)
                 : null;
             units.Add(new Unit(adapter.Name, CoreModule.Parse(AdapterModule.Minimize(adapter.Module, required, mainRealloc))));
         }
@@ -112,7 +114,7 @@ public static class ComponentEncoder
         w.Bytes(core.Bytes.AsSpan(0, 8));
         foreach (CoreModule.Section section in core.Sections)
         {
-            if (section.Id == 0 && IsComponentType(section.Name))
+            if (section.Id == (byte)WasmSectionId.Custom && IsComponentType(section.Name))
                 continue;
             w.Bytes(core.Bytes.AsSpan(section.Start, section.End - section.Start));
         }
@@ -185,21 +187,21 @@ public static class ComponentEncoder
             };
         }
 
-        public sealed record Import(string Module, string Field, byte Kind, uint TypeIndex);
+        public sealed record Import(string Module, string Field, CoreSort Kind, uint TypeIndex);
 
         public List<Section> Sections { get; } = [];
-        public IEnumerable<Section> Customs => Sections.Where(s => s.Id == 0);
+        public IEnumerable<Section> Customs => Sections.Where(s => s.Id == (byte)WasmSectionId.Custom);
         public List<FuncType> Types { get; } = [];
         public List<Import> Imports { get; } = [];
-        public Dictionary<string, (byte Kind, uint Index)> Exports { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, (CoreSort Kind, uint Index)> Exports { get; } = new(StringComparer.Ordinal);
         public byte[] Bytes { get; private init; } = [];
 
         public FuncType FunctionType(uint funcIndex)
         {
-            var functionImports = Imports.Where(i => i.Kind == 0x00).ToList();
+            var functionImports = Imports.Where(i => i.Kind == CoreSort.Func).ToList();
             if (funcIndex < functionImports.Count)
                 return Types[(int)functionImports[(int)funcIndex].TypeIndex];
-            Section functions = Sections.FirstOrDefault(s => s.Id == 3)
+            Section functions = Sections.FirstOrDefault(s => s.Id == (byte)WasmSectionId.Function)
                 ?? throw new LinkerException("module has no function section.");
             var r = new CtReader(Bytes, functions.PayloadStart, functions.End);
             uint count = r.ReadU32();
@@ -229,24 +231,24 @@ public static class ComponentEncoder
                 int payload = r.Position;
                 CtReader body = r.Sub(size);
                 string name = "";
-                switch (id)
+                switch ((WasmSectionId)id)
                 {
-                    case 0:
+                    case WasmSectionId.Custom:
                         name = body.ReadName();
                         payload = body.Position;
                         break;
-                    case 1:
+                    case WasmSectionId.Type:
                         module.ReadTypes(body);
                         break;
-                    case 2:
+                    case WasmSectionId.Import:
                         module.ReadImports(body);
                         break;
-                    case 7:
+                    case WasmSectionId.Export:
                         uint count = body.ReadU32();
                         for (uint i = 0; i < count; i++)
                         {
                             string export = body.ReadName();
-                            byte kind = body.ReadByte();
+                            var kind = (CoreSort)body.ReadByte();
                             module.Exports[export] = (kind, body.ReadU32());
                         }
 
@@ -292,16 +294,16 @@ public static class ComponentEncoder
             {
                 string module = r.ReadName();
                 string field = r.ReadName();
-                byte kind = r.ReadByte();
+                var kind = (CoreSort)r.ReadByte();
                 uint typeIndex = 0;
                 switch (kind)
                 {
-                    case 0x00: typeIndex = r.ReadU32(); break;
-                    case 0x01: r.ReadByte(); SkipLimits(r); break;
-                    case 0x02: SkipLimits(r); break;
-                    case 0x03: r.ReadByte(); r.ReadByte(); break;
-                    case 0x04: r.ReadByte(); r.ReadU32(); break;
-                    default: throw new LinkerException($"unknown import kind 0x{kind:X2}.");
+                    case CoreSort.Func: typeIndex = r.ReadU32(); break;
+                    case CoreSort.Table: r.ReadByte(); SkipLimits(r); break;
+                    case CoreSort.Memory: SkipLimits(r); break;
+                    case CoreSort.Global: r.ReadByte(); r.ReadByte(); break;
+                    case CoreSort.Tag: r.ReadByte(); r.ReadU32(); break;
+                    default: throw new LinkerException($"unknown import kind 0x{(byte)kind:X2}.");
                 }
 
                 Imports.Add(new Import(module, field, kind, typeIndex));
@@ -358,7 +360,7 @@ public static class ComponentEncoder
             foreach (Unit unit in units)
             {
                 unit.ModuleIndex = _coreModules++;
-                _out.Section(1, w => w.Bytes(unit.Module.Bytes));
+                _out.Section(ComponentSectionId.CoreModule, w => w.Bytes(unit.Module.Bytes));
             }
 
             EmitCoreImportsAndInstantiate(plans);
@@ -373,18 +375,18 @@ public static class ComponentEncoder
             var plans = new List<ImportPlan>();
             foreach (CoreModule.Import import in unit.Module.Imports)
             {
-                if (!unit.IsMain && import.Module == "env" && import.Kind == 0x02 && import.Field == "memory")
+                if (!unit.IsMain && import.Module == "env" && import.Kind == CoreSort.Memory && import.Field == "memory")
                 {
                     plans.Add(new ImportPlan(unit, import, ImportKind.Memory));
                     continue;
                 }
 
-                if (import.Kind != 0x00)
+                if (import.Kind != CoreSort.Func)
                     throw new LinkerException(
                         $"{unit} imports a non-function `{import.Module}::{import.Field}`; components cannot import core memories, tables or globals.");
                 if (!unit.IsMain && import.Module == MainModuleName)
                 {
-                    if (!Main.Module.Exports.TryGetValue(import.Field, out var export) || export.Kind != 0x00)
+                    if (!Main.Module.Exports.TryGetValue(import.Field, out var export) || export.Kind != CoreSort.Func)
                         throw new LinkerException($"{unit} requires the main module to export function `{import.Field}`.");
                     CheckSignature(unit, import, Main.Module.FunctionType(export.Index), "the main module's export");
                     plans.Add(new ImportPlan(unit, import, ImportKind.MainExport));
@@ -395,7 +397,7 @@ public static class ComponentEncoder
                 {
                     if (!unit.IsMain)
                         throw new NotSupportedException($"{unit} imports from adapter `{adapter.Name}`; adapters importing adapters are not supported.");
-                    if (!adapter.Module.Exports.TryGetValue(import.Field, out var export) || export.Kind != 0x00)
+                    if (!adapter.Module.Exports.TryGetValue(import.Field, out var export) || export.Kind != CoreSort.Func)
                         throw new LinkerException($"adapter `{adapter.Name}` does not export function `{import.Field}`.");
                     CheckSignature(unit, import, adapter.Module.FunctionType(export.Index), "the adapter's export");
                     plans.Add(new ImportPlan(unit, import, ImportKind.FromAdapter, Adapter: adapter));
@@ -412,7 +414,7 @@ public static class ComponentEncoder
                 if (import.Field.StartsWith(ResourceDropPrefix, StringComparison.Ordinal))
                 {
                     string resource = import.Field[ResourceDropPrefix.Length..];
-                    if (!iface.Exports.TryGetValue(resource, out int d) || iface.Decls[d] is not CtExportDecl { Desc.Kind: CtExternDesc.Type })
+                    if (!iface.Exports.TryGetValue(resource, out int d) || iface.Decls[d] is not CtExportDecl { Desc.Kind: ComponentExternKind.Type })
                         throw new LinkerException($"interface `{iface.Name}` has no resource `{resource}` for `{import.Field}`.");
                     CheckSignature(unit, import, new CoreModule.FuncType([CanonicalAbi.I32], []), "the canonical ABI lowering");
                     plans.Add(new ImportPlan(unit, import, ImportKind.ResourceDrop, iface));
@@ -464,9 +466,9 @@ public static class ComponentEncoder
                 {
                     if (decl is not CtExportDecl export)
                         continue;
-                    if (export.Desc.Kind == CtExternDesc.Type && export.Desc.SubResource)
+                    if (export.Desc.Kind == ComponentExternKind.Type && export.Desc.SubResource)
                         throw new NotSupportedException($"exported interface `{iface.Name}` defines resource `{export.Name}`; exported resources are not supported yet.");
-                    if (export.Desc.Kind != CtExternDesc.Func)
+                    if (export.Desc.Kind != ComponentExternKind.Func)
                         continue;
                     CtFunc func = iface.FindFunction(export.Name, out _)
                         ?? throw new LinkerException($"`{iface.Name}#{export.Name}` is not a function type.");
@@ -476,7 +478,7 @@ public static class ComponentEncoder
                         throw new LinkerException($"module does not export required function `{iface.Name}#{export.Name}`.");
                     CanonicalAbi.Lowering lifting = _abi.Flatten(iface, func, lift: true);
                     var (kind, index) = owner.Unit.Module.Exports[owner.Name];
-                    CoreModule.FuncType actual = kind == 0x00 ? owner.Unit.Module.FunctionType(index) : throw new LinkerException($"export `{owner.Name}` is not a function.");
+                    CoreModule.FuncType actual = kind == CoreSort.Func ? owner.Unit.Module.FunctionType(index) : throw new LinkerException($"export `{owner.Name}` is not a function.");
                     if (!actual.Matches(lifting))
                         throw new LinkerException(
                             $"type mismatch for exported function `{owner.Name}`: {owner.Unit} declares {actual} but the canonical ABI lifting is {new CoreModule.FuncType(lifting.Params, lifting.Results)}.");
@@ -531,10 +533,10 @@ public static class ComponentEncoder
                         WitInterface target = world.Lookup(symbol);
                         MarkDecl(target, target.Exports[symbol.Name]);
                         break;
-                    case CtExportDecl { Desc.Kind: CtExternDesc.Type, Desc.SubResource: false } e:
+                    case CtExportDecl { Desc.Kind: ComponentExternKind.Type, Desc.SubResource: false } e:
                         MarkType(iface, e.Desc.Index);
                         break;
-                    case CtExportDecl { Desc.Kind: CtExternDesc.Func } e:
+                    case CtExportDecl { Desc.Kind: ComponentExternKind.Func } e:
                         MarkType(iface, e.Desc.Index);
                         break;
                 }
@@ -585,7 +587,7 @@ public static class ComponentEncoder
                 {
                     CtTypeDecl t => new CtTypeDecl(ComponentTypeCodec.RemapTypes(t.Type, Map)),
                     CtAliasDecl { Target: CtAliasSymbol symbol } => new CtAliasDecl(CtSort.TypeSort, new CtAliasOuter(1, _typeAliases[(world.Lookup(symbol), symbol.Name)])),
-                    CtExportDecl { Desc.Kind: CtExternDesc.Type or CtExternDesc.Func, Desc.SubResource: false } e => e with { Desc = e.Desc with { Index = Map(e.Desc.Index) } },
+                    CtExportDecl { Desc.Kind: ComponentExternKind.Type or ComponentExternKind.Func, Desc.SubResource: false } e => e with { Desc = e.Desc with { Index = Map(e.Desc.Index) } },
                     _ => decl,
                 });
                 if (definesType)
@@ -593,16 +595,16 @@ public static class ComponentEncoder
             }
 
             uint type = _types++;
-            _out.Section(7, w =>
+            _out.Section(ComponentSectionId.Type, w =>
             {
                 w.U32(1);
                 ComponentTypeCodec.WriteDefType(w, new CtInstanceType(decls));
             });
-            _out.Section(10, w =>
+            _out.Section(ComponentSectionId.Import, w =>
             {
                 w.U32(1);
                 ComponentTypeCodec.WriteExternName(w, iface.Name);
-                ComponentTypeCodec.WriteExternDesc(w, new CtExternDesc(CtExternDesc.Instance, type));
+                ComponentTypeCodec.WriteExternDesc(w, new CtExternDesc(ComponentExternKind.Instance, type));
             });
             _instanceIndex[iface] = _instances++;
         }
@@ -621,22 +623,22 @@ public static class ComponentEncoder
             if (_funcAliases.TryGetValue((iface, name), out uint index))
                 return index;
             index = _funcAliases[(iface, name)] = _funcs++;
-            EmitAlias(new CtAliasDecl(new CtSort(CtSort.Func), new CtAliasExport(_instanceIndex[iface], name)));
+            EmitAlias(new CtAliasDecl(new CtSort(ComponentSort.Func), new CtAliasExport(_instanceIndex[iface], name)));
             return index;
         }
 
-        private uint CoreExportAlias(uint instance, string name, byte coreSort)
+        private uint CoreExportAlias(uint instance, string name, CoreSort coreSort)
         {
-            EmitAlias(new CtAliasDecl(new CtSort(CtSort.Core, coreSort), new CtAliasCoreExport(instance, name)));
+            EmitAlias(new CtAliasDecl(new CtSort(ComponentSort.Core, coreSort), new CtAliasCoreExport(instance, name)));
             return coreSort switch
             {
-                CtSort.CoreFunc => _coreFuncs++,
-                CtSort.CoreMemory => _coreMemories++,
+                CoreSort.Func => _coreFuncs++,
+                CoreSort.Memory => _coreMemories++,
                 _ => throw new InvalidOperationException(),
             };
         }
 
-        private void EmitAlias(CtAliasDecl alias) => _out.Section(6, w =>
+        private void EmitAlias(CtAliasDecl alias) => _out.Section(ComponentSectionId.Alias, w =>
         {
             w.U32(1);
             ComponentTypeCodec.WriteAlias(w, alias);
@@ -659,12 +661,12 @@ public static class ComponentEncoder
 
                 uint shimModule = _coreModules++;
                 byte[] shim = BuildShimModule(indirect, shimTypes);
-                _out.Section(1, w => w.Bytes(shim));
+                _out.Section(ComponentSectionId.CoreModule, w => w.Bytes(shim));
                 shimInstance = _coreInstances++;
-                _out.Section(2, w =>
+                _out.Section(ComponentSectionId.CoreInstance, w =>
                 {
                     w.U32(1);
-                    w.Byte(0x00);
+                    w.Byte((byte)InstanceExprKind.Instantiate);
                     w.U32(shimModule);
                     w.U32(0);
                 });
@@ -682,22 +684,22 @@ public static class ComponentEncoder
                 var instanceArgs = new List<(string Name, uint Instance)>();
                 foreach (string module in moduleOrder)
                 {
-                    var exports = new List<(string Name, byte Sort, uint Index)>();
+                    var exports = new List<(string Name, CoreSort Sort, uint Index)>();
                     foreach (ImportPlan p in plans.Where(p => p.Owner == unit && p.Import.Module == module))
                     {
                         switch (p.Kind)
                         {
                             case ImportKind.Memory:
-                                exports.Add((p.Import.Field, CtSort.CoreMemory, MainMemory()));
+                                exports.Add((p.Import.Field, CoreSort.Memory, MainMemory()));
                                 continue;
                             case ImportKind.MainExport:
-                                exports.Add((p.Import.Field, CtSort.CoreFunc, CoreExportAlias(Main.Instance, p.Import.Field, CtSort.CoreFunc)));
+                                exports.Add((p.Import.Field, CoreSort.Func, CoreExportAlias(Main.Instance, p.Import.Field, CoreSort.Func)));
                                 continue;
                             case ImportKind.ResourceDrop:
                                 uint resource = TypeAlias(p.Interface!, p.Import.Field[ResourceDropPrefix.Length..]);
-                                exports.Add((p.Import.Field, CtSort.CoreFunc, Canon(w =>
+                                exports.Add((p.Import.Field, CoreSort.Func, Canon(w =>
                                 {
-                                    w.Byte(0x03);
+                                    w.Byte((byte)CanonOpcode.ResourceDrop);
                                     w.U32(resource);
                                 })));
                                 continue;
@@ -705,15 +707,15 @@ public static class ComponentEncoder
 
                         if (p.Indirect)
                         {
-                            exports.Add((p.Import.Field, CtSort.CoreFunc,
-                                CoreExportAlias(shimInstance, indirect.IndexOf(p).ToString(System.Globalization.CultureInfo.InvariantCulture), CtSort.CoreFunc)));
+                            exports.Add((p.Import.Field, CoreSort.Func,
+                                CoreExportAlias(shimInstance, indirect.IndexOf(p).ToString(System.Globalization.CultureInfo.InvariantCulture), CoreSort.Func)));
                             continue;
                         }
 
                         uint target = FuncAlias(p.Interface!, p.Import.Field);
-                        exports.Add((p.Import.Field, CtSort.CoreFunc, Canon(w =>
+                        exports.Add((p.Import.Field, CoreSort.Func, Canon(w =>
                         {
-                            w.Byte(0x01);
+                            w.Byte((byte)CanonOpcode.Lower);
                             w.Byte(0x00);
                             w.U32(target);
                             WriteOptions(w, p.Lowering!, 0, null, null);
@@ -724,16 +726,16 @@ public static class ComponentEncoder
                 }
 
                 unit.Instance = _coreInstances++;
-                _out.Section(2, w =>
+                _out.Section(ComponentSectionId.CoreInstance, w =>
                 {
                     w.U32(1);
-                    w.Byte(0x00);
+                    w.Byte((byte)InstanceExprKind.Instantiate);
                     w.U32(unit.ModuleIndex);
                     w.U32((uint)instanceArgs.Count);
                     foreach (var (name, instance) in instanceArgs)
                     {
                         w.Name(name);
-                        w.Byte(0x12);
+                        w.Byte((byte)CoreSort.Instance);
                         w.U32(instance);
                     }
                 });
@@ -742,14 +744,14 @@ public static class ComponentEncoder
             if (indirect.Count == 0)
                 return;
 
-            var actualFuncs = new List<(string, byte, uint)>();
+            var actualFuncs = new List<(string, CoreSort, uint)>();
             for (int i = 0; i < indirect.Count; i++)
             {
                 ImportPlan p = indirect[i];
                 uint func;
                 if (p.Kind == ImportKind.FromAdapter)
                 {
-                    func = CoreExportAlias(p.Adapter!.Instance, p.Import.Field, CtSort.CoreFunc);
+                    func = CoreExportAlias(p.Adapter!.Instance, p.Import.Field, CoreSort.Func);
                 }
                 else
                 {
@@ -758,32 +760,32 @@ public static class ComponentEncoder
                     uint? realloc = p.Lowering!.Realloc ? Realloc(p.Owner, import: true) : null;
                     func = Canon(w =>
                     {
-                        w.Byte(0x01);
+                        w.Byte((byte)CanonOpcode.Lower);
                         w.Byte(0x00);
                         w.U32(target);
                         WriteOptions(w, p.Lowering, memory, realloc, null);
                     });
                 }
 
-                actualFuncs.Add((i.ToString(System.Globalization.CultureInfo.InvariantCulture), CtSort.CoreFunc, func));
+                actualFuncs.Add((i.ToString(System.Globalization.CultureInfo.InvariantCulture), CoreSort.Func, func));
             }
 
             uint actual = CoreInstanceFromExports(actualFuncs);
             uint fixupModule = _coreModules++;
             byte[] fixup = BuildFixupModule(indirect, shimTypes);
-            _out.Section(1, w => w.Bytes(fixup));
+            _out.Section(ComponentSectionId.CoreModule, w => w.Bytes(fixup));
             _coreInstances++;
-            _out.Section(2, w =>
+            _out.Section(ComponentSectionId.CoreInstance, w =>
             {
                 w.U32(1);
-                w.Byte(0x00);
+                w.Byte((byte)InstanceExprKind.Instantiate);
                 w.U32(fixupModule);
                 w.U32(2);
                 w.Name("actual");
-                w.Byte(0x12);
+                w.Byte((byte)CoreSort.Instance);
                 w.U32(actual);
                 w.Name("shim");
-                w.Byte(0x12);
+                w.Byte((byte)CoreSort.Instance);
                 w.U32(shimInstance);
             });
         }
@@ -794,9 +796,9 @@ public static class ComponentEncoder
         {
             if (_memory is { } m)
                 return m;
-            if (!Main.Module.Exports.TryGetValue("memory", out var export) || export.Kind != 0x02)
+            if (!Main.Module.Exports.TryGetValue("memory", out var export) || export.Kind != CoreSort.Memory)
                 throw new LinkerException("module does not export a memory named `memory`, which the canonical ABI needs.");
-            _memory = CoreExportAlias(Main.Instance, "memory", CtSort.CoreMemory);
+            _memory = CoreExportAlias(Main.Instance, "memory", CoreSort.Memory);
             return _memory.Value;
         }
 
@@ -807,9 +809,9 @@ public static class ComponentEncoder
                 return r;
             string specific = import ? "cabi_import_realloc" : "cabi_export_realloc";
             string name = unit.Module.Exports.ContainsKey(specific) ? specific : "cabi_realloc";
-            if (!unit.Module.Exports.TryGetValue(name, out var export) || export.Kind != 0x00)
+            if (!unit.Module.Exports.TryGetValue(name, out var export) || export.Kind != CoreSort.Func)
                 throw new LinkerException($"{unit} does not export `cabi_realloc`, which the canonical ABI needs.");
-            return unit.Reallocs[import] = CoreExportAlias(unit.Instance, name, CtSort.CoreFunc);
+            return unit.Reallocs[import] = CoreExportAlias(unit.Instance, name, CoreSort.Func);
         }
 
         private void WriteOptions(CtWriter w, CanonicalAbi.Lowering lowering, uint memory, uint? realloc, uint? postReturn)
@@ -834,7 +836,7 @@ public static class ComponentEncoder
 
         private uint Canon(Action<CtWriter> body)
         {
-            _out.Section(8, w =>
+            _out.Section(ComponentSectionId.Canon, w =>
             {
                 w.U32(1);
                 body(w);
@@ -842,18 +844,18 @@ public static class ComponentEncoder
             return _coreFuncs++;
         }
 
-        private uint CoreInstanceFromExports(IEnumerable<(string Name, byte Sort, uint Index)> exports)
+        private uint CoreInstanceFromExports(IEnumerable<(string Name, CoreSort Sort, uint Index)> exports)
         {
             var list = exports.ToList();
-            _out.Section(2, w =>
+            _out.Section(ComponentSectionId.CoreInstance, w =>
             {
                 w.U32(1);
-                w.Byte(0x01);
+                w.Byte((byte)InstanceExprKind.FromExports);
                 w.U32((uint)list.Count);
                 foreach (var (name, sort, index) in list)
                 {
                     w.Name(name);
-                    w.Byte(sort);
+                    w.Byte((byte)sort);
                     w.U32(index);
                 }
             });
@@ -868,13 +870,13 @@ public static class ComponentEncoder
             w.Bytes([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]);
             WriteTypeSection(w, types);
             uint n = (uint)indirect.Count;
-            w.Section(3, s =>
+            w.Section(WasmSectionId.Function, s =>
             {
                 s.U32(n);
                 foreach (ImportPlan p in indirect)
                     s.U32((uint)types.IndexOf(TypeOf(p)));
             });
-            w.Section(4, s =>
+            w.Section(WasmSectionId.Table, s =>
             {
                 s.U32(1);
                 s.Byte(0x70);
@@ -882,21 +884,21 @@ public static class ComponentEncoder
                 s.U32(n);
                 s.U32(n);
             });
-            w.Section(7, s =>
+            w.Section(WasmSectionId.Export, s =>
             {
                 s.U32(n + 1);
                 for (uint i = 0; i < n; i++)
                 {
                     s.Name(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                    s.Byte(0x00);
+                    s.Byte((byte)CoreSort.Func);
                     s.U32(i);
                 }
 
                 s.Name("$imports");
-                s.Byte(0x01);
+                s.Byte((byte)CoreSort.Table);
                 s.U32(0);
             });
-            w.Section(10, s =>
+            w.Section(WasmSectionId.Code, s =>
             {
                 s.U32(n);
                 for (int i = 0; i < indirect.Count; i++)
@@ -906,16 +908,16 @@ public static class ComponentEncoder
                     body.U32(0);
                     for (uint p = 0; p < type.Params.Length; p++)
                     {
-                        body.Byte(0x20);
+                        body.Byte(WasmOpcode.LocalGet);
                         body.U32(p);
                     }
 
-                    body.Byte(0x41);
+                    body.Byte(WasmOpcode.I32Const);
                     body.S33(i);
-                    body.Byte(0x11);
+                    body.Byte(WasmOpcode.CallIndirect);
                     body.U32((uint)types.IndexOf(type));
                     body.U32(0);
-                    body.Byte(0x0B);
+                    body.Byte(WasmOpcode.End);
                     s.U32((uint)body.Length);
                     s.Bytes(body.ToArray());
                 }
@@ -932,26 +934,26 @@ public static class ComponentEncoder
             w.Bytes([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]);
             WriteTypeSection(w, types);
             uint n = (uint)indirect.Count;
-            w.Section(2, s =>
+            w.Section(WasmSectionId.Import, s =>
             {
                 s.U32(n + 1);
                 for (int i = 0; i < indirect.Count; i++)
                 {
                     s.Name("actual");
                     s.Name(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                    s.Byte(0x00);
+                    s.Byte((byte)CoreSort.Func);
                     s.U32((uint)types.IndexOf(TypeOf(indirect[i])));
                 }
 
                 s.Name("shim");
                 s.Name("$imports");
-                s.Byte(0x01);
+                s.Byte((byte)CoreSort.Table);
                 s.Byte(0x70);
                 s.Byte(0x01);
                 s.U32(n);
                 s.U32(n);
             });
-            w.Section(9, s =>
+            w.Section(WasmSectionId.Element, s =>
             {
                 s.U32(1);
                 s.Byte(0x00);
@@ -965,7 +967,7 @@ public static class ComponentEncoder
 
         private static CoreModule.FuncType TypeOf(ImportPlan p) => p.CoreType;
 
-        private static void WriteTypeSection(CtWriter w, List<CoreModule.FuncType> types) => w.Section(1, s =>
+        private static void WriteTypeSection(CtWriter w, List<CoreModule.FuncType> types) => w.Section(WasmSectionId.Type, s =>
         {
             s.U32((uint)types.Count);
             foreach (CoreModule.FuncType t in types)
@@ -978,7 +980,7 @@ public static class ComponentEncoder
             }
         });
 
-        private static void WriteNameSection(CtWriter w, IEnumerable<string> functionNames) => w.Section(0, s =>
+        private static void WriteNameSection(CtWriter w, IEnumerable<string> functionNames) => w.Section(WasmSectionId.Custom, s =>
         {
             s.Name("name");
             var names = functionNames.ToList();
@@ -1009,17 +1011,17 @@ public static class ComponentEncoder
                     iface.FindFunction(name, out int d);
                     uint typeIndex = ((CtExportDecl)iface.Decls[d]).Desc.Index;
                     uint funcType = LiftType(iface, typeIndex);
-                    uint coreFunc = CoreExportAlias(owner.Instance, coreName, CtSort.CoreFunc);
+                    uint coreFunc = CoreExportAlias(owner.Instance, coreName, CoreSort.Func);
                     uint memory = lifting.Memory ? MainMemory() : 0;
                     uint? realloc = lifting.Realloc ? Realloc(owner, import: false) : null;
-                    uint? postReturn = owner.Module.Exports.TryGetValue($"cabi_post_{coreName}", out var post) && post.Kind == 0x00
-                        ? CoreExportAlias(owner.Instance, $"cabi_post_{coreName}", CtSort.CoreFunc)
+                    uint? postReturn = owner.Module.Exports.TryGetValue($"cabi_post_{coreName}", out var post) && post.Kind == CoreSort.Func
+                        ? CoreExportAlias(owner.Instance, $"cabi_post_{coreName}", CoreSort.Func)
                         : null;
-                    _out.Section(8, w =>
+                    _out.Section(ComponentSectionId.Canon, w =>
                     {
                         w.U32(1);
-                        w.Byte(0x00);
-                        w.Byte(0x00);
+                        w.Byte((byte)CanonOpcode.Lift);
+                        w.Byte((byte)CoreSort.Func);
                         w.U32(coreFunc);
                         WriteOptions(w, lifting, memory, realloc, postReturn);
                         w.U32(funcType);
@@ -1031,26 +1033,26 @@ public static class ComponentEncoder
                 var shim = new ExportShim(this, iface);
                 byte[] component = shim.Build(lifted);
                 uint componentIndex = _components++;
-                _out.Section(4, w => w.Bytes(component));
-                _out.Section(5, w =>
+                _out.Section(ComponentSectionId.Component, w => w.Bytes(component));
+                _out.Section(ComponentSectionId.Instance, w =>
                 {
                     w.U32(1);
-                    w.Byte(0x00);
+                    w.Byte((byte)InstanceExprKind.Instantiate);
                     w.U32(componentIndex);
                     w.U32((uint)shim.Args.Count);
                     foreach (var (name, sort, index) in shim.Args)
                     {
                         w.Name(name);
-                        w.Byte(sort);
+                        w.Byte((byte)sort);
                         w.U32(index);
                     }
                 });
                 uint instance = _instances++;
-                _out.Section(11, w =>
+                _out.Section(ComponentSectionId.Export, w =>
                 {
                     w.U32(1);
                     ComponentTypeCodec.WriteExternName(w, iface.Name);
-                    w.Byte(CtSort.Instance);
+                    w.Byte((byte)ComponentSort.Instance);
                     w.U32(instance);
                     w.Byte(0x00);
                 });
@@ -1075,7 +1077,7 @@ public static class ComponentEncoder
             private uint _types, _funcs;
 
             /// <summary>Instantiation arguments: import name, outer sort and outer index.</summary>
-            public List<(string Name, byte Sort, uint Index)> Args { get; } = [];
+            public List<(string Name, ComponentSort Sort, uint Index)> Args { get; } = [];
 
             public byte[] Build(List<(string Name, uint Func, uint TypeIndex)> lifted)
             {
@@ -1083,23 +1085,23 @@ public static class ComponentEncoder
                 foreach (var (name, func, typeIndex) in lifted)
                 {
                     uint type = Type(iface, typeIndex, exported: false);
-                    string importName = Import($"import-func-{name}", new CtExternDesc(CtExternDesc.Func, type));
-                    Args.Add((importName, CtSort.Func, func));
+                    string importName = Import($"import-func-{name}", new CtExternDesc(ComponentExternKind.Func, type));
+                    Args.Add((importName, ComponentSort.Func, func));
                     imports.Add(_funcs++);
                 }
 
                 foreach (CtDecl decl in iface.Decls)
                 {
-                    if (decl is not CtExportDecl { Desc.Kind: CtExternDesc.Type } e)
+                    if (decl is not CtExportDecl { Desc.Kind: ComponentExternKind.Type } e)
                         continue;
-                    Export(e.Name, CtSort.Type, Imported(iface, e.Name), null);
+                    Export(e.Name, ComponentSort.Type, Imported(iface, e.Name), null);
                     _exported[e.Name] = _types++;
                 }
 
                 for (int i = 0; i < lifted.Count; i++)
                 {
                     uint type = Type(iface, lifted[i].TypeIndex, exported: true);
-                    Export(lifted[i].Name, CtSort.Func, imports[i], new CtExternDesc(CtExternDesc.Func, type));
+                    Export(lifted[i].Name, ComponentSort.Func, imports[i], new CtExternDesc(ComponentExternKind.Func, type));
                     _funcs++;
                 }
 
@@ -1119,13 +1121,13 @@ public static class ComponentEncoder
                 {
                     case CtAliasDecl { Target: CtAliasSymbol symbol }:
                         return Imported(outer.World.Lookup(symbol), symbol.Name);
-                    case CtExportDecl { Desc.Kind: CtExternDesc.Type } e:
+                    case CtExportDecl { Desc.Kind: ComponentExternKind.Type } e:
                         return exported && scope == iface && _exported.TryGetValue(e.Name, out uint own) ? own : Imported(scope, e.Name);
                     case CtTypeDecl t:
                         if (_anonymous.TryGetValue((scope, index, exported), out uint copy))
                             return copy;
                         CtDefType def = ComponentTypeCodec.RemapTypes(t.Type, i => Type(scope, i, exported));
-                        _body.Section(7, w =>
+                        _body.Section(ComponentSectionId.Type, w =>
                         {
                             w.U32(1);
                             ComponentTypeCodec.WriteDefType(w, def);
@@ -1148,7 +1150,7 @@ public static class ComponentEncoder
                 {
                     if (owner.IsExport)
                         throw new NotSupportedException($"exported interface `{owner.Name}` defines resource `{name}`; exported resources are not supported yet.");
-                    bound = new CtExternDesc(CtExternDesc.Type, 0, SubResource: true);
+                    bound = new CtExternDesc(ComponentExternKind.Type, 0, SubResource: true);
                     outerType = outer.TypeAlias(owner, name);
                 }
                 else
@@ -1159,10 +1161,10 @@ public static class ComponentEncoder
                         case CtAliasDecl { Target: CtAliasSymbol symbol }:
                             return _imported[(owner, name)] = Imported(outer.World.Lookup(symbol), symbol.Name);
                         case CtExportDecl other:
-                            bound = new CtExternDesc(CtExternDesc.Type, Imported(owner, other.Name));
+                            bound = new CtExternDesc(ComponentExternKind.Type, Imported(owner, other.Name));
                             break;
                         default:
-                            bound = new CtExternDesc(CtExternDesc.Type, Type(owner, e.Desc.Index, exported: false));
+                            bound = new CtExternDesc(ComponentExternKind.Type, Type(owner, e.Desc.Index, exported: false));
                             break;
                     }
 
@@ -1170,7 +1172,7 @@ public static class ComponentEncoder
                 }
 
                 string importName = Import($"import-type-{name}", bound);
-                Args.Add((importName, CtSort.Type, outerType));
+                Args.Add((importName, ComponentSort.Type, outerType));
                 return _imported[(owner, name)] = _types++;
             }
 
@@ -1179,7 +1181,7 @@ public static class ComponentEncoder
                 string name = baseName;
                 for (int i = 0; !_names.Add(name); i++)
                     name = baseName + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                _body.Section(10, w =>
+                _body.Section(ComponentSectionId.Import, w =>
                 {
                     w.U32(1);
                     ComponentTypeCodec.WriteExternName(w, name);
@@ -1188,11 +1190,11 @@ public static class ComponentEncoder
                 return name;
             }
 
-            private void Export(string name, byte sort, uint index, CtExternDesc? ascription) => _body.Section(11, w =>
+            private void Export(string name, ComponentSort sort, uint index, CtExternDesc? ascription) => _body.Section(ComponentSectionId.Export, w =>
             {
                 w.U32(1);
                 ComponentTypeCodec.WriteExternName(w, name);
-                w.Byte(sort);
+                w.Byte((byte)sort);
                 w.U32(index);
                 if (ascription is null)
                 {
@@ -1221,13 +1223,13 @@ public static class ComponentEncoder
                     top = TypeAlias(owner, symbol.Name);
                     break;
                 // The shim component gives the type its name; the outer component only needs its structure.
-                case CtExportDecl { Desc.Kind: CtExternDesc.Type, Desc.SubResource: false } e:
+                case CtExportDecl { Desc.Kind: ComponentExternKind.Type, Desc.SubResource: false } e:
                     top = LiftType(iface, e.Desc.Index);
                     break;
                 case CtTypeDecl t:
                     CtDefType def = ComponentTypeCodec.RemapTypes(t.Type, i => LiftType(iface, i));
                     top = _types++;
-                    _out.Section(7, w =>
+                    _out.Section(ComponentSectionId.Type, w =>
                     {
                         w.U32(1);
                         ComponentTypeCodec.WriteDefType(w, def);

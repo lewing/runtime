@@ -3,7 +3,9 @@
 
 namespace Microsoft.NET.WebAssembly.Binary;
 
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Types;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
 /// <summary>
@@ -12,7 +14,7 @@ using System.Runtime.CompilerServices;
 /// </summary>
 internal readonly record struct OpcodeId(byte Opcode, uint SubOpcode = 0)
 {
-    public bool IsPrefixed => Opcode is 0xFB or 0xFC or 0xFD or 0xE0 or 0xFE;
+    public bool IsPrefixed => Opcode is WasmOpcode.GcPrefix or WasmOpcode.MiscPrefix or WasmOpcode.SimdPrefix or WasmOpcode.StackSwitchingPrefix or WasmOpcode.AtomicPrefix;
 
     public override string ToString() => IsPrefixed ? $"0x{Opcode:X2}:0x{SubOpcode:X}" : $"0x{Opcode:X2}";
 }
@@ -239,26 +241,26 @@ internal ref struct InstructionCursor
                     result.HeapType0 = ReadS33Leb();
                     break;
 
-                case 0xFC:
+                case WasmOpcode.MiscPrefix:
                     DecodeFc(ref result);
                     break;
 
-                case 0xFD:
+                case WasmOpcode.SimdPrefix:
                     RequireFeature(WasmFeatures.Simd, "SIMD instruction (0xFD prefix)");
                     DecodeFd(ref result);
                     break;
 
-                case 0xFB:
+                case WasmOpcode.GcPrefix:
                     RequireFeature(WasmFeatures.Gc, "GC instruction (0xFB prefix)");
                     DecodeFb(ref result);
                     break;
 
-                case 0xE0:
+                case WasmOpcode.StackSwitchingPrefix:
                     RequireFeature(WasmFeatures.StackSwitching, "stack-switching instruction (0xE0 prefix)");
                     DecodeE0(ref result);
                     break;
 
-                case 0xFE:
+                case WasmOpcode.AtomicPrefix:
                     RequireFeature(WasmFeatures.Threads, "atomic/threads instruction (0xFE prefix)");
                     // Not a malformed binary: the feature is enabled and the encoding may be
                     // perfectly well-formed — nesm simply cannot decode it. A plain
@@ -318,7 +320,7 @@ internal ref struct InstructionCursor
     private void DecodeFc(ref DecodedInstruction instruction)
     {
         uint sub = ReadU32Leb();
-        instruction.OpcodeId = new OpcodeId(0xFC, sub);
+        instruction.OpcodeId = new OpcodeId(WasmOpcode.MiscPrefix, sub);
         if (!IsKnownFcSubOpcode(sub))
             throw new WasmFormatException($"Unknown 0xFC sub-opcode: {sub}");
 
@@ -358,7 +360,7 @@ internal ref struct InstructionCursor
     private void DecodeFd(ref DecodedInstruction instruction)
     {
         uint sub = ReadU32Leb();
-        instruction.OpcodeId = new OpcodeId(0xFD, sub);
+        instruction.OpcodeId = new OpcodeId(WasmOpcode.SimdPrefix, sub);
         instruction.Index2 = (uint)_pc;
 
         if (IsKnownRelaxedSimdSubOpcode(sub))
@@ -399,7 +401,7 @@ internal ref struct InstructionCursor
     private void DecodeFb(ref DecodedInstruction instruction)
     {
         uint sub = ReadU32Leb();
-        instruction.OpcodeId = new OpcodeId(0xFB, sub);
+        instruction.OpcodeId = new OpcodeId(WasmOpcode.GcPrefix, sub);
         instruction.ImmediateKind = InstructionImmediateKind.Gc;
         if (!IsKnownGcSubOpcode(sub))
             throw new WasmFormatException($"Unknown 0xFB sub-opcode: {sub}");
@@ -449,7 +451,7 @@ internal ref struct InstructionCursor
     private void DecodeE0(ref DecodedInstruction instruction)
     {
         uint sub = ReadU32Leb();
-        instruction.OpcodeId = new OpcodeId(0xE0, sub);
+        instruction.OpcodeId = new OpcodeId(WasmOpcode.StackSwitchingPrefix, sub);
         instruction.ImmediateKind = InstructionImmediateKind.StackSwitching;
         if (!IsKnownE0SubOpcode(sub))
             throw new WasmFormatException($"Unknown 0xE0 sub-opcode: {sub}");
@@ -550,114 +552,81 @@ internal ref struct InstructionCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private uint ReadU32Leb()
     {
-        byte b = _code[_pc++];
+        byte b = _code[_pc];
         if ((b & 0x80) == 0)
-            return b;
-        return ReadU32LebSlow(b);
-    }
-
-    private uint ReadU32LebSlow(byte first)
-    {
-        uint result = (uint)(first & 0x7F);
-        int shift = 7;
-        for (int i = 1; i < 5; i++)
         {
-            byte b = _code[_pc++];
-            if (i == 4 && (b & 0xF0) != 0)
-                throw new WasmFormatException("Unsigned LEB128 value overflows uint32");
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
+            _pc++;
+            return b;
         }
-
-        throw new WasmFormatException("Unsigned LEB128 encoding exceeds 5 bytes for uint32");
+        if (!WasmLeb128.TryReadU32(_code, ref _pc, out uint value))
+            ThrowLebFailure(_code, _pc, WasmLeb128.Leb128Kind.U32);
+        return value;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ulong ReadU64Leb()
     {
-        ulong result = 0;
-        int shift = 0;
-        for (int i = 0; i < 10; i++)
+        byte b = _code[_pc];
+        if ((b & 0x80) == 0)
         {
-            byte b = _code[_pc++];
-            if (i == 9 && (b & 0xFE) != 0)
-                throw new WasmFormatException("Unsigned LEB128 value overflows uint64");
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
+            _pc++;
+            return b;
         }
-
-        throw new WasmFormatException("Unsigned LEB128 encoding exceeds 10 bytes for uint64");
+        if (!WasmLeb128.TryReadU64(_code, ref _pc, out ulong value))
+            ThrowLebFailure(_code, _pc, WasmLeb128.Leb128Kind.U64);
+        return value;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int ReadS32Leb()
     {
-        byte b = _code[_pc++];
+        byte b = _code[_pc];
         if ((b & 0x80) == 0)
-            return (b & 0x40) != 0 ? (int)(b | 0xFFFF_FF80u) : b;
-        return ReadS32LebSlow(b);
-    }
-
-    private int ReadS32LebSlow(byte first)
-    {
-        int result = first & 0x7F;
-        int shift = 7;
-        byte b = first;
-        for (int i = 1; i < 5; i++)
         {
-            b = _code[_pc++];
-            if (i == 4 && (b & 0x78) != 0 && (b & 0x78) != 0x78)
-                throw new WasmFormatException("Signed LEB128 value overflows int32");
-            result |= (b & 0x7F) << shift;
-            shift += 7;
-            if ((b & 0x80) == 0)
-            {
-                if (shift < 32 && (b & 0x40) != 0)
-                    result |= ~0 << shift;
-                return result;
-            }
+            _pc++;
+            return (b & 0x40) != 0 ? (int)(b | 0xFFFF_FF80u) : b;
         }
-
-        throw new WasmFormatException("Signed LEB128 encoding exceeds 5 bytes for int32");
+        if (!WasmLeb128.TryReadS32(_code, ref _pc, out int value))
+            ThrowLebFailure(_code, _pc, WasmLeb128.Leb128Kind.S32);
+        return value;
     }
 
     private long ReadS33Leb()
     {
-        return S33Leb128.Read(_code, ref _pc);
+        if (!WasmLeb128.TryReadS33(_code, ref _pc, out long value))
+            ThrowLebFailure(_code, _pc, WasmLeb128.Leb128Kind.S33);
+        return value;
+    }
+
+    // A body that ends inside an encoding reports the same error as any other read past its end.
+    [DoesNotReturn]
+    private static void ThrowLebFailure(ReadOnlySpan<byte> code, int pc, WasmLeb128.Leb128Kind kind)
+    {
+        ReadOnlySpan<byte> rest = code[pc..];
+        Leb128Status status = kind switch
+        {
+            WasmLeb128.Leb128Kind.U32 => WasmLeb128.DecodeU32(rest, out _, out _),
+            WasmLeb128.Leb128Kind.U64 => WasmLeb128.DecodeU64(rest, out _, out _),
+            WasmLeb128.Leb128Kind.S32 => WasmLeb128.DecodeS32(rest, out _, out _),
+            WasmLeb128.Leb128Kind.S64 => WasmLeb128.DecodeS64(rest, out _, out _),
+            _ => WasmLeb128.DecodeS33(rest, out _, out _),
+        };
+        throw status == Leb128Status.Truncated
+            ? new WasmFormatException("unexpected end of section or function")
+            : WasmLeb128.CreateException(status, kind);
     }
 
     private long ReadS64Leb()
     {
-        byte b = _code[_pc++];
+        byte b = _code[_pc];
         if ((b & 0x80) == 0)
-            return (b & 0x40) != 0 ? (long)(b | 0xFFFF_FFFF_FFFF_FF80uL) : b;
-        return ReadS64LebSlow(b);
-    }
-
-    private long ReadS64LebSlow(byte first)
-    {
-        long result = first & 0x7F;
-        int shift = 7;
-        byte b = first;
-        for (int i = 1; i < 10; i++)
         {
-            b = _code[_pc++];
-            if (i == 9 && (b & 0x7F) != 0 && (b & 0x7F) != 0x7F)
-                throw new WasmFormatException("Signed LEB128 value overflows int64");
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-            if ((b & 0x80) == 0)
-            {
-                if (shift < 64 && (b & 0x40) != 0)
-                    result |= ~0L << shift;
-                return result;
-            }
+            _pc++;
+            return (b & 0x40) != 0 ? (long)(b | 0xFFFF_FFFF_FFFF_FF80uL) : b;
         }
-
-        throw new WasmFormatException("Signed LEB128 encoding exceeds 10 bytes for int64");
+        if (!WasmLeb128.TryReadS64(_code, ref _pc, out long value))
+            ThrowLebFailure(_code, _pc, WasmLeb128.Leb128Kind.S64);
+        return value;
     }
 
     private uint ReadRawU32()
@@ -694,22 +663,22 @@ internal static class InstructionDecodeCoverage
                 AddPrimary(result);
                 break;
             case InstructionOpcodeBucket.Fc:
-                for (uint sub = 0; sub <= 17; sub++) result.Add(new OpcodeId(0xFC, sub));
-                for (uint sub = 19; sub <= 22; sub++) result.Add(new OpcodeId(0xFC, sub));
+                for (uint sub = 0; sub <= 17; sub++) result.Add(new OpcodeId(WasmOpcode.MiscPrefix, sub));
+                for (uint sub = 19; sub <= 22; sub++) result.Add(new OpcodeId(WasmOpcode.MiscPrefix, sub));
                 break;
             case InstructionOpcodeBucket.FbGc:
-                for (uint sub = 0; sub <= 0x1E; sub++) result.Add(new OpcodeId(0xFB, sub));
+                for (uint sub = 0; sub <= 0x1E; sub++) result.Add(new OpcodeId(WasmOpcode.GcPrefix, sub));
                 break;
             case InstructionOpcodeBucket.FdSimd:
                 for (uint sub = 0; sub <= 0xFF; sub++)
                     if (InstructionCursor.IsKnownSimdSubOpcode(sub))
-                        result.Add(new OpcodeId(0xFD, sub));
+                        result.Add(new OpcodeId(WasmOpcode.SimdPrefix, sub));
                 break;
             case InstructionOpcodeBucket.FdRelaxedSimd:
-                for (uint sub = 0x100; sub <= 0x113; sub++) result.Add(new OpcodeId(0xFD, sub));
+                for (uint sub = 0x100; sub <= 0x113; sub++) result.Add(new OpcodeId(WasmOpcode.SimdPrefix, sub));
                 break;
             case InstructionOpcodeBucket.E0StackSwitching:
-                for (uint sub = 0; sub <= 4; sub++) result.Add(new OpcodeId(0xE0, sub));
+                for (uint sub = 0; sub <= 4; sub++) result.Add(new OpcodeId(WasmOpcode.StackSwitchingPrefix, sub));
                 break;
         }
 

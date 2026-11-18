@@ -3,8 +3,12 @@ Binary/DwarfTypeReaderTests.cs
 Binary/DwarfVariableReaderTests.cs
 Binary/Memory64Tests.cs
 Binary/ModuleReaderTests.cs
+Binary/ObjectReencoder.cs
+Binary/ObjectWriterReferenceTests.cs
 Binary/WasmBinaryReaderTests.cs
 Binary/WasmFeaturesTests.cs
+Binary/WasmLeb128ReaderTests.cs
+Binary/WasmObjectWriterApiTests.cs
 Linker/ArArchiveReaderTests.cs
 Linker/DeadCodeEliminatorTests.cs
 Linker/DebugAndNameSectionTests.cs

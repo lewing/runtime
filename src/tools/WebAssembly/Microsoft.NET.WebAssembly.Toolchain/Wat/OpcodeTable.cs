@@ -3,6 +3,8 @@
 
 namespace Microsoft.NET.WebAssembly.Wat;
 
+using Microsoft.NET.WebAssembly.Binary;
+
 /// <summary>Opcode mnemonic to binary encoding mapping.</summary>
 public enum ImmediateKind
 {
@@ -322,7 +324,7 @@ public static class OpcodeTable
         // ── 0xFC prefix: saturating truncation + bulk memory/table ops ───────
 
         void AddFC(string name, uint sub, ImmediateKind imm = ImmediateKind.None) =>
-            t[name] = new OpcodeEntry([0xFC, (byte)sub], imm);
+            t[name] = new OpcodeEntry([WasmOpcode.MiscPrefix, (byte)sub], imm);
 
         // Saturating float-to-int conversions (sub 0-7)
         AddFC("i32.trunc_sat_f32_s", 0);
@@ -359,8 +361,8 @@ public static class OpcodeTable
         void AddFD(string name, uint sub, ImmediateKind imm = ImmediateKind.None)
         {
             byte[] opcodes = sub < 128
-                ? [0xFD, (byte)sub]
-                : [0xFD, (byte)((sub & 0x7F) | 0x80), (byte)(sub >> 7)];
+                ? [WasmOpcode.SimdPrefix, (byte)sub]
+                : [WasmOpcode.SimdPrefix, (byte)((sub & 0x7F) | 0x80), (byte)(sub >> 7)];
             t[name] = new OpcodeEntry(opcodes, imm);
         }
 

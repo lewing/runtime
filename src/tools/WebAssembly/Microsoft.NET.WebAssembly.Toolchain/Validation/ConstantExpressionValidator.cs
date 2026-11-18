@@ -142,7 +142,7 @@ internal static class ConstantExpressionValidator
             {
                 while (cursor.MoveNext(out var instruction))
                 {
-                    if (instruction.OpcodeId.Opcode == 0x0B)
+                    if (instruction.OpcodeId.Opcode == WasmOpcode.End)
                     {
                         if (cursor.Position != expression.Length)
                             return Diagnostic(WasmValidationCode.InvalidGlobalInitExpr, $"{contextName}: bytes follow constant-expression end");
@@ -218,10 +218,10 @@ internal static class ConstantExpressionValidator
                 case 0xD2:
                     RefFunc(instruction.Index0);
                     return;
-                case 0xFD when instruction.OpcodeId.SubOpcode == 0x0C:
+                case WasmOpcode.SimdPrefix when instruction.OpcodeId.SubOpcode == 0x0C:
                     Push(V128);
                     return;
-                case 0xFB:
+                case WasmOpcode.GcPrefix:
                     ApplyGc(instruction);
                     return;
                 default:
@@ -489,9 +489,9 @@ internal static class ConstantExpressionValidator
             {
                 while (cursor.MoveNext(out var instruction))
                 {
-                    if (instruction.OpcodeId.Opcode == 0xD2 && IsFunctionIndex(unchecked((int)instruction.Index0)))
+                    if (instruction.OpcodeId.Opcode == WasmOpcode.RefFunc && IsFunctionIndex(unchecked((int)instruction.Index0)))
                         _declaredFunctionReferences.Add((int)instruction.Index0);
-                    if (instruction.OpcodeId.Opcode == 0x0B)
+                    if (instruction.OpcodeId.Opcode == WasmOpcode.End)
                         return;
                 }
             }

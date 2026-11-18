@@ -4,6 +4,8 @@
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 // A lossless model of the component-model type grammar (deftype, instance/component type decls), sufficient to
 // read a `component-type` custom section, rewrite indices and write the result back out. Encodings follow
@@ -51,12 +53,10 @@ internal sealed record CtAliasDecl(CtSort Sort, CtAliasTarget Target) : CtDecl;
 internal sealed record CtImportDecl(string Name, CtExternDesc Desc, byte[]? RawName = null) : CtDecl;
 internal sealed record CtExportDecl(string Name, CtExternDesc Desc, byte[]? RawName = null) : CtDecl;
 
-/// <summary>A component sort; <see cref="CoreSort"/> is set (and <see cref="Kind"/> is 0x00) for core sorts.</summary>
-internal readonly record struct CtSort(byte Kind, byte CoreSort = 0)
+/// <summary>A component sort; <see cref="CoreSort"/> is set (and <see cref="Kind"/> is <see cref="ComponentSort.Core"/>) for core sorts.</summary>
+internal readonly record struct CtSort(ComponentSort Kind, CoreSort CoreSort = default)
 {
-    public const byte Core = 0x00, Func = 0x01, Value = 0x02, Type = 0x03, Component = 0x04, Instance = 0x05;
-    public const byte CoreFunc = 0x00, CoreTable = 0x01, CoreMemory = 0x02, CoreGlobal = 0x03;
-    public static readonly CtSort TypeSort = new(Type);
+    public static readonly CtSort TypeSort = new(ComponentSort.Type);
 }
 
 internal abstract record CtAliasTarget;
@@ -65,14 +65,9 @@ internal sealed record CtAliasCoreExport(uint Instance, string Name) : CtAliasTa
 internal sealed record CtAliasOuter(uint Count, uint Index) : CtAliasTarget;
 
 /// <summary>
-/// <c>externdesc</c>. <see cref="Kind"/> is the binary discriminant (0x00 core module, 0x01 func, 0x02 value,
-/// 0x03 type, 0x04 component, 0x05 instance). For types, <see cref="SubResource"/> distinguishes
-/// <c>(sub resource)</c> from <c>(eq Index)</c>.
+/// <c>externdesc</c>. For types, <see cref="SubResource"/> distinguishes <c>(sub resource)</c> from <c>(eq Index)</c>.
 /// </summary>
-internal sealed record CtExternDesc(byte Kind, uint Index, bool SubResource = false, byte[]? RawValueBound = null)
-{
-    public const byte CoreModule = 0x00, Func = 0x01, Value = 0x02, Type = 0x03, Component = 0x04, Instance = 0x05;
-}
+internal sealed record CtExternDesc(ComponentExternKind Kind, uint Index, bool SubResource = false, byte[]? RawValueBound = null);
 
 internal sealed class CtReader(byte[] bytes, int start, int end)
 {
@@ -88,38 +83,40 @@ internal sealed class CtReader(byte[] bytes, int start, int end)
 
     public uint ReadU32()
     {
-        uint result = 0;
-        for (int shift = 0; ; shift += 7)
-        {
-            byte b = ReadByte();
-            if (shift == 28 && (b & 0x70) != 0)
-                throw new FormatException("u32 LEB128 out of range.");
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            if (shift >= 28)
-                throw new FormatException("u32 LEB128 too long.");
-        }
+        Leb128Status status = WasmLeb128.DecodeU32(Remaining, out uint value, out int length);
+        Position += status == Leb128Status.Ok ? length : throw LebException(status, "u32");
+        return value;
+    }
+
+    public ulong ReadU64()
+    {
+        Leb128Status status = WasmLeb128.DecodeU64(Remaining, out ulong value, out int length);
+        Position += status == Leb128Status.Ok ? length : throw LebException(status, "u64");
+        return value;
     }
 
     public long ReadS33()
     {
-        long result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            b = ReadByte();
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-        }
-        while ((b & 0x80) != 0 && shift < 35);
-        if ((b & 0x80) != 0)
-            throw new FormatException("s33 LEB128 too long.");
-        if ((b & 0x40) != 0)
-            result |= -1L << shift;
-        return result;
+        Leb128Status status = WasmLeb128.DecodeS33(Remaining, out long value, out int length);
+        Position += status == Leb128Status.Ok ? length : throw LebException(status, "s33");
+        return value;
     }
+
+    /// <summary>Skips one LEB128 of any length without range checks.</summary>
+    public void SkipLeb128()
+    {
+        if (!WasmLeb128.TrySkip(_bytes.AsSpan(0, End), ref Position))
+            throw new FormatException("Unexpected end of component data.");
+    }
+
+    private ReadOnlySpan<byte> Remaining => _bytes.AsSpan(Position, End - Position);
+
+    private static FormatException LebException(Leb128Status status, string type) => status switch
+    {
+        Leb128Status.Truncated => new FormatException("Unexpected end of component data."),
+        Leb128Status.Overflow => new FormatException($"{type} LEB128 out of range."),
+        _ => new FormatException($"{type} LEB128 too long."),
+    };
 
     public string ReadName()
     {
@@ -152,33 +149,9 @@ internal sealed class CtWriter
     public int Length => (int)_stream.Length;
     public byte[] ToArray() => _stream.ToArray();
 
-    public void U32(uint value)
-    {
-        do
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            if (value != 0)
-                b |= 0x80;
-            _stream.WriteByte(b);
-        }
-        while (value != 0);
-    }
+    public void U32(uint value) => WasmLeb128.WriteULeb128(_stream, value);
 
-    public void S33(long value)
-    {
-        while (true)
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            bool done = (value == 0 && (b & 0x40) == 0) || (value == -1 && (b & 0x40) != 0);
-            if (!done)
-                b |= 0x80;
-            _stream.WriteByte(b);
-            if (done)
-                return;
-        }
-    }
+    public void S33(long value) => WasmLeb128.WriteSLeb128(_stream, value);
 
     public void Name(string name)
     {
@@ -188,6 +161,11 @@ internal sealed class CtWriter
     }
 
     /// <summary>Writes a section: id, size, and the body produced by <paramref name="body"/>.</summary>
+    public void Section(WasmSectionId id, Action<CtWriter> body) => Section((byte)id, body);
+
+    public void Section(ComponentSectionId id, Action<CtWriter> body) => Section((byte)id, body);
+
+    /// <summary>Writes a section with a raw id; production code uses the typed overloads, byte-exact fixtures this one.</summary>
     public void Section(byte id, Action<CtWriter> body)
     {
         var inner = new CtWriter();
@@ -279,30 +257,30 @@ internal static class ComponentTypeCodec
     public static CtDefType ReadDefType(CtReader r)
     {
         byte op = r.ReadByte();
-        switch (op)
+        switch ((ComponentTypeCode)op)
         {
-            case 0x40:
-            case 0x43:
+            case ComponentTypeCode.Func:
+            case ComponentTypeCode.AsyncFunc:
             {
                 var parameters = ReadLabeledList(r);
                 byte resultKind = r.ReadByte();
                 return resultKind switch
                 {
-                    0x00 => new CtFunc(op == 0x43, parameters, ReadValType(r), null),
-                    0x01 => ReadNamedResults(r, op == 0x43, parameters),
+                    0x00 => new CtFunc(op == (byte)ComponentTypeCode.AsyncFunc, parameters, ReadValType(r), null),
+                    0x01 => ReadNamedResults(r, op == (byte)ComponentTypeCode.AsyncFunc, parameters),
                     _ => throw new FormatException($"Unknown functype result kind 0x{resultKind:X2}."),
                 };
             }
-            case 0x41:
+            case ComponentTypeCode.Component:
                 return new CtComponentType(ReadDecls(r, allowImports: true));
-            case 0x42:
+            case ComponentTypeCode.Instance:
                 return new CtInstanceType(ReadDecls(r, allowImports: false));
-            case 0x3F:
-            case 0x3E:
+            case ComponentTypeCode.Resource:
+            case ComponentTypeCode.AsyncResource:
             {
                 int start = r.Position;
                 ReadValType(r);
-                if (op == 0x3E)
+                if (op == (byte)ComponentTypeCode.AsyncResource)
                     r.ReadU32();
                 if (r.ReadByte() == 0x01)
                     r.ReadU32();
@@ -323,10 +301,10 @@ internal static class ComponentTypeCodec
     {
         if (IsPrimitiveCode(op))
             return new CtPrimitive(op);
-        switch (op)
+        switch ((ComponentTypeCode)op)
         {
-            case 0x72: return new CtRecord(ReadLabeledList(r));
-            case 0x71:
+            case ComponentTypeCode.Record: return new CtRecord(ReadLabeledList(r));
+            case ComponentTypeCode.Variant:
             {
                 uint count = r.ReadU32();
                 var cases = new List<(string, CtValType?)>((int)count);
@@ -341,13 +319,13 @@ internal static class ComponentTypeCodec
 
                 return new CtVariant(cases);
             }
-            case 0x70: return new CtList(ReadValType(r), null);
-            case 0x67:
+            case ComponentTypeCode.List: return new CtList(ReadValType(r), null);
+            case ComponentTypeCode.FixedList:
             {
                 CtValType element = ReadValType(r);
                 return new CtList(element, r.ReadU32());
             }
-            case 0x6F:
+            case ComponentTypeCode.Tuple:
             {
                 uint count = r.ReadU32();
                 var elements = new List<CtValType>((int)count);
@@ -355,19 +333,19 @@ internal static class ComponentTypeCodec
                     elements.Add(ReadValType(r));
                 return new CtTuple(elements);
             }
-            case 0x6E: return new CtFlags(ReadNames(r));
-            case 0x6D: return new CtEnum(ReadNames(r));
-            case 0x6B: return new CtOption(ReadValType(r));
-            case 0x6A:
+            case ComponentTypeCode.Flags: return new CtFlags(ReadNames(r));
+            case ComponentTypeCode.Enum: return new CtEnum(ReadNames(r));
+            case ComponentTypeCode.Option: return new CtOption(ReadValType(r));
+            case ComponentTypeCode.Result:
             {
                 CtValType? ok = ReadOptionalValType(r);
                 return new CtResult(ok, ReadOptionalValType(r));
             }
-            case 0x69: return new CtOwn(r.ReadU32());
-            case 0x68: return new CtBorrow(r.ReadU32());
-            case 0x66: return new CtStream(ReadOptionalValType(r));
-            case 0x65: return new CtFuture(ReadOptionalValType(r));
-            case 0x63:
+            case ComponentTypeCode.Own: return new CtOwn(r.ReadU32());
+            case ComponentTypeCode.Borrow: return new CtBorrow(r.ReadU32());
+            case ComponentTypeCode.Stream: return new CtStream(ReadOptionalValType(r));
+            case ComponentTypeCode.Future: return new CtFuture(ReadOptionalValType(r));
+            case ComponentTypeCode.Map:
             {
                 CtValType key = ReadValType(r);
                 return new CtMap(key, ReadValType(r));
@@ -382,9 +360,9 @@ internal static class ComponentTypeCodec
         switch (type)
         {
             case CtPrimitive p: w.Byte(p.Code); break;
-            case CtRecord rec: w.Byte(0x72); WriteLabeledList(w, rec.Fields); break;
+            case CtRecord rec: w.Byte((byte)ComponentTypeCode.Record); WriteLabeledList(w, rec.Fields); break;
             case CtVariant v:
-                w.Byte(0x71);
+                w.Byte((byte)ComponentTypeCode.Variant);
                 w.U32((uint)v.Cases.Count);
                 foreach (var (name, payload) in v.Cases)
                 {
@@ -396,27 +374,27 @@ internal static class ComponentTypeCodec
                 break;
             case CtList { FixedLength: null } list: w.Byte(0x70); WriteValType(w, list.Element); break;
             case CtList list:
-                w.Byte(0x67);
+                w.Byte((byte)ComponentTypeCode.FixedList);
                 WriteValType(w, list.Element);
                 w.U32(list.FixedLength!.Value);
                 break;
             case CtTuple t:
-                w.Byte(0x6F);
+                w.Byte((byte)ComponentTypeCode.Tuple);
                 w.U32((uint)t.Elements.Count);
                 foreach (CtValType e in t.Elements)
                     WriteValType(w, e);
                 break;
-            case CtFlags f: w.Byte(0x6E); WriteNames(w, f.Names); break;
-            case CtEnum e: w.Byte(0x6D); WriteNames(w, e.Names); break;
-            case CtOption o: w.Byte(0x6B); WriteValType(w, o.Element); break;
-            case CtResult res: w.Byte(0x6A); WriteOptionalValType(w, res.Ok); WriteOptionalValType(w, res.Err); break;
-            case CtOwn own: w.Byte(0x69); w.U32(own.Resource); break;
-            case CtBorrow borrow: w.Byte(0x68); w.U32(borrow.Resource); break;
-            case CtStream s: w.Byte(0x66); WriteOptionalValType(w, s.Element); break;
-            case CtFuture f: w.Byte(0x65); WriteOptionalValType(w, f.Element); break;
-            case CtMap m: w.Byte(0x63); WriteValType(w, m.Key); WriteValType(w, m.Value); break;
+            case CtFlags f: w.Byte((byte)ComponentTypeCode.Flags); WriteNames(w, f.Names); break;
+            case CtEnum e: w.Byte((byte)ComponentTypeCode.Enum); WriteNames(w, e.Names); break;
+            case CtOption o: w.Byte((byte)ComponentTypeCode.Option); WriteValType(w, o.Element); break;
+            case CtResult res: w.Byte((byte)ComponentTypeCode.Result); WriteOptionalValType(w, res.Ok); WriteOptionalValType(w, res.Err); break;
+            case CtOwn own: w.Byte((byte)ComponentTypeCode.Own); w.U32(own.Resource); break;
+            case CtBorrow borrow: w.Byte((byte)ComponentTypeCode.Borrow); w.U32(borrow.Resource); break;
+            case CtStream s: w.Byte((byte)ComponentTypeCode.Stream); WriteOptionalValType(w, s.Element); break;
+            case CtFuture f: w.Byte((byte)ComponentTypeCode.Future); WriteOptionalValType(w, f.Element); break;
+            case CtMap m: w.Byte((byte)ComponentTypeCode.Map); WriteValType(w, m.Key); WriteValType(w, m.Value); break;
             case CtFunc fn:
-                w.Byte(fn.Async ? (byte)0x43 : (byte)0x40);
+                w.Byte((byte)(fn.Async ? ComponentTypeCode.AsyncFunc : ComponentTypeCode.Func));
                 WriteLabeledList(w, fn.Params);
                 if (fn.NamedResults is { } named)
                 {
@@ -436,8 +414,8 @@ internal static class ComponentTypeCodec
 
                 break;
             case CtResource res: w.Byte(res.Opcode); w.Bytes(res.Raw); break;
-            case CtInstanceType inst: w.Byte(0x42); WriteDecls(w, inst.Decls); break;
-            case CtComponentType comp: w.Byte(0x41); WriteDecls(w, comp.Decls); break;
+            case CtInstanceType inst: w.Byte((byte)ComponentTypeCode.Instance); WriteDecls(w, inst.Decls); break;
+            case CtComponentType comp: w.Byte((byte)ComponentTypeCode.Component); WriteDecls(w, comp.Decls); break;
             default: throw new InvalidOperationException($"Unhandled component type {type.GetType().Name}.");
         }
     }
@@ -449,13 +427,13 @@ internal static class ComponentTypeCodec
         for (uint i = 0; i < count; i++)
         {
             byte kind = r.ReadByte();
-            decls.Add(kind switch
+            decls.Add((ComponentDeclKind)kind switch
             {
-                0x00 => new CtCoreTypeDecl(ReadRawCoreType(r)),
-                0x01 => new CtTypeDecl(ReadDefType(r)),
-                0x02 => ReadAlias(r),
-                0x03 when allowImports => ReadImportDecl(r),
-                0x04 => ReadExportDecl(r),
+                ComponentDeclKind.CoreType => new CtCoreTypeDecl(ReadRawCoreType(r)),
+                ComponentDeclKind.Type => new CtTypeDecl(ReadDefType(r)),
+                ComponentDeclKind.Alias => ReadAlias(r),
+                ComponentDeclKind.Import when allowImports => ReadImportDecl(r),
+                ComponentDeclKind.Export => ReadExportDecl(r),
                 _ => throw new FormatException($"Unknown component type declaration 0x{kind:X2}."),
             });
         }
@@ -470,11 +448,11 @@ internal static class ComponentTypeCodec
         {
             switch (decl)
             {
-                case CtCoreTypeDecl core: w.Byte(0x00); w.Bytes(core.Raw); break;
-                case CtTypeDecl t: w.Byte(0x01); WriteDefType(w, t.Type); break;
-                case CtAliasDecl a: w.Byte(0x02); WriteAlias(w, a); break;
-                case CtImportDecl i: w.Byte(0x03); WriteExternName(w, i.Name, i.RawName); WriteExternDesc(w, i.Desc); break;
-                case CtExportDecl e: w.Byte(0x04); WriteExternName(w, e.Name, e.RawName); WriteExternDesc(w, e.Desc); break;
+                case CtCoreTypeDecl core: w.Byte((byte)ComponentDeclKind.CoreType); w.Bytes(core.Raw); break;
+                case CtTypeDecl t: w.Byte((byte)ComponentDeclKind.Type); WriteDefType(w, t.Type); break;
+                case CtAliasDecl a: w.Byte((byte)ComponentDeclKind.Alias); WriteAlias(w, a); break;
+                case CtImportDecl i: w.Byte((byte)ComponentDeclKind.Import); WriteExternName(w, i.Name, i.RawName); WriteExternDesc(w, i.Desc); break;
+                case CtExportDecl e: w.Byte((byte)ComponentDeclKind.Export); WriteExternName(w, e.Name, e.RawName); WriteExternDesc(w, e.Desc); break;
                 default: throw new InvalidOperationException($"Unhandled declaration {decl.GetType().Name}.");
             }
         }
@@ -497,12 +475,12 @@ internal static class ComponentTypeCodec
                 for (uint i = 0; i < count; i++)
                 {
                     byte kind = r.ReadByte();
-                    switch (kind)
+                    switch ((CoreModuleDeclKind)kind)
                     {
-                        case 0x00: r.ReadName(); r.ReadName(); SkipCoreImportDesc(r); break;
-                        case 0x01: ReadRawCoreType(r); break;
-                        case 0x02: r.ReadByte(); r.ReadByte(); r.ReadU32(); r.ReadU32(); break;
-                        case 0x03: r.ReadName(); SkipCoreImportDesc(r); break;
+                        case CoreModuleDeclKind.Import: r.ReadName(); r.ReadName(); SkipCoreImportDesc(r); break;
+                        case CoreModuleDeclKind.Type: ReadRawCoreType(r); break;
+                        case CoreModuleDeclKind.Alias: r.ReadByte(); r.ReadByte(); r.ReadU32(); r.ReadU32(); break;
+                        case CoreModuleDeclKind.Export: r.ReadName(); SkipCoreImportDesc(r); break;
                         default: throw new FormatException($"Unknown core module type declaration 0x{kind:X2}.");
                     }
                 }
@@ -532,13 +510,13 @@ internal static class ComponentTypeCodec
     private static void SkipCoreImportDesc(CtReader r)
     {
         byte kind = r.ReadByte();
-        switch (kind)
+        switch ((CoreSort)kind)
         {
-            case 0x00: r.ReadU32(); break;
-            case 0x01: SkipCoreValType(r); SkipLimits(r); break;
-            case 0x02: SkipLimits(r); break;
-            case 0x03: SkipCoreValType(r); r.ReadByte(); break;
-            case 0x04: r.ReadByte(); r.ReadU32(); break;
+            case CoreSort.Func: r.ReadU32(); break;
+            case CoreSort.Table: SkipCoreValType(r); SkipLimits(r); break;
+            case CoreSort.Memory: SkipLimits(r); break;
+            case CoreSort.Global: SkipCoreValType(r); r.ReadByte(); break;
+            case CoreSort.Tag: r.ReadByte(); r.ReadU32(); break;
             default: throw new FormatException($"Unknown core import kind 0x{kind:X2}.");
         }
     }
@@ -553,26 +531,26 @@ internal static class ComponentTypeCodec
 
     public static CtSort ReadSort(CtReader r)
     {
-        byte kind = r.ReadByte();
-        return kind == CtSort.Core ? new CtSort(kind, r.ReadByte()) : new CtSort(kind);
+        var kind = (ComponentSort)r.ReadByte();
+        return kind == ComponentSort.Core ? new CtSort(kind, (CoreSort)r.ReadByte()) : new CtSort(kind);
     }
 
     public static void WriteSort(CtWriter w, CtSort sort)
     {
-        w.Byte(sort.Kind);
-        if (sort.Kind == CtSort.Core)
-            w.Byte(sort.CoreSort);
+        w.Byte((byte)sort.Kind);
+        if (sort.Kind == ComponentSort.Core)
+            w.Byte((byte)sort.CoreSort);
     }
 
     public static CtAliasDecl ReadAlias(CtReader r)
     {
         CtSort sort = ReadSort(r);
         byte target = r.ReadByte();
-        return new CtAliasDecl(sort, target switch
+        return new CtAliasDecl(sort, (ComponentAliasTarget)target switch
         {
-            0x00 => new CtAliasExport(r.ReadU32(), r.ReadName()),
-            0x01 => new CtAliasCoreExport(r.ReadU32(), r.ReadName()),
-            0x02 => new CtAliasOuter(r.ReadU32(), r.ReadU32()),
+            ComponentAliasTarget.Export => new CtAliasExport(r.ReadU32(), r.ReadName()),
+            ComponentAliasTarget.CoreExport => new CtAliasCoreExport(r.ReadU32(), r.ReadName()),
+            ComponentAliasTarget.Outer => new CtAliasOuter(r.ReadU32(), r.ReadU32()),
             _ => throw new FormatException($"Unknown alias target 0x{target:X2}."),
         });
     }
@@ -582,9 +560,9 @@ internal static class ComponentTypeCodec
         WriteSort(w, alias.Sort);
         switch (alias.Target)
         {
-            case CtAliasExport e: w.Byte(0x00); w.U32(e.Instance); w.Name(e.Name); break;
-            case CtAliasCoreExport c: w.Byte(0x01); w.U32(c.Instance); w.Name(c.Name); break;
-            case CtAliasOuter o: w.Byte(0x02); w.U32(o.Count); w.U32(o.Index); break;
+            case CtAliasExport e: w.Byte((byte)ComponentAliasTarget.Export); w.U32(e.Instance); w.Name(e.Name); break;
+            case CtAliasCoreExport c: w.Byte((byte)ComponentAliasTarget.CoreExport); w.U32(c.Instance); w.Name(c.Name); break;
+            case CtAliasOuter o: w.Byte((byte)ComponentAliasTarget.Outer); w.U32(o.Count); w.U32(o.Index); break;
             default: throw new InvalidOperationException($"Unhandled alias target {alias.Target.GetType().Name}.");
         }
     }
@@ -640,57 +618,57 @@ internal static class ComponentTypeCodec
 
     public static CtExternDesc ReadExternDesc(CtReader r)
     {
-        byte kind = r.ReadByte();
+        var kind = (ComponentExternKind)r.ReadByte();
         switch (kind)
         {
-            case CtExternDesc.CoreModule:
-                if (r.ReadByte() != 0x11)
+            case ComponentExternKind.CoreModule:
+                if (r.ReadByte() != (byte)CoreSort.Module)
                     throw new FormatException("Core extern descriptors other than modules are not valid here.");
                 return new CtExternDesc(kind, r.ReadU32());
-            case CtExternDesc.Type:
-                return r.ReadByte() switch
+            case ComponentExternKind.Type:
+                return (TypeBoundKind)r.ReadByte() switch
                 {
-                    0x00 => new CtExternDesc(kind, r.ReadU32()),
-                    0x01 => new CtExternDesc(kind, 0, SubResource: true),
-                    var b => throw new FormatException($"Unknown type bound 0x{b:X2}."),
+                    TypeBoundKind.Eq => new CtExternDesc(kind, r.ReadU32()),
+                    TypeBoundKind.SubResource => new CtExternDesc(kind, 0, SubResource: true),
+                    var b => throw new FormatException($"Unknown type bound 0x{(byte)b:X2}."),
                 };
-            case CtExternDesc.Value:
+            case ComponentExternKind.Value:
             {
                 int start = r.Position;
-                if (r.ReadByte() == 0x00)
+                if ((ValueBoundKind)r.ReadByte() == ValueBoundKind.Value)
                     r.ReadU32();
                 else
                     ReadValType(r);
                 return new CtExternDesc(kind, 0, RawValueBound: r.Slice(start));
             }
-            case CtExternDesc.Func:
-            case CtExternDesc.Component:
-            case CtExternDesc.Instance:
+            case ComponentExternKind.Func:
+            case ComponentExternKind.Component:
+            case ComponentExternKind.Instance:
                 return new CtExternDesc(kind, r.ReadU32());
             default:
-                throw new FormatException($"Unknown externdesc 0x{kind:X2}.");
+                throw new FormatException($"Unknown externdesc 0x{(byte)kind:X2}.");
         }
     }
 
     public static void WriteExternDesc(CtWriter w, CtExternDesc desc)
     {
-        w.Byte(desc.Kind);
+        w.Byte((byte)desc.Kind);
         switch (desc.Kind)
         {
-            case CtExternDesc.CoreModule: w.Byte(0x11); w.U32(desc.Index); break;
-            case CtExternDesc.Type:
+            case ComponentExternKind.CoreModule: w.Byte((byte)CoreSort.Module); w.U32(desc.Index); break;
+            case ComponentExternKind.Type:
                 if (desc.SubResource)
                 {
-                    w.Byte(0x01);
+                    w.Byte((byte)TypeBoundKind.SubResource);
                 }
                 else
                 {
-                    w.Byte(0x00);
+                    w.Byte((byte)TypeBoundKind.Eq);
                     w.U32(desc.Index);
                 }
 
                 break;
-            case CtExternDesc.Value: w.Bytes(desc.RawValueBound!); break;
+            case ComponentExternKind.Value: w.Bytes(desc.RawValueBound!); break;
             default: w.U32(desc.Index); break;
         }
     }
@@ -699,18 +677,18 @@ internal static class ComponentTypeCodec
     public static bool DefinesType(CtDecl decl) => decl switch
     {
         CtTypeDecl => true,
-        CtAliasDecl a => a.Sort.Kind == CtSort.Type,
-        CtImportDecl i => i.Desc.Kind == CtExternDesc.Type,
-        CtExportDecl e => e.Desc.Kind == CtExternDesc.Type,
+        CtAliasDecl a => a.Sort.Kind == ComponentSort.Type,
+        CtImportDecl i => i.Desc.Kind == ComponentExternKind.Type,
+        CtExportDecl e => e.Desc.Kind == ComponentExternKind.Type,
         _ => false,
     };
 
     /// <summary>Whether the declaration adds an entry to the component-instance index space.</summary>
     public static bool DefinesInstance(CtDecl decl) => decl switch
     {
-        CtAliasDecl a => a.Sort.Kind == CtSort.Instance,
-        CtImportDecl i => i.Desc.Kind == CtExternDesc.Instance,
-        CtExportDecl e => e.Desc.Kind == CtExternDesc.Instance,
+        CtAliasDecl a => a.Sort.Kind == ComponentSort.Instance,
+        CtImportDecl i => i.Desc.Kind == ComponentExternKind.Instance,
+        CtExportDecl e => e.Desc.Kind == ComponentExternKind.Instance,
         _ => false,
     };
 

@@ -3,6 +3,9 @@
 
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
+using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
+
 /// <summary>An interface (component instance type) imported or exported by a WIT world.</summary>
 internal sealed class WitInterface
 {
@@ -43,7 +46,7 @@ internal sealed class WitInterface
 
     public CtFunc? FindFunction(string name, out int declIndex)
     {
-        if (Exports.TryGetValue(name, out declIndex) && Decls[declIndex] is CtExportDecl { Desc.Kind: CtExternDesc.Func } export)
+        if (Exports.TryGetValue(name, out declIndex) && Decls[declIndex] is CtExportDecl { Desc.Kind: ComponentExternKind.Func } export)
             return Resolve(export.Desc.Index) as CtFunc;
         declIndex = -1;
         return null;
@@ -151,9 +154,9 @@ internal sealed class WitWorld
         {
             byte id = r.ReadByte();
             CtReader section = r.Sub(checked((int)r.ReadU32()));
-            switch (id)
+            switch ((ComponentSectionId)id)
             {
-                case 0:
+                case ComponentSectionId.Custom:
                     string name = section.ReadName();
                     if (name == "wit-component-encoding" && section.HasMore)
                     {
@@ -163,12 +166,12 @@ internal sealed class WitWorld
                     }
 
                     break;
-                case 7:
+                case ComponentSectionId.Type:
                     uint count = section.ReadU32();
                     for (uint i = 0; i < count; i++)
                         types.Add(ComponentTypeCodec.ReadDefType(section));
                     break;
-                case 11:
+                case ComponentSectionId.Export:
                     // A world encoded as `(component (type (component <world>)) (export "pkg/world" (component (type 0))))`
                     // lives in a type definition; a bare export section is not expected here.
                     break;
@@ -187,7 +190,7 @@ internal sealed class WitWorld
                     case CtTypeDecl t:
                         outerTypes.Add(t.Type);
                         break;
-                    case CtExportDecl { Desc.Kind: CtExternDesc.Component } e
+                    case CtExportDecl { Desc.Kind: ComponentExternKind.Component } e
                         when e.Desc.Index < outerTypes.Count && outerTypes[(int)e.Desc.Index] is CtComponentType w:
                         world = w;
                         break;
@@ -216,14 +219,14 @@ internal sealed class WitWorld
                 case CtTypeDecl t:
                     worldTypes.Add(t.Type);
                     break;
-                case CtAliasDecl { Sort.Kind: CtSort.Type, Target: CtAliasExport e }:
+                case CtAliasDecl { Sort.Kind: ComponentSort.Type, Target: CtAliasExport e }:
                     WitInterface owner = instances[(int)e.Instance];
                     worldTypes.Add(new CtAliasSymbol(owner.Key, owner.IsExport, e.Name));
                     break;
-                case CtImportDecl { Desc.Kind: CtExternDesc.Instance } import:
+                case CtImportDecl { Desc.Kind: ComponentExternKind.Instance } import:
                     instances.Add(Merge(Imports, Normalize(import.Name, import.Desc.Index, worldTypes, false, mergeBySemver)));
                     break;
-                case CtExportDecl { Desc.Kind: CtExternDesc.Instance } export:
+                case CtExportDecl { Desc.Kind: ComponentExternKind.Instance } export:
                     instances.Add(Merge(Exports, Normalize(export.Name, export.Desc.Index, worldTypes, true, mergeBySemver)));
                     break;
                 default:
@@ -245,7 +248,7 @@ internal sealed class WitWorld
         {
             if (decl is CtAliasDecl { Target: CtAliasOuter outer } alias)
             {
-                if (outer.Count != 1 || alias.Sort.Kind != CtSort.Type || outer.Index >= worldTypes.Count
+                if (outer.Count != 1 || alias.Sort.Kind != ComponentSort.Type || outer.Index >= worldTypes.Count
                     || worldTypes[(int)outer.Index] is not CtAliasSymbol symbol)
                     throw new NotSupportedException(
                         $"Interface `{name}` refers to a world-level type; only types from other interfaces are supported.");

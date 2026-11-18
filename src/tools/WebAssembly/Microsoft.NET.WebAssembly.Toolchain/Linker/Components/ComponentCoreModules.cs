@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
 /// Core-module surgery on component binaries: listing, replacing and unbundling the core modules a component
@@ -15,10 +16,6 @@ public static class ComponentCoreModules
     /// <summary>The default <c>--threshold</c> of <c>wasm-tools component unbundle</c>: modules larger than this are extracted.</summary>
     public const int DefaultUnbundleThreshold = 10240;
 
-    private const byte SectionCoreModule = 1, SectionCoreInstance = 2, SectionCoreType = 3, SectionComponent = 4,
-        SectionInstance = 5, SectionAlias = 6, SectionImport = 10, SectionExport = 11;
-
-    private const byte SortCore = 0x00, CoreSortModule = 0x11, CoreSortType = 0x10;
 
     /// <summary>The result of <see cref="Unbundle"/>: the rewritten component and the extracted modules, in order.</summary>
     public sealed record UnbundleResult(byte[] Component, IReadOnlyList<byte[]> Modules);
@@ -30,7 +27,7 @@ public static class ComponentCoreModules
         var modules = new List<byte[]>();
         foreach (var (id, start, end, _) in Sections(component))
         {
-            if (id == SectionCoreModule)
+            if ((ComponentSectionId)id == ComponentSectionId.CoreModule)
                 modules.Add(component[start..end]);
         }
 
@@ -58,10 +55,10 @@ public static class ComponentCoreModules
         bool replaced = false;
         foreach (var (id, start, end, sectionStart) in Sections(component))
         {
-            if (id == SectionCoreModule && current++ == index)
+            if ((ComponentSectionId)id == ComponentSectionId.CoreModule && current++ == index)
             {
                 RequireCompatible(component[start..end], module, index);
-                w.Byte(SectionCoreModule);
+                w.Byte((byte)ComponentSectionId.CoreModule);
                 w.U32((uint)module.Length);
                 w.Bytes(module);
                 replaced = true;
@@ -113,21 +110,33 @@ public static class ComponentCoreModules
     {
         if (actual.Kind != expected.Kind)
             return false;
-        switch (actual.Kind)
+        switch ((CoreSort)actual.Kind)
         {
-            case 0x00:
-            case 0x04:
+            case CoreSort.Func:
+            case CoreSort.Tag:
                 return actualModule.Types[actual.TypeIndex].AsSpan().SequenceEqual(expectedModule.Types[expected.TypeIndex]);
-            case 0x03:
+            case CoreSort.Global:
                 return actual.Raw.AsSpan().SequenceEqual(expected.Raw);
-            case 0x01:
-                // Element types are single bytes here (typed references are rejected when reading).
-                return actual.Raw[0] == expected.Raw[0] && LimitsSubtype(actual.Raw, 1, expected.Raw, 1);
-            case 0x02:
+            case CoreSort.Table:
+                // The element type is a reference type, one byte or a typed reference (0x63/0x64 and an s33 heap
+                // type); tables are invariant in it, and the limits follow it.
+                int actualLength = RefTypeLength(actual.Raw), expectedLength = RefTypeLength(expected.Raw);
+                return actual.Raw.AsSpan(0, actualLength).SequenceEqual(expected.Raw.AsSpan(0, expectedLength)) &&
+                    LimitsSubtype(actual.Raw, actualLength, expected.Raw, expectedLength);
+            case CoreSort.Memory:
                 return LimitsSubtype(actual.Raw, 0, expected.Raw, 0);
             default:
                 return false;
         }
+    }
+
+    private static int RefTypeLength(byte[] raw)
+    {
+        if (raw[0] is not (0x63 or 0x64))
+            return 1;
+        var r = new CtReader(raw, 1, raw.Length);
+        r.ReadS33();
+        return r.Position;
     }
 
     private static bool LimitsSubtype(byte[] actual, int actualStart, byte[] expected, int expectedStart)
@@ -144,22 +153,10 @@ public static class ComponentCoreModules
         var r = new CtReader(raw, start, raw.Length);
         byte flags = r.ReadByte();
         bool is64 = (flags & 0x04) != 0;
-        ulong min = is64 ? ReadU64(r) : r.ReadU32();
-        ulong? max = (flags & 0x01) != 0 ? (is64 ? ReadU64(r) : r.ReadU32()) : null;
+        ulong min = is64 ? r.ReadU64() : r.ReadU32();
+        ulong? max = (flags & 0x01) != 0 ? (is64 ? r.ReadU64() : r.ReadU32()) : null;
         uint? pageSize = (flags & 0x08) != 0 ? r.ReadU32() : null;
         return ((byte)(flags & ~0x01), min, max, pageSize);
-    }
-
-    private static ulong ReadU64(CtReader r)
-    {
-        ulong result = 0;
-        for (int shift = 0; ; shift += 7)
-        {
-            byte b = r.ReadByte();
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-        }
     }
 
     /// <summary>
@@ -180,11 +177,11 @@ public static class ComponentCoreModules
         var extracted = new List<byte[]>();
         foreach (var (id, start, end, _) in Sections(component))
         {
-            if (id == SectionCoreModule && end - start > threshold)
+            if ((ComponentSectionId)id == ComponentSectionId.CoreModule && end - start > threshold)
                 extracted.Add(component[start..end]);
-            else if (id == SectionComponent)
+            else if ((ComponentSectionId)id == ComponentSectionId.Component)
                 CheckNested(component, start, end, depth: 1, threshold);
-            else if (id is SectionCoreType)
+            else if ((ComponentSectionId)id is ComponentSectionId.CoreType)
                 throw new NotSupportedException("unbundling a component with a top-level core type section is not supported.");
         }
 
@@ -205,20 +202,20 @@ public static class ComponentCoreModules
 
         var w = new CtWriter();
         w.Bytes(component.AsSpan(0, 8));
-        w.Section(SectionCoreType, s =>
+        w.Section(ComponentSectionId.CoreType, s =>
         {
             s.U32((uint)typeEntries.Count);
             foreach (byte[] entry in typeEntries)
                 s.Bytes(entry);
         });
-        w.Section(SectionImport, s =>
+        w.Section(ComponentSectionId.Import, s =>
         {
             s.U32(extraModules);
             for (int i = 0; i < extracted.Count; i++)
             {
                 ComponentTypeCodec.WriteExternName(s, $"unbundled-module{i}");
-                s.Byte(CtExternDesc.CoreModule);
-                s.Byte(CoreSortModule);
+                s.Byte((byte)ComponentExternKind.CoreModule);
+                s.Byte((byte)CoreSort.Module);
                 s.U32(moduleTypeIndices[i]);
             }
         });
@@ -227,40 +224,40 @@ public static class ComponentCoreModules
         foreach (var (id, start, end, sectionStart) in Sections(component))
         {
             var r = new CtReader(component, start, end);
-            switch (id)
+            switch ((ComponentSectionId)id)
             {
-                case SectionCoreModule when end - start > threshold:
+                case ComponentSectionId.CoreModule when end - start > threshold:
                     uint aliased = nextExtracted++;
-                    w.Section(SectionAlias, s =>
+                    w.Section(ComponentSectionId.Alias, s =>
                     {
                         s.U32(1);
-                        s.Byte(SortCore);
-                        s.Byte(CoreSortModule);
-                        s.Byte(0x02);
+                        s.Byte((byte)ComponentSort.Core);
+                        s.Byte((byte)CoreSort.Module);
+                        s.Byte((byte)ComponentAliasTarget.Outer);
                         s.U32(0);
                         s.U32(aliased);
                     });
                     break;
-                case SectionCoreInstance:
-                    w.Section(id, s => RewriteCoreInstances(r, s, extraModules));
+                case ComponentSectionId.CoreInstance:
+                    w.Section((ComponentSectionId)id, s => RewriteCoreInstances(r, s, extraModules));
                     break;
-                case SectionInstance:
-                    w.Section(id, s => RewriteInstances(r, s, extraModules));
+                case ComponentSectionId.Instance:
+                    w.Section((ComponentSectionId)id, s => RewriteInstances(r, s, extraModules));
                     break;
-                case SectionExport:
-                    w.Section(id, s => RewriteExports(r, s, extraModules));
+                case ComponentSectionId.Export:
+                    w.Section((ComponentSectionId)id, s => RewriteExports(r, s, extraModules));
                     break;
-                case SectionAlias:
+                case ComponentSectionId.Alias:
                     CheckAliases(r, depth: 0);
                     w.Bytes(component.AsSpan(sectionStart, end - sectionStart));
                     break;
-                case SectionImport:
+                case ComponentSectionId.Import:
                     CheckImports(r);
                     w.Bytes(component.AsSpan(sectionStart, end - sectionStart));
                     break;
-                case 0 when r.ReadName() == "component-name":
+                case ComponentSectionId.Custom when r.ReadName() == "component-name":
                     int payload = r.Position;
-                    w.Section(0, s =>
+                    w.Section(ComponentSectionId.Custom, s =>
                     {
                         s.Name("component-name");
                         RewriteNames(new CtReader(component, payload, end), s, extraModules, extraTypes);
@@ -307,7 +304,7 @@ public static class ComponentCoreModules
         {
             byte kind = r.ReadByte();
             w.Byte(kind);
-            if (kind == 0x00)
+            if (kind == (byte)InstanceExprKind.Instantiate)
             {
                 w.U32(r.ReadU32() + extraModules);
                 uint args = r.ReadU32();
@@ -319,7 +316,7 @@ public static class ComponentCoreModules
                     w.U32(r.ReadU32());
                 }
             }
-            else if (kind == 0x01)
+            else if (kind == (byte)InstanceExprKind.FromExports)
             {
                 uint exports = r.ReadU32();
                 w.U32(exports);
@@ -345,7 +342,7 @@ public static class ComponentCoreModules
         {
             byte kind = r.ReadByte();
             w.Byte(kind);
-            if (kind == 0x00)
+            if (kind == (byte)InstanceExprKind.Instantiate)
             {
                 w.U32(r.ReadU32());
                 uint args = r.ReadU32();
@@ -356,7 +353,7 @@ public static class ComponentCoreModules
                     RewriteSortIndex(r, w, extraModules);
                 }
             }
-            else if (kind == 0x01)
+            else if (kind == (byte)InstanceExprKind.FromExports)
             {
                 uint exports = r.ReadU32();
                 w.U32(exports);
@@ -386,7 +383,7 @@ public static class ComponentCoreModules
             if (hasType == 0x01)
             {
                 CtExternDesc desc = ComponentTypeCodec.ReadExternDesc(r);
-                if (desc.Kind == CtExternDesc.CoreModule)
+                if (desc.Kind == ComponentExternKind.CoreModule)
                     throw new NotSupportedException("unbundling a component that ascribes a core module type to an export is not supported.");
                 ComponentTypeCodec.WriteExternDesc(w, desc);
             }
@@ -412,7 +409,7 @@ public static class ComponentCoreModules
             }
 
             CtSort sort = ComponentTypeCodec.ReadSort(sub);
-            uint shift = sort.Kind == SortCore ? sort.CoreSort switch { CoreSortModule => extraModules, CoreSortType => extraTypes, _ => 0u } : 0u;
+            uint shift = sort.Kind == ComponentSort.Core ? sort.CoreSort switch { CoreSort.Module => extraModules, CoreSort.Type => extraTypes, _ => 0u } : 0u;
             var body = new CtWriter();
             ComponentTypeCodec.WriteSort(body, sort);
             uint count = sub.ReadU32();
@@ -433,9 +430,9 @@ public static class ComponentCoreModules
     {
         CtSort sort = ComponentTypeCodec.ReadSort(r);
         uint index = r.ReadU32();
-        if (sort.Kind == SortCore && sort.CoreSort == CoreSortModule)
+        if (sort.Kind == ComponentSort.Core && sort.CoreSort == CoreSort.Module)
             index += extraModules;
-        else if (sort.Kind == SortCore && sort.CoreSort == CoreSortType)
+        else if (sort.Kind == ComponentSort.Core && sort.CoreSort == CoreSort.Type)
             throw new NotSupportedException("unbundling a component that passes core types between instances is not supported.");
         ComponentTypeCodec.WriteSort(w, sort);
         w.U32(index);
@@ -454,7 +451,7 @@ public static class ComponentCoreModules
         for (uint i = 0; i < count; i++)
         {
             ComponentTypeCodec.ReadExternName(r);
-            if (ComponentTypeCodec.ReadExternDesc(r).Kind == CtExternDesc.CoreModule)
+            if (ComponentTypeCodec.ReadExternDesc(r).Kind == ComponentExternKind.CoreModule)
                 throw new NotSupportedException("unbundling a component that imports core modules is not supported.");
         }
     }
@@ -466,7 +463,7 @@ public static class ComponentCoreModules
         for (uint i = 0; i < count; i++)
         {
             CtAliasDecl alias = ComponentTypeCodec.ReadAlias(r);
-            if (alias is { Sort.Kind: SortCore, Sort.CoreSort: CoreSortModule or CoreSortType, Target: CtAliasOuter outer } && outer.Count == depth)
+            if (alias is { Sort.Kind: ComponentSort.Core, Sort.CoreSort: CoreSort.Module or CoreSort.Type, Target: CtAliasOuter outer } && outer.Count == depth)
                 throw new NotSupportedException("unbundling a component with outer aliases of top-level core modules or core types is not supported.");
         }
     }
@@ -475,14 +472,14 @@ public static class ComponentCoreModules
     {
         foreach (var (id, s, e, _) in Sections(bytes, start + 8, end))
         {
-            switch (id)
+            switch ((ComponentSectionId)id)
             {
-                case SectionCoreModule when e - s > threshold:
+                case ComponentSectionId.CoreModule when e - s > threshold:
                     throw new NotSupportedException("unbundling core modules embedded in nested components is not supported.");
-                case SectionComponent:
+                case ComponentSectionId.Component:
                     CheckNested(bytes, s, e, depth + 1, threshold);
                     break;
-                case SectionAlias:
+                case ComponentSectionId.Alias:
                     CheckAliases(new CtReader(bytes, s, e), depth);
                     break;
             }
@@ -515,9 +512,9 @@ public static class ComponentCoreModules
             }
 
             var alias = new CtWriter();
-            alias.Byte(0x02);
-            alias.Byte(CoreSortType);
-            alias.Byte(0x01);
+            alias.Byte((byte)CoreModuleDeclKind.Alias);
+            alias.Byte((byte)CoreSort.Type);
+            alias.Byte(0x01); // core:aliastarget outer
             alias.U32(1);
             alias.U32(outer);
             decls.Add(alias.ToArray());
@@ -528,12 +525,12 @@ public static class ComponentCoreModules
         {
             var w = new CtWriter();
             w.Byte(entity.Kind);
-            switch (entity.Kind)
+            switch ((CoreSort)entity.Kind)
             {
-                case 0x00:
+                case CoreSort.Func:
                     w.U32(TypeIndex(entity.TypeIndex));
                     break;
-                case 0x04:
+                case CoreSort.Tag:
                     w.Byte(0x00);
                     w.U32(TypeIndex(entity.TypeIndex));
                     break;
@@ -549,7 +546,7 @@ public static class ComponentCoreModules
         {
             byte[] type = EntityType(entity);
             var d = new CtWriter();
-            d.Byte(0x00);
+            d.Byte((byte)CoreModuleDeclKind.Import);
             d.Name(moduleName);
             d.Name(field);
             d.Bytes(type);
@@ -560,7 +557,7 @@ public static class ComponentCoreModules
         {
             byte[] type = EntityType(entity);
             var d = new CtWriter();
-            d.Byte(0x03);
+            d.Byte((byte)CoreModuleDeclKind.Export);
             d.Name(name);
             d.Bytes(type);
             decls.Add(d.ToArray());
@@ -597,9 +594,9 @@ public static class ComponentCoreModules
             foreach (var (id, start, end, _) in Sections(module))
             {
                 var r = new CtReader(module, start, end);
-                switch (id)
+                switch ((WasmSectionId)id)
                 {
-                    case 1:
+                    case WasmSectionId.Type:
                         uint typeCount = r.ReadU32();
                         for (uint i = 0; i < typeCount; i++)
                         {
@@ -612,7 +609,7 @@ public static class ComponentCoreModules
                         }
 
                         break;
-                    case 2:
+                    case WasmSectionId.Import:
                         uint importCount = r.ReadU32();
                         for (uint i = 0; i < importCount; i++)
                         {
@@ -621,29 +618,29 @@ public static class ComponentCoreModules
                             byte kind = r.ReadByte();
                             int rawStart = r.Position;
                             Entity entity;
-                            switch (kind)
+                            switch ((CoreSort)kind)
                             {
-                                case 0x00:
+                                case CoreSort.Func:
                                     entity = new Entity(kind, checked((int)r.ReadU32()), []);
                                     funcs.Add(entity.TypeIndex);
                                     break;
-                                case 0x01:
+                                case CoreSort.Table:
                                     SkipTableType(r);
                                     entity = new Entity(kind, 0, r.Slice(rawStart));
                                     tables.Add(entity.Raw);
                                     break;
-                                case 0x02:
+                                case CoreSort.Memory:
                                     SkipLimits(r);
                                     entity = new Entity(kind, 0, r.Slice(rawStart));
                                     memories.Add(entity.Raw);
                                     break;
-                                case 0x03:
+                                case CoreSort.Global:
                                     SkipValType(r);
                                     r.ReadByte();
                                     entity = new Entity(kind, 0, r.Slice(rawStart));
                                     globals.Add(entity.Raw);
                                     break;
-                                case 0x04:
+                                case CoreSort.Tag:
                                     r.ReadByte();
                                     entity = new Entity(kind, checked((int)r.ReadU32()), []);
                                     tags.Add(entity.TypeIndex);
@@ -656,12 +653,12 @@ public static class ComponentCoreModules
                         }
 
                         break;
-                    case 3:
+                    case WasmSectionId.Function:
                         uint funcCount = r.ReadU32();
                         for (uint i = 0; i < funcCount; i++)
                             funcs.Add(checked((int)r.ReadU32()));
                         break;
-                    case 4:
+                    case WasmSectionId.Table:
                         uint tableCount = r.ReadU32();
                         for (uint i = 0; i < tableCount; i++)
                         {
@@ -673,7 +670,7 @@ public static class ComponentCoreModules
                         }
 
                         break;
-                    case 5:
+                    case WasmSectionId.Memory:
                         uint memoryCount = r.ReadU32();
                         for (uint i = 0; i < memoryCount; i++)
                         {
@@ -683,7 +680,7 @@ public static class ComponentCoreModules
                         }
 
                         break;
-                    case 6:
+                    case WasmSectionId.Global:
                         uint globalCount = r.ReadU32();
                         for (uint i = 0; i < globalCount; i++)
                         {
@@ -695,12 +692,12 @@ public static class ComponentCoreModules
                         }
 
                         break;
-                    case 7:
+                    case WasmSectionId.Export:
                         uint exportCount = r.ReadU32();
                         for (uint i = 0; i < exportCount; i++)
                             exports.Add((r.ReadName(), r.ReadByte(), r.ReadU32()));
                         break;
-                    case 13:
+                    case WasmSectionId.Tag:
                         uint tagCount = r.ReadU32();
                         for (uint i = 0; i < tagCount; i++)
                         {
@@ -714,13 +711,13 @@ public static class ComponentCoreModules
 
             foreach (var (name, kind, index) in exports)
             {
-                info.Exports.Add((name, kind switch
+                info.Exports.Add((name, (CoreSort)kind switch
                 {
-                    0x00 => new Entity(kind, funcs[(int)index], []),
-                    0x01 => new Entity(kind, 0, tables[(int)index]),
-                    0x02 => new Entity(kind, 0, memories[(int)index]),
-                    0x03 => new Entity(kind, 0, globals[(int)index]),
-                    0x04 => new Entity(kind, tags[(int)index], []),
+                    CoreSort.Func => new Entity(kind, funcs[(int)index], []),
+                    CoreSort.Table => new Entity(kind, 0, tables[(int)index]),
+                    CoreSort.Memory => new Entity(kind, 0, memories[(int)index]),
+                    CoreSort.Global => new Entity(kind, 0, globals[(int)index]),
+                    CoreSort.Tag => new Entity(kind, tags[(int)index], []),
                     _ => throw new FormatException($"Unknown export kind 0x{kind:X2}."),
                 }));
             }
@@ -735,11 +732,13 @@ public static class ComponentCoreModules
                 SkipValType(r);
         }
 
+        // Types are copied into the component as raw bytes, which is exact for abstract heap types such as binaryen's
+        // (ref exn); a concrete (ref $t) names a module type index the component's core type space does not share.
         private static void SkipValType(CtReader r)
         {
             byte b = r.ReadByte();
-            if (b is 0x63 or 0x64)
-                throw new NotSupportedException("core modules with typed function references are not supported (unbundle, replace-module).");
+            if (b is 0x63 or 0x64 && r.ReadS33() >= 0)
+                throw new NotSupportedException("core modules with concrete typed references, (ref $t), are not supported (unbundle, replace-module).");
         }
 
         private static void SkipTableType(CtReader r)
@@ -753,9 +752,9 @@ public static class ComponentCoreModules
             byte flags = r.ReadByte();
             if ((flags & 0x04) != 0)
             {
-                ReadU64(r);
+                r.SkipLeb128();
                 if ((flags & 0x01) != 0)
-                    ReadU64(r);
+                    r.SkipLeb128();
             }
             else
             {
@@ -768,19 +767,12 @@ public static class ComponentCoreModules
                 r.ReadU32();
         }
 
-        private static void ReadU64(CtReader r)
-        {
-            while ((r.ReadByte() & 0x80) != 0)
-            {
-            }
-        }
-
         private static void SkipConstExpr(byte[] module, CtReader r)
         {
             var cursor = new InstructionCursor(module.AsSpan(r.Position, r.End - r.Position), WasmFeatures.All);
             while (cursor.MoveNext(out DecodedInstruction instruction))
             {
-                if (!instruction.OpcodeId.IsPrefixed && instruction.OpcodeId.Opcode == 0x0B)
+                if (!instruction.OpcodeId.IsPrefixed && instruction.OpcodeId.Opcode == WasmOpcode.End)
                 {
                     r.Position += cursor.Position;
                     return;

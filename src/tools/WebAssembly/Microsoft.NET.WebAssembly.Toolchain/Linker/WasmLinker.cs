@@ -85,6 +85,18 @@ public sealed class LinkerOptions
     public bool NoNameSection { get; init; }
 
     /// <summary>
+    /// When <c>true</c> (the default, as in wasm-ld), C++ (Itanium) and Rust v0 symbol names in the <c>name</c>
+    /// section of an object-file link are demangled; <c>--no-demangle</c> turns this off.
+    /// </summary>
+    public bool Demangle { get; init; } = true;
+
+    /// <summary>
+    /// The module name an object-file link writes to the <c>name</c> section. wasm-ld writes <c>--soname</c>, or
+    /// else the output file's name; <see cref="WasmLdCommandLine"/> sets it that way. <c>null</c> omits it.
+    /// </summary>
+    public string? ModuleName { get; init; }
+
+    /// <summary>
     /// When <c>true</c>, the output module imports its linear memory instead of defining it locally.
     /// </summary>
     public bool ImportMemory { get; init; }

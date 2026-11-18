@@ -7,6 +7,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using ExactValueType = Microsoft.NET.WebAssembly.Types.ValueType;
@@ -229,7 +230,7 @@ public static class WasmDisassembler
         while (cursor.MoveNext(out var instruction))
         {
             bool isImplicitFunctionEnd =
-                instruction.OpcodeId.Opcode == 0x0B &&
+                instruction.OpcodeId.Opcode == WasmOpcode.End &&
                 cursor.Position == body.Length;
             if (isImplicitFunctionEnd)
                 break;
@@ -265,16 +266,8 @@ public static class WasmDisassembler
 
     private static uint DecodeOpcodeSubImmediate(ReadOnlySpan<byte> bytes)
     {
-        uint result = 0;
-        int shift = 0;
-        foreach (byte value in bytes)
-        {
-            result |= (uint)(value & 0x7F) << shift;
-            if ((value & 0x80) == 0)
-                return result;
-            shift += 7;
-        }
-        return result;
+        int position = 0;
+        return WasmLeb128.ReadU32(bytes, ref position);
     }
 
     // ── Context ──────────────────────────────────────────────────────────
@@ -400,24 +393,12 @@ public static class WasmDisassembler
                 else if (opcodes.Length >= 2)
                 {
                     // Prefixed: decode the sub-opcode as u32 LEB128 from opcodes[1..]
-                    uint sub = DecodeLeb128(opcodes.AsSpan(1));
+                    int subPosition = 1;
+                    uint sub = WasmLeb128.ReadU32(opcodes, ref subPosition);
                     uint key = ((uint)opcodes[0] << 24) | sub;
                     PrefixedOpcodes.TryAdd(key, (mnemonic, entry.Immediate));
                 }
             }
-        }
-
-        private static uint DecodeLeb128(ReadOnlySpan<byte> bytes)
-        {
-            uint result = 0;
-            int shift = 0;
-            foreach (var b in bytes)
-            {
-                result |= (uint)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) return result;
-                shift += 7;
-            }
-            return result;
         }
 
         private void ParseNameSection(WasmModule module)
@@ -440,16 +421,16 @@ public static class WasmDisassembler
                 uint subsectionSize = reader.ReadU32Leb128();
                 long start = reader.Position;
 
-                switch (subsectionId)
+                switch ((NameSubsectionId)subsectionId)
                 {
-                    case 0: // module name
+                    case NameSubsectionId.Module:
                         ModuleName = reader.ReadName();
                         break;
-                    case 1: // function names
-                    case 2: // local names
+                    case NameSubsectionId.Function:
+                    case NameSubsectionId.Local:
                         // Parsed by WasmNameSectionReader for all consumers.
                         break;
-                    case 4: // type names
+                    case NameSubsectionId.Type:
                     {
                         uint count = reader.ReadU32Leb128();
                         for (uint i = 0; i < count; i++)
@@ -1359,7 +1340,7 @@ public static class WasmDisassembler
             while (cursor.MoveNext(out var instruction))
             {
                 byte opcode = instruction.OpcodeId.Opcode;
-                if (opcode == 0x0B)
+                if (opcode == WasmOpcode.End)
                 {
                     if (cursor.Position != expression.Length)
                         throw new WatException(
@@ -1422,7 +1403,7 @@ public static class WasmDisassembler
                         values.Add($"ref.func {function}");
                         break;
                     }
-                    case 0xFD when instruction.OpcodeId.SubOpcode == 0x0C:
+                    case WasmOpcode.SimdPrefix when instruction.OpcodeId.SubOpcode == 0x0C:
                     {
                         ReadOnlySpan<byte> bytes = instruction.ImmediateBytes[^16..];
                         var text = new StringBuilder("v128.const i32x4");
@@ -1434,7 +1415,7 @@ public static class WasmDisassembler
                         values.Add(text.ToString());
                         break;
                     }
-                    case 0xFB:
+                    case WasmOpcode.GcPrefix:
                     {
                         string name = GcConstantExpressionName(instruction.OpcodeId.SubOpcode);
                         throw new NotSupportedException(
@@ -1752,7 +1733,7 @@ public static class WasmDisassembler
 
         if (branchHints.TryGetValue(instructionOrdinal, out BranchHint? branchHint))
         {
-            if (opByte is not 0x04 and not 0x0D)
+            if (opByte is not WasmOpcode.If and not WasmOpcode.BrIf)
             {
                 throw new WatException(
                     $"Branch hint at instruction {instructionOrdinal} targets opcode " +
@@ -1764,7 +1745,7 @@ public static class WasmDisassembler
         }
 
         // END — close the current block with )
-        if (opByte == 0x0B)
+        if (opByte == WasmOpcode.End)
         {
             var block = blockStack.Count > 0 ? blockStack.Pop() : "block";
             if (block == "if-then")
@@ -1791,7 +1772,7 @@ public static class WasmDisassembler
         }
 
         // ELSE — close (then, open (else
-        if (opByte == 0x05)
+        if (opByte == WasmOpcode.Else)
         {
             if (blockStack.Count > 0) blockStack.Pop();
             indent--;
@@ -1804,9 +1785,9 @@ public static class WasmDisassembler
         }
 
         // Block-opening: block, loop
-        if (opByte is 0x02 or 0x03)
+        if (opByte is WasmOpcode.Block or WasmOpcode.Loop)
         {
-            string mnemonic = opByte == 0x02 ? "block" : "loop";
+            string mnemonic = opByte == WasmOpcode.Block ? "block" : "loop";
             Indent(output, indent);
             output.Write($"({mnemonic}");
             EmitBlockType(output, body, ref pos, ctx);
@@ -1818,7 +1799,7 @@ public static class WasmDisassembler
         }
 
         // If
-        if (opByte == 0x04)
+        if (opByte == WasmOpcode.If)
         {
             Indent(output, indent);
             output.Write("(if");
@@ -1834,7 +1815,7 @@ public static class WasmDisassembler
         }
 
         // try (legacy)
-        if (opByte == 0x06)
+        if (opByte == WasmOpcode.Try)
         {
             Indent(output, indent);
             output.Write("(block");
@@ -1847,7 +1828,7 @@ public static class WasmDisassembler
         }
 
         // try_table
-        if (opByte == 0x1F)
+        if (opByte == WasmOpcode.TryTable)
         {
             Indent(output, indent);
             output.Write("(try_table");
@@ -1872,7 +1853,7 @@ public static class WasmDisassembler
 
         if (instruction.OpcodeId.IsPrefixed)
         {
-            uint encodedSubOpcode = ReadU32Leb128(body, ref pos);
+            uint encodedSubOpcode = WasmLeb128.ReadU32(body, ref pos);
             if (encodedSubOpcode != instruction.OpcodeId.SubOpcode)
             {
                 throw new WatException(
@@ -1890,7 +1871,7 @@ public static class WasmDisassembler
                 return;
             }
 
-            if (opByte == 0xFB && inspectionMode)
+            if (opByte == WasmOpcode.GcPrefix && inspectionMode)
             {
                 Indent(output, indent);
                 EmitGcInstruction(output, body, ref pos, instruction.OpcodeId.SubOpcode, ctx);
@@ -1937,14 +1918,14 @@ public static class WasmDisassembler
         ref int pos,
         DisassemblyContext context)
     {
-        uint count = ReadU32Leb128(body, ref pos);
+        uint count = WasmLeb128.ReadU32(body, ref pos);
         writer.Write(" (result");
         for (uint i = 0; i < count; i++)
         {
             byte valueType = body[pos++];
             if (valueType is 0x63 or 0x64)
             {
-                long encodedHeapType = ReadS33Leb128(body, ref pos);
+                long encodedHeapType = WasmLeb128.ReadS33(body, ref pos);
                 var exact = new ExactValueType.Reference(
                     valueType == 0x63 ? Nullability.Nullable : Nullability.NonNullable,
                     ExactHeapType(encodedHeapType));
@@ -2018,7 +1999,7 @@ public static class WasmDisassembler
             case 0x0D:
             case 0x0E:
             case 0x10:
-                writer.Write($" {ReadU32Leb128(body, ref pos)}");
+                writer.Write($" {WasmLeb128.ReadU32(body, ref pos)}");
                 break;
             case 0x02:
             case 0x03:
@@ -2031,7 +2012,7 @@ public static class WasmDisassembler
             case 0x12:
             case 0x13:
                 writer.Write(
-                    $" {ReadU32Leb128(body, ref pos)} {ReadU32Leb128(body, ref pos)}");
+                    $" {WasmLeb128.ReadU32(body, ref pos)} {WasmLeb128.ReadU32(body, ref pos)}");
                 break;
             case 0x14:
             case 0x15:
@@ -2039,7 +2020,7 @@ public static class WasmDisassembler
             case 0x17:
             {
                 bool nullable = subOpcode is 0x15 or 0x17;
-                string heapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
+                string heapType = HeapTypeText(WasmLeb128.ReadS33(body, ref pos), context);
                 writer.Write(nullable ? $" (ref null {heapType})" : $" (ref {heapType})");
                 break;
             }
@@ -2047,9 +2028,9 @@ public static class WasmDisassembler
             case 0x19:
             {
                 byte flags = body[pos++];
-                uint label = ReadU32Leb128(body, ref pos);
-                string sourceHeapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
-                string targetHeapType = HeapTypeText(ReadS33Leb128(body, ref pos), context);
+                uint label = WasmLeb128.ReadU32(body, ref pos);
+                string sourceHeapType = HeapTypeText(WasmLeb128.ReadS33(body, ref pos), context);
+                string targetHeapType = HeapTypeText(WasmLeb128.ReadS33(body, ref pos), context);
                 string sourceNull = (flags & 0x01) != 0 ? " null" : "";
                 string targetNull = (flags & 0x02) != 0 ? " null" : "";
                 writer.Write(
@@ -2137,7 +2118,7 @@ public static class WasmDisassembler
         DisassemblyContext context)
     {
         EmitBlockType(writer, body, ref pos, context);
-        uint handlerCount = ReadU32Leb128(body, ref pos);
+        uint handlerCount = WasmLeb128.ReadU32(body, ref pos);
         for (uint i = 0; i < handlerCount; i++)
         {
             byte kind = body[pos++];
@@ -2145,27 +2126,27 @@ public static class WasmDisassembler
             {
                 case 0:
                 {
-                    uint tagIdx = ReadU32Leb128(body, ref pos);
-                    uint label = ReadU32Leb128(body, ref pos);
+                    uint tagIdx = WasmLeb128.ReadU32(body, ref pos);
+                    uint label = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" (catch {tagIdx} {label})");
                     break;
                 }
                 case 1:
                 {
-                    uint tagIdx = ReadU32Leb128(body, ref pos);
-                    uint label = ReadU32Leb128(body, ref pos);
+                    uint tagIdx = WasmLeb128.ReadU32(body, ref pos);
+                    uint label = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" (catch_ref {tagIdx} {label})");
                     break;
                 }
                 case 2:
                 {
-                    uint label = ReadU32Leb128(body, ref pos);
+                    uint label = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" (catch_all {label})");
                     break;
                 }
                 case 3:
                 {
-                    uint label = ReadU32Leb128(body, ref pos);
+                    uint label = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" (catch_all_ref {label})");
                     break;
                 }
@@ -2197,7 +2178,7 @@ public static class WasmDisassembler
             case ImmediateKind.MemIdx:
             case ImmediateKind.TypeIdx:
             {
-                uint idx = ReadU32Leb128(body, ref pos);
+                uint idx = WasmLeb128.ReadU32(body, ref pos);
                 if (imm == ImmediateKind.FuncIdx && ctx.FuncNames.TryGetValue((int)idx, out var n))
                     writer.Write($" {FormatRefName(n, (int)idx)}");
                 else if (imm == ImmediateKind.LocalIdx
@@ -2211,14 +2192,14 @@ public static class WasmDisassembler
 
             case ImmediateKind.I32:
             {
-                int val = ReadS32Leb128(body, ref pos);
+                int val = WasmLeb128.ReadS32(body, ref pos);
                 writer.Write($" {val}");
                 break;
             }
 
             case ImmediateKind.I64:
             {
-                long val = ReadS64Leb128(body, ref pos);
+                long val = WasmLeb128.ReadS64(body, ref pos);
                 writer.Write($" {val}");
                 break;
             }
@@ -2241,8 +2222,8 @@ public static class WasmDisassembler
 
             case ImmediateKind.MemArg:
             {
-                uint align = ReadU32Leb128(body, ref pos);
-                uint offset = ReadU32Leb128(body, ref pos);
+                uint align = WasmLeb128.ReadU32(body, ref pos);
+                uint offset = WasmLeb128.ReadU32(body, ref pos);
                 var natAlign = OpcodeTable.NaturalAlignment(mnemonic);
                 if (offset != 0)
                     writer.Write($" offset={offset}");
@@ -2253,21 +2234,21 @@ public static class WasmDisassembler
 
             case ImmediateKind.BrTable:
             {
-                uint count = ReadU32Leb128(body, ref pos);
+                uint count = WasmLeb128.ReadU32(body, ref pos);
                 for (uint i = 0; i < count; i++)
                 {
-                    uint label = ReadU32Leb128(body, ref pos);
+                    uint label = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" {label}");
                 }
-                uint defaultLabel = ReadU32Leb128(body, ref pos);
+                uint defaultLabel = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {defaultLabel}");
                 break;
             }
 
             case ImmediateKind.CallIndirect:
             {
-                uint typeIdx = ReadU32Leb128(body, ref pos);
-                uint tableIdx = ReadU32Leb128(body, ref pos);
+                uint typeIdx = WasmLeb128.ReadU32(body, ref pos);
+                uint tableIdx = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" (type {typeIdx})");
                 if (tableIdx != 0)
                     writer.Write($" {tableIdx}");
@@ -2276,29 +2257,29 @@ public static class WasmDisassembler
 
             case ImmediateKind.TypePair:
             {
-                uint first = ReadU32Leb128(body, ref pos);
-                uint second = ReadU32Leb128(body, ref pos);
+                uint first = WasmLeb128.ReadU32(body, ref pos);
+                uint second = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {first} {second}");
                 break;
             }
 
             case ImmediateKind.TypeTagPair:
             {
-                uint typeIdx = ReadU32Leb128(body, ref pos);
-                uint tagIdx = ReadU32Leb128(body, ref pos);
+                uint typeIdx = WasmLeb128.ReadU32(body, ref pos);
+                uint tagIdx = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {typeIdx} {tagIdx}");
                 break;
             }
 
             case ImmediateKind.ResumeTable:
             {
-                uint typeIdx = ReadU32Leb128(body, ref pos);
-                uint handlerCount = ReadU32Leb128(body, ref pos);
+                uint typeIdx = WasmLeb128.ReadU32(body, ref pos);
+                uint handlerCount = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {typeIdx}");
                 for (uint i = 0; i < handlerCount; i++)
                 {
-                    uint tagIdx = ReadU32Leb128(body, ref pos);
-                    uint labelIdx = ReadU32Leb128(body, ref pos);
+                    uint tagIdx = WasmLeb128.ReadU32(body, ref pos);
+                    uint labelIdx = WasmLeb128.ReadU32(body, ref pos);
                     writer.Write($" (on {tagIdx} {labelIdx})");
                 }
                 break;
@@ -2332,8 +2313,8 @@ public static class WasmDisassembler
 
             case ImmediateKind.MemArgLane:
             {
-                uint align = ReadU32Leb128(body, ref pos);
-                uint offset = ReadU32Leb128(body, ref pos);
+                uint align = WasmLeb128.ReadU32(body, ref pos);
+                uint offset = WasmLeb128.ReadU32(body, ref pos);
                 byte lane = body[pos++];
                 var natAlign = OpcodeTable.NaturalAlignment(mnemonic);
                 if (offset != 0)
@@ -2348,14 +2329,14 @@ public static class WasmDisassembler
             {
                 // `ref.null` is the only instruction with this immediate, and it takes a heap type
                 // encoded as an s33 — a defined type index when non-negative.
-                writer.Write($" {HeapTypeText(ReadS33Leb128(body, ref pos), ctx)}");
+                writer.Write($" {HeapTypeText(WasmLeb128.ReadS33(body, ref pos), ctx)}");
                 break;
             }
 
             case ImmediateKind.DataMemIdx:
             {
-                uint dataIdx = ReadU32Leb128(body, ref pos);
-                uint memIdx = ReadU32Leb128(body, ref pos);
+                uint dataIdx = WasmLeb128.ReadU32(body, ref pos);
+                uint memIdx = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {dataIdx}");
                 if (memIdx != 0) writer.Write($" {memIdx}");
                 break;
@@ -2363,8 +2344,8 @@ public static class WasmDisassembler
 
             case ImmediateKind.MemCopy:
             {
-                uint dst = ReadU32Leb128(body, ref pos);
-                uint src = ReadU32Leb128(body, ref pos);
+                uint dst = WasmLeb128.ReadU32(body, ref pos);
+                uint src = WasmLeb128.ReadU32(body, ref pos);
                 if (dst != 0 || src != 0)
                     writer.Write($" {dst} {src}");
                 break;
@@ -2372,16 +2353,16 @@ public static class WasmDisassembler
 
             case ImmediateKind.ElemTableIdx:
             {
-                uint elemIdx = ReadU32Leb128(body, ref pos);
-                uint tableIdx = ReadU32Leb128(body, ref pos);
+                uint elemIdx = WasmLeb128.ReadU32(body, ref pos);
+                uint tableIdx = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {elemIdx} {tableIdx}");
                 break;
             }
 
             case ImmediateKind.TableCopy:
             {
-                uint dst = ReadU32Leb128(body, ref pos);
-                uint src = ReadU32Leb128(body, ref pos);
+                uint dst = WasmLeb128.ReadU32(body, ref pos);
+                uint src = WasmLeb128.ReadU32(body, ref pos);
                 writer.Write($" {dst} {src}");
                 break;
             }
@@ -2414,7 +2395,7 @@ public static class WasmDisassembler
         else if (b is 0x63 or 0x64)
         {
             pos++;
-            long encodedHeapType = ReadS33Leb128(body, ref pos);
+            long encodedHeapType = WasmLeb128.ReadS33(body, ref pos);
             HeapType heapType = ExactHeapType(encodedHeapType);
             var exact = new ExactValueType.Reference(
                 b == 0x63 ? Nullability.Nullable : Nullability.NonNullable,
@@ -2424,7 +2405,7 @@ public static class WasmDisassembler
         else
         {
             // type index (s33 LEB)
-            long typeIdx = ReadS33Leb128(body, ref pos);
+            long typeIdx = WasmLeb128.ReadS33(body, ref pos);
             if (typeIdx < 0 || typeIdx > int.MaxValue)
                 throw new WatException($"Invalid block type index {typeIdx}.");
             writer.Write($" (type {TypeReferenceText((int)typeIdx, context)})");
@@ -2457,59 +2438,6 @@ public static class WasmDisassembler
     /// </remarks>
     private static bool IsSingleByteValType(byte b) =>
         b is 0x7B or 0x7C or 0x7D or 0x7E or 0x7F || AbstractHeapTypeCodes.TryFromCode(b, out _);
-
-    // ── LEB128 readers (from byte array) ─────────────────────────────────
-
-    private static uint ReadU32Leb128(byte[] data, ref int pos)
-    {
-        uint result = 0;
-        int shift = 0;
-        for (int i = 0; i < 5; i++)
-        {
-            byte b = data[pos++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-        }
-        return result;
-    }
-
-    private static int ReadS32Leb128(byte[] data, ref int pos)
-    {
-        int result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            b = data[pos++];
-            result |= (int)(b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-
-        if (shift < 32 && (b & 0x40) != 0)
-            result |= ~0 << shift;
-        return result;
-    }
-
-    private static long ReadS64Leb128(byte[] data, ref int pos)
-    {
-        long result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            b = data[pos++];
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-
-        if (shift < 64 && (b & 0x40) != 0)
-            result |= ~0L << shift;
-        return result;
-    }
-
-    private static long ReadS33Leb128(byte[] data, ref int pos)
-        => S33Leb128.Read(data, ref pos);
 
     // ── Formatting helpers ───────────────────────────────────────────────
 
