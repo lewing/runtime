@@ -326,7 +326,7 @@ internal static class DwarfCodeAddressRewriter
         {
             int unitStart = pos;
             uint unitLength = ReadU32(info, ref pos);
-            if (unitLength >= 0xFFFFFFF0)
+            if (unitLength >= DwarfUnitLength.ReservedMin)
                 throw new DwarfRewriteException("64-bit DWARF is not supported");
             int unitEnd = checked(pos + (int)unitLength);
             int version = ReadU16(info, ref pos);
@@ -646,7 +646,7 @@ internal static class DwarfCodeAddressRewriter
         {
             int setStart = pos;
             uint unitLength = ReadU32(original, ref pos);
-            if (unitLength >= 0xFFFFFFF0)
+            if (unitLength >= DwarfUnitLength.ReservedMin)
                 throw new DwarfRewriteException("64-bit DWARF is not supported");
             int setEnd = checked(pos + (int)unitLength);
             pos += 2; // version
@@ -704,7 +704,7 @@ internal static class DwarfCodeAddressRewriter
         {
             int unitStart = pos;
             uint unitLength = ReadU32(original, ref pos);
-            if (unitLength >= 0xFFFFFFF0)
+            if (unitLength >= DwarfUnitLength.ReservedMin)
                 throw new DwarfRewriteException("64-bit DWARF is not supported");
             int unitEnd = checked(pos + (int)unitLength);
             int version = ReadU16(original, ref pos);

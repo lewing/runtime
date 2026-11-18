@@ -29,141 +29,256 @@ public sealed class DwarfLineProgram
 }
 
 /// <summary>
+/// The line programs of a <c>.debug_line</c> section, and the errors of the units that could not be
+/// read. A malformed unit is reported and skipped; the units around it are still read.
+/// </summary>
+public sealed class DwarfLineParseResult
+{
+    public DwarfLineParseResult(IReadOnlyList<DwarfLineProgram> programs, IReadOnlyList<DwarfFormatException> errors)
+    {
+        Programs = programs;
+        Errors = errors;
+    }
+
+    /// <summary>One program per readable unit, in section order.</summary>
+    public IReadOnlyList<DwarfLineProgram> Programs { get; }
+
+    /// <summary>One error per malformed unit, in section order. Empty for well-formed DWARF.</summary>
+    public IReadOnlyList<DwarfFormatException> Errors { get; }
+}
+
+/// <summary>
 /// Parses DWARF .debug_line sections to produce source line ↔ code address tables.
 /// Supports DWARF versions 2–5 in the 32-bit DWARF format used by wasm32.
 /// </summary>
 public static class DwarfLineReader
 {
+    private const string Section = ".debug_line";
+
     /// <summary>
-    /// Parses all line number programs from <paramref name="data"/> (.debug_line content).
-    /// Returns one <see cref="DwarfLineProgram"/> per compilation unit header found.
+    /// Parses all line number programs from <paramref name="data"/> (.debug_line content), and
+    /// throws on the first malformed unit. Use <see cref="ParseUnits"/> to keep the good units.
     /// </summary>
+    /// <exception cref="DwarfFormatException">A unit is malformed.</exception>
     public static List<DwarfLineProgram> Parse(
         ReadOnlySpan<byte> data,
         byte[]? lineStrData = null,
         byte[]? strData = null)
     {
+        var result = ParseUnits(data, lineStrData, strData);
+        if (result.Errors.Count != 0)
+            throw result.Errors[0];
+        return (List<DwarfLineProgram>)result.Programs;
+    }
+
+    /// <summary>
+    /// Parses every line number program in <paramref name="data"/> (.debug_line content), one per
+    /// unit, recovering per unit. A unit that is malformed inside is reported in
+    /// <see cref="DwarfLineParseResult.Errors"/> and skipped: its end is already known, so the next
+    /// unit is still read. Only a bad <c>unit_length</c> ends the parse, because it leaves no next
+    /// unit to resume at. Units with an unsupported version, 64-bit DWARF units, zero-length units
+    /// and trailing zero padding are skipped without an error.
+    /// </summary>
+    public static DwarfLineParseResult ParseUnits(
+        ReadOnlySpan<byte> data,
+        byte[]? lineStrData = null,
+        byte[]? strData = null)
+    {
         var programs = new List<DwarfLineProgram>();
+        List<DwarfFormatException>? errors = null;
         int pos = 0;
 
-        while (pos + 6 <= data.Length)
+        while (pos < data.Length)
         {
-            uint unitLen = ReadU32LE(data, pos); pos += 4;
-            if (unitLen == 0xFFFF_FFFF) break; // 64-bit DWARF not supported
+            // Zero bytes after the last unit are padding (zero-length units), not a truncated unit.
+            if (data[pos..].IndexOfAnyExcept((byte)0) < 0)
+                break;
 
-            int programEnd = pos + (int)unitLen;
-            if (programEnd > data.Length) break;
-
-            ushort version = ReadU16LE(data, pos); pos += 2;
-            if (version < 2 || version > 5) { pos = programEnd; continue; }
-
-            byte addrSize = 4; // wasm32: 4-byte addresses
-            if (version >= 5)
+            int unitStart = pos;
+            int programEnd;
+            bool is64Bit;
+            try
             {
-                addrSize = data[pos++];
-                _ = data[pos++]; // segment_selector_size
+                // The end is checked against the data and is always past the length field, so
+                // resuming at it always advances.
+                programEnd = DwarfReaderHelpers.ReadUnitLength(data, ref pos, Section, out is64Bit);
+            }
+            catch (DwarfFormatException ex)
+            {
+                (errors ??= []).Add(ex);
+                break;
             }
 
-            uint headerLength = ReadU32LE(data, pos); pos += 4;
-            int headerEnd = pos + (int)headerLength;
+            if (!is64Bit && programEnd > pos) // 64-bit DWARF is not supported; length 0 is padding
+            {
+                try
+                {
+                    if (ReadUnit(data[..programEnd], pos, unitStart, lineStrData, strData) is { } program)
+                        programs.Add(program);
+                }
+                catch (DwarfFormatException ex)
+                {
+                    (errors ??= []).Add(ex);
+                }
+            }
 
-            byte minInsnLen = data[pos++];
-            if (version >= 4)
-                _ = data[pos++]; // maximum_operations_per_instruction
-            bool defaultIsStmt = data[pos++] != 0;
-            int lineBase = (sbyte)data[pos++];
-            byte lineRange = data[pos++];
-            byte opcodeBase = data[pos++];
-
-            // Skip standard opcode lengths (opcodeBase - 1 bytes)
-            var stdOpcodeLengths = new byte[opcodeBase - 1];
-            for (int i = 0; i < opcodeBase - 1 && pos < headerEnd; i++)
-                stdOpcodeLengths[i] = data[pos++];
-
-            List<string> fileNames;
-            if (version >= 5)
-                fileNames = ParseDwarf5FilePaths(data, ref pos, lineStrData, strData);
-            else
-                fileNames = ParseDwarf4FilePaths(data, ref pos, headerEnd);
-
-            // headerEnd = start of the line number program
-            pos = headerEnd;
-            var rows = RunStateMachine(
-                data, ref pos, programEnd,
-                minInsnLen, lineBase, lineRange, opcodeBase,
-                stdOpcodeLengths, defaultIsStmt, addrSize, fileNames, version);
-
-            programs.Add(new DwarfLineProgram(fileNames, rows));
             pos = programEnd;
         }
 
-        return programs;
+        return new DwarfLineParseResult(programs, errors is null ? [] : errors);
+    }
+
+    /// <summary>
+    /// Parses the one unit at <paramref name="offset"/> in <paramref name="data"/> (a whole
+    /// .debug_line section, so error offsets are section offsets). Returns null for a 64-bit or
+    /// unsupported-version unit.
+    /// </summary>
+    /// <exception cref="DwarfFormatException">The unit is malformed.</exception>
+    internal static DwarfLineProgram? ParseUnitAt(
+        ReadOnlySpan<byte> data, int offset, byte[]? lineStrData = null, byte[]? strData = null)
+    {
+        int pos = offset;
+        int programEnd = DwarfReaderHelpers.ReadUnitLength(data, ref pos, Section, out bool is64Bit);
+        return is64Bit ? null : ReadUnit(data[..programEnd], pos, offset, lineStrData, strData);
+    }
+
+    /// <summary>
+    /// Reads one unit. Every read is bounded by <paramref name="unit"/>, which ends at the unit's
+    /// end, so a unit cannot read into the next one; a fixed-size field that runs past it is
+    /// reported, not thrown as a runtime exception.
+    /// </summary>
+    private static DwarfLineProgram? ReadUnit(
+        ReadOnlySpan<byte> unit, int pos, int unitStart, byte[]? lineStrData, byte[]? strData)
+    {
+        try
+        {
+            return ParseUnit(unit, pos, unitStart, lineStrData, strData);
+        }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException)
+        {
+            throw new DwarfFormatException(Section, unitStart,
+                $"a field of the line program at 0x{unitStart:X} runs past the end of its unit or header", ex);
+        }
+    }
+
+    /// <summary>
+    /// Parses one unit. <paramref name="unit"/> ends at the unit's end; <paramref name="pos"/> is just
+    /// past its unit_length. Returns null for an unsupported version.
+    /// </summary>
+    private static DwarfLineProgram? ParseUnit(
+        ReadOnlySpan<byte> unit, int pos, int unitStart, byte[]? lineStrData, byte[]? strData)
+    {
+        int programEnd = unit.Length;
+        if (programEnd - pos < 2)
+            throw new DwarfFormatException(Section, unitStart, $"the unit at 0x{unitStart:X} is too short to hold its version");
+        ushort version = ReadU16LE(unit, pos); pos += 2;
+        if (version < 2 || version > 5)
+            return null;
+
+        byte addrSize = 4; // wasm32: 4-byte addresses
+        if (version >= 5)
+        {
+            addrSize = unit[pos++];
+            _ = unit[pos++]; // segment_selector_size
+        }
+
+        int headerLengthPos = pos;
+        uint headerLength = ReadU32LE(unit, pos); pos += 4;
+        if (headerLength > (uint)(programEnd - pos))
+            throw new DwarfFormatException(Section, headerLengthPos,
+                $"the unit at 0x{unitStart:X} has header_length {headerLength}, but only {programEnd - pos} bytes of the unit follow it");
+        int headerEnd = pos + (int)headerLength;
+        var header = unit[..headerEnd];
+
+        byte minInsnLen = header[pos++];
+        if (version >= 4)
+            _ = header[pos++]; // maximum_operations_per_instruction
+        bool defaultIsStmt = header[pos++] != 0;
+        int lineBase = (sbyte)header[pos++];
+        byte lineRange = header[pos++];
+        int opcodeBasePos = pos;
+        byte opcodeBase = header[pos++];
+        if (opcodeBase == 0)
+            throw new DwarfFormatException(Section, opcodeBasePos, $"the unit at 0x{unitStart:X} has opcode_base 0");
+
+        if (opcodeBase - 1 > headerEnd - pos)
+            throw new DwarfFormatException(Section, opcodeBasePos,
+                $"the unit at 0x{unitStart:X} has {opcodeBase - 1} standard_opcode_lengths, which run past its header");
+        var stdOpcodeLengths = header.Slice(pos, opcodeBase - 1);
+        pos += opcodeBase - 1;
+
+        List<string> fileNames = version >= 5
+            ? ParseDwarf5FilePaths(header, ref pos, lineStrData, strData)
+            : ParseDwarf4FilePaths(header, ref pos);
+        if (pos > headerEnd)
+            throw new DwarfFormatException(Section, headerEnd, $"the file tables of the unit at 0x{unitStart:X} run past its header");
+
+        // headerEnd = start of the line number program
+        pos = headerEnd;
+        var rows = RunStateMachine(
+            unit, ref pos,
+            minInsnLen, lineBase, lineRange, opcodeBase,
+            stdOpcodeLengths, defaultIsStmt, addrSize, fileNames, version);
+
+        return new DwarfLineProgram(fileNames, rows);
     }
 
     // ── DWARF 4 header parsing ─────────────────────────────────────────────
 
-    private static List<string> ParseDwarf4FilePaths(ReadOnlySpan<byte> data, ref int pos, int headerEnd)
+    /// <summary>Reads the DWARF 2–4 directory and file tables; <paramref name="header"/> ends at the header's end.</summary>
+    private static List<string> ParseDwarf4FilePaths(ReadOnlySpan<byte> header, ref int pos)
     {
         // include_directories: sequence of null-terminated strings, terminated by empty string
         var dirs = new List<string> { "" }; // index 0 = current dir (unused in DWARF4 spec)
-        while (pos < headerEnd && data[pos] != 0)
-        {
-            dirs.Add(ReadNullTerminatedString(data, ref pos));
-        }
-        if (pos < headerEnd) pos++; // skip terminating null
+        while (header[pos] != 0)
+            dirs.Add(ReadNullTerminatedString(header, ref pos));
+        pos++; // skip terminating null
 
         // file_names: name_nts, dir_index_uleb, mtime_uleb, flen_uleb; terminated by empty name
         var files = new List<string> { "" }; // index 0 placeholder; DWARF4 files are 1-based
-        while (pos < headerEnd && data[pos] != 0)
+        while (header[pos] != 0)
         {
-            string name = ReadNullTerminatedString(data, ref pos);
-            uint dirIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
-            DwarfReaderHelpers.ReadULEB128(data, ref pos); // last modified time
-            DwarfReaderHelpers.ReadULEB128(data, ref pos); // file length
+            string name = ReadNullTerminatedString(header, ref pos);
+            ulong dirIdx = ReadULEB128(header, ref pos, "file directory index");
+            ReadULEB128(header, ref pos, "file modification time");
+            ReadULEB128(header, ref pos, "file length");
 
-            string dir = dirIdx < (uint)dirs.Count ? dirs[(int)dirIdx] : "";
+            string dir = dirIdx < (ulong)dirs.Count ? dirs[(int)dirIdx] : "";
             files.Add(dir.Length > 0 ? dir + "/" + name : name);
         }
-        if (pos < headerEnd) pos++; // skip terminating null
+        pos++; // skip terminating null
         return files;
     }
 
     // ── DWARF 5 header parsing ─────────────────────────────────────────────
 
+    /// <summary>Reads the DWARF 5 directory and file tables; <paramref name="header"/> ends at the header's end.</summary>
     private static List<string> ParseDwarf5FilePaths(
-        ReadOnlySpan<byte> data, ref int pos,
+        ReadOnlySpan<byte> header, ref int pos,
         byte[]? lineStrData, byte[]? strData)
     {
         // Directories
-        byte dirFmtCount = data[pos++];
-        var dirFmts = new (uint ContentType, uint Form)[dirFmtCount];
-        for (int i = 0; i < dirFmtCount; i++)
-            dirFmts[i] = (DwarfReaderHelpers.ReadULEB128(data, ref pos), DwarfReaderHelpers.ReadULEB128(data, ref pos));
-
-        uint dirCount = DwarfReaderHelpers.ReadULEB128(data, ref pos);
-        var dirs = new List<string>((int)dirCount);
-        for (uint i = 0; i < dirCount; i++)
+        var dirFmts = ReadEntryFormats(header, ref pos);
+        int dirCount = ReadEntryCount(header, ref pos, dirFmts.Length, "directories");
+        var dirs = new List<string>(dirCount);
+        for (int i = 0; i < dirCount; i++)
         {
             string dirPath = "";
             foreach (var (ct, form) in dirFmts)
             {
                 if (ct == DwLnct.Path)
-                    dirPath = ReadStringByForm(data, ref pos, form, lineStrData, strData) ?? "";
+                    dirPath = ReadStringByForm(header, ref pos, form, lineStrData, strData) ?? "";
                 else
-                    SkipFormValue(data, ref pos, form, addrSize: 4);
+                    SkipFormValue(header, ref pos, form, addrSize: 4);
             }
             dirs.Add(dirPath);
         }
 
         // File names
-        byte fileFmtCount = data[pos++];
-        var fileFmts = new (uint ContentType, uint Form)[fileFmtCount];
-        for (int i = 0; i < fileFmtCount; i++)
-            fileFmts[i] = (DwarfReaderHelpers.ReadULEB128(data, ref pos), DwarfReaderHelpers.ReadULEB128(data, ref pos));
-
-        uint fileCount = DwarfReaderHelpers.ReadULEB128(data, ref pos);
-        var files = new List<string>((int)fileCount);
-        for (uint i = 0; i < fileCount; i++)
+        var fileFmts = ReadEntryFormats(header, ref pos);
+        int fileCount = ReadEntryCount(header, ref pos, fileFmts.Length, "file names");
+        var files = new List<string>(fileCount);
+        for (int i = 0; i < fileCount; i++)
         {
             string filePath = "";
             uint dirIdx = 0;
@@ -171,14 +286,14 @@ public static class DwarfLineReader
             foreach (var (ct, form) in fileFmts)
             {
                 if (ct == DwLnct.Path)
-                    filePath = ReadStringByForm(data, ref pos, form, lineStrData, strData) ?? "";
+                    filePath = ReadStringByForm(header, ref pos, form, lineStrData, strData) ?? "";
                 else if (ct == DwLnct.DirectoryIndex)
                 {
-                    dirIdx = ReadUnsignedByForm(data, ref pos, form);
+                    dirIdx = ReadUnsignedByForm(header, ref pos, form);
                     hasDirIdx = true;
                 }
                 else
-                    SkipFormValue(data, ref pos, form, addrSize: 4);
+                    SkipFormValue(header, ref pos, form, addrSize: 4);
             }
 
             if (hasDirIdx && dirIdx < (uint)dirs.Count)
@@ -191,14 +306,53 @@ public static class DwarfLineReader
         return files;
     }
 
+    private static (uint ContentType, uint Form)[] ReadEntryFormats(ReadOnlySpan<byte> header, ref int pos)
+    {
+        byte count = header[pos++];
+        var formats = new (uint ContentType, uint Form)[count];
+        for (int i = 0; i < count; i++)
+        {
+            uint contentType = (uint)ReadULEB128(header, ref pos, "entry content type");
+            uint form = (uint)ReadULEB128(header, ref pos, "entry form");
+            formats[i] = (contentType, form);
+        }
+        return formats;
+    }
+
+    /// <summary>
+    /// Reads a DWARF 5 directory or file count and checks it against the header. Every form a
+    /// table entry can use takes at least one byte (<see cref="SkipFormValue"/> refuses the others),
+    /// so a count larger than the bytes left in the header cannot be right, and checking it bounds
+    /// the loop and the allocation by the header's size.
+    /// </summary>
+    private static int ReadEntryCount(ReadOnlySpan<byte> header, ref int pos, int formatCount, string table)
+    {
+        int countPos = pos;
+        ulong count = ReadULEB128(header, ref pos, $"{table} count");
+        if (count == 0)
+            return 0;
+        if (formatCount == 0)
+            throw new DwarfFormatException(Section, countPos, $"the {table} table at 0x{countPos:X} has {count} entries but no entry format");
+        if (count > (ulong)(header.Length - pos))
+            throw new DwarfFormatException(Section, countPos,
+                $"the {table} table at 0x{countPos:X} has {count} entries, more than the {header.Length - pos} bytes left in its header");
+        return (int)count;
+    }
+
     // ── State machine ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Runs the line program from <paramref name="pos"/> to the end of <paramref name="data"/>, which
+    /// ends at the unit's end. Every opcode consumes at least one byte and no length moves the
+    /// cursor backwards, so the loop always advances.
+    /// </summary>
     private static List<DwarfLineRow> RunStateMachine(
-        ReadOnlySpan<byte> data, ref int pos, int programEnd,
+        ReadOnlySpan<byte> data, ref int pos,
         byte minInsnLen, int lineBase, byte lineRange, byte opcodeBase,
-        byte[] stdOpcodeLengths, bool defaultIsStmt, byte addrSize,
+        ReadOnlySpan<byte> stdOpcodeLengths, bool defaultIsStmt, byte addrSize,
         List<string> fileNames, int version)
     {
+        int programEnd = data.Length;
         uint address = 0;
         uint fileIdx = version >= 5 ? 0u : 1u; // DWARF5: 0-based; DWARF4: 1-based
         int line = 1;
@@ -219,24 +373,29 @@ public static class DwarfLineReader
 
         while (pos < programEnd)
         {
+            int opStart = pos;
             byte op = data[pos++];
 
             if (op >= opcodeBase)
             {
                 // Special opcode
                 int adj = op - opcodeBase;
-                address += (uint)((adj / lineRange) * minInsnLen);
+                address += (uint)((adj / NonZeroLineRange(lineRange, opStart)) * minInsnLen);
                 line += lineBase + (adj % lineRange);
                 EmitRow();
             }
             else if (op == 0)
             {
                 // Extended opcode
-                int extLen = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos);
-                int extEnd = pos + extLen;
-                if (extLen == 0 || extEnd > programEnd) { pos = extEnd; continue; }
+                ulong extLen = ReadULEB128(data, ref pos, "extended opcode length");
+                if (extLen == 0) continue;
+                if (extLen > (ulong)(programEnd - pos))
+                    throw new DwarfFormatException(Section, opStart,
+                        $"the extended opcode at 0x{opStart:X} has length {extLen}, but only {programEnd - pos} bytes of its line program follow");
+                int extEnd = pos + (int)extLen;
+                var ext = data[..extEnd];
 
-                byte extOp = data[pos++];
+                byte extOp = ext[pos++];
                 switch (extOp)
                 {
                     case DwLne.EndSequence:
@@ -246,32 +405,38 @@ public static class DwarfLineReader
                         break;
 
                     case DwLne.SetAddress:
-                        address = addrSize == 8
-                            ? (uint)ReadU64LE(data, pos)
-                            : ReadU32LE(data, pos);
-                        pos += addrSize;
+                    {
+                        int addressBytes = addrSize == 8 ? 8 : 4;
+                        if (extEnd - pos < addressBytes)
+                            throw new DwarfFormatException(Section, opStart,
+                                $"DW_LNE_set_address at 0x{opStart:X} has length {extLen}, too short for a {addressBytes}-byte address");
+                        address = addressBytes == 8
+                            ? (uint)ReadU64LE(ext, pos)
+                            : ReadU32LE(ext, pos);
                         break;
+                    }
 
                     case DwLne.DefineFile: // DWARF4 only
                         if (version < 5)
                         {
-                            string name = ReadNullTerminatedString(data, ref pos);
-                            uint dirIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
-                            DwarfReaderHelpers.ReadULEB128(data, ref pos); // mtime
-                            DwarfReaderHelpers.ReadULEB128(data, ref pos); // size
-                            fileNames.Add(dirIdx < (uint)fileNames.Count
+                            string name = ReadNullTerminatedString(ext, ref pos);
+                            ulong dirIdx = ReadULEB128(ext, ref pos, "DW_LNE_define_file directory index");
+                            ReadULEB128(ext, ref pos, "DW_LNE_define_file modification time");
+                            ReadULEB128(ext, ref pos, "DW_LNE_define_file length");
+                            fileNames.Add(dirIdx < (ulong)fileNames.Count
                                 ? fileNames[(int)dirIdx] + "/" + name : name);
                         }
                         break;
 
                     case DwLne.SetDiscriminator:
-                        DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                        ReadULEB128(ext, ref pos, "DW_LNE_set_discriminator operand");
                         break;
 
                     default:
-                        pos = extEnd; // skip unknown extended op
-                        break;
+                        break; // unknown extended op: skipped by its length below
                 }
+
+                pos = extEnd;
             }
             else
             {
@@ -283,19 +448,19 @@ public static class DwarfLineReader
                         break;
 
                     case DwLns.AdvancePc:
-                        address += DwarfReaderHelpers.ReadULEB128(data, ref pos) * minInsnLen;
+                        address += (uint)ReadULEB128(data, ref pos, "DW_LNS_advance_pc operand") * minInsnLen;
                         break;
 
                     case DwLns.AdvanceLine:
-                        line += (int)DwarfReaderHelpers.ReadSLEB128(data, ref pos);
+                        line += (int)DwarfReaderHelpers.ReadSLEB128Checked(data, ref pos, Section, "DW_LNS_advance_line operand");
                         break;
 
                     case DwLns.SetFile:
-                        fileIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                        fileIdx = (uint)ReadULEB128(data, ref pos, "DW_LNS_set_file operand");
                         break;
 
                     case DwLns.SetColumn:
-                        column = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                        column = (int)(uint)ReadULEB128(data, ref pos, "DW_LNS_set_column operand");
                         break;
 
                     case DwLns.NegateStmt:
@@ -306,10 +471,13 @@ public static class DwarfLineReader
                         break;
 
                     case DwLns.ConstAddPc:
-                        address += (uint)(((255 - opcodeBase) / lineRange) * minInsnLen);
+                        address += (uint)(((255 - opcodeBase) / NonZeroLineRange(lineRange, opStart)) * minInsnLen);
                         break;
 
                     case DwLns.FixedAdvancePc:
+                        if (programEnd - pos < 2)
+                            throw new DwarfFormatException(Section, opStart,
+                                $"DW_LNS_fixed_advance_pc at 0x{opStart:X} needs a 2-byte operand, but its line program ends");
                         address += ReadU16LE(data, pos); pos += 2;
                         break;
 
@@ -321,7 +489,7 @@ public static class DwarfLineReader
                         break; // no state needed
 
                     case DwLns.SetIsa:
-                        DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                        ReadULEB128(data, ref pos, "DW_LNS_set_isa operand");
                         break;
 
                     default:
@@ -329,7 +497,7 @@ public static class DwarfLineReader
                         int opsIdx = op - 1;
                         int nOps = opsIdx < stdOpcodeLengths.Length ? stdOpcodeLengths[opsIdx] : 0;
                         for (int i = 0; i < nOps; i++)
-                            DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                            ReadULEB128(data, ref pos, "standard opcode operand");
                         break;
                 }
             }
@@ -337,6 +505,13 @@ public static class DwarfLineReader
 
         return rows;
     }
+
+    private static int NonZeroLineRange(byte lineRange, int opStart) => lineRange != 0
+        ? lineRange
+        : throw new DwarfFormatException(Section, opStart, $"the opcode at 0x{opStart:X} needs line_range, which is 0");
+
+    private static ulong ReadULEB128(ReadOnlySpan<byte> data, ref int pos, string what) =>
+        DwarfReaderHelpers.ReadULEB128Checked(data, ref pos, Section, what);
 
     // ── Binary helpers ─────────────────────────────────────────────────────
 
@@ -349,12 +524,14 @@ public static class DwarfLineReader
     private static ulong ReadU64LE(ReadOnlySpan<byte> data, int pos) =>
         (ulong)ReadU32LE(data, pos) | ((ulong)ReadU32LE(data, pos + 4) << 32);
 
+    /// <summary>Reads a string that must be terminated within <paramref name="data"/> (its header or opcode).</summary>
     private static string ReadNullTerminatedString(ReadOnlySpan<byte> data, ref int pos)
     {
-        int start = pos;
-        while (pos < data.Length && data[pos] != 0) pos++;
-        var s = Encoding.UTF8.GetString(data.Slice(start, pos - start));
-        if (pos < data.Length) pos++; // skip null
+        int length = data[pos..].IndexOf((byte)0);
+        if (length < 0)
+            throw new DwarfFormatException(Section, pos, $"the string at 0x{pos:X} is not terminated before the end of its header or opcode");
+        var s = Encoding.UTF8.GetString(data.Slice(pos, length));
+        pos += length + 1;
         return s;
     }
 
@@ -400,11 +577,16 @@ public static class DwarfLineReader
             case DwForm.Data1: return data[pos++];
             case DwForm.Data2: { var v = ReadU16LE(data, pos); pos += 2; return v; }
             case DwForm.Data4: { var v = ReadU32LE(data, pos); pos += 4; return v; }
-            case DwForm.Udata: return DwarfReaderHelpers.ReadULEB128(data, ref pos);
+            case DwForm.Udata: return (uint)ReadULEB128(data, ref pos, "DW_FORM_udata");
             default: SkipFormValue(data, ref pos, form, addrSize: 4); return 0;
         }
     }
 
+    /// <summary>
+    /// Skips a directory or file entry field. Only the forms DWARF 5 allows there are accepted; each
+    /// takes at least one byte, which <see cref="ReadEntryCount"/> relies on. Any other form cannot be
+    /// sized, so it is refused rather than skipped as zero bytes.
+    /// </summary>
     private static void SkipFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, byte addrSize)
     {
         switch ((DwForm)form)
@@ -413,13 +595,19 @@ public static class DwarfLineReader
             case DwForm.Data2: pos += 2; break;
             case DwForm.Data4: pos += 4; break;
             case DwForm.Data8: pos += 8; break;
-            case DwForm.String: while (pos < data.Length && data[pos] != 0) pos++; if (pos < data.Length) pos++; break;
-            case DwForm.Block: { int length = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos); pos += length; break; }
+            case DwForm.String: ReadNullTerminatedString(data, ref pos); break;
+            case DwForm.Block:
+            {
+                ulong length = ReadULEB128(data, ref pos, "DW_FORM_block length");
+                pos += DwarfReaderHelpers.CheckedBlockLength(data, pos, length, Section);
+                break;
+            }
             case DwForm.Data1: pos += 1; break;
             case DwForm.Strp: pos += 4; break;
-            case DwForm.Udata: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
-            case DwForm.Strx: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
-            case DwForm.Addrx: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
+            case DwForm.StrpSup: pos += 4; break;
+            case DwForm.Udata: ReadULEB128(data, ref pos, "DW_FORM_udata"); break;
+            case DwForm.Strx: ReadULEB128(data, ref pos, "DW_FORM_strx"); break;
+            case DwForm.Addrx: ReadULEB128(data, ref pos, "DW_FORM_addrx"); break;
             case DwForm.Data16: pos += 16; break;
             case DwForm.LineStrp: pos += 4; break;
             case DwForm.Strx1: pos += 1; break;
@@ -428,7 +616,8 @@ public static class DwarfLineReader
             case DwForm.Addrx1: pos += 1; break;
             case DwForm.Addrx2: pos += 2; break;
             case DwForm.Addrx4: pos += 4; break;
-            default: break;                                  // unknown: stop
+            default:
+                throw new DwarfFormatException(Section, pos, $"form 0x{form:X} at 0x{pos:X} is not valid in a line table header");
         }
     }
 }

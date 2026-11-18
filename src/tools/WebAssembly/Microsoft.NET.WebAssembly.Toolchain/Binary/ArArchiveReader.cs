@@ -112,15 +112,30 @@ public static class ArArchiveReader
         Stream stream, string? sourcePath = null)
     {
         var result = new List<(WasmModule, string)>();
+        foreach ((ReadOnlyMemory<byte> bytes, string label) in ReadWasmMembers(stream, sourcePath))
+            result.Add((ModuleReader.ParseCoreModule(bytes), label));
+        return result;
+    }
 
-        foreach (var member in ReadMembers(stream, sourcePath))
+    /// <summary>
+    /// The contents and labels of every WebAssembly member, unparsed (for reading members lazily). The archive is
+    /// read into one buffer and each member is a slice of it, so its members are neither copied nor, being one
+    /// large object, moved by the garbage collector while a link holds them.
+    /// </summary>
+    public static List<(ReadOnlyMemory<byte> Bytes, string Label)> ReadWasmMembers(Stream stream, string? sourcePath = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        byte[] archive = new byte[checked((int)(stream.Length - stream.Position))];
+        ReadExactly(stream, archive, $"Archive '{sourcePath ?? "<archive>"}' could not be read.");
+
+        var result = new List<(ReadOnlyMemory<byte>, string)>();
+        using var view = new MemoryStream(archive, writable: false);
+        foreach (MemberLayout member in ReadMemberLayouts(view, sourcePath))
         {
-            if (member.Data.Length < 4 || !member.Data.AsSpan(0, 4).SequenceEqual(WasmMagicBytes))
+            ReadOnlyMemory<byte> data = archive.AsMemory((int)member.Offset, member.Length);
+            if (data.Length < 4 || !data.Span[..4].SequenceEqual(WasmMagicBytes))
                 continue;
-
-            var module = ModuleReader.ParseCoreModule(member.Data.AsMemory());
-            string label = sourcePath is not null ? $"{sourcePath}({member.Name})" : member.Name;
-            result.Add((module, label));
+            result.Add((data, sourcePath is not null ? $"{sourcePath}({member.Name})" : member.Name));
         }
 
         return result;

@@ -61,6 +61,10 @@ internal ref struct DecodedInstruction
     public InstructionImmediateKind ImmediateKind;
     public uint Index0;
     public uint Index1;
+    /// <summary>
+    /// For <c>0xFD</c> instructions, the body offset just past the sub-opcode. For <c>try_table</c>,
+    /// the body offset of the handler vector (after the block type).
+    /// </summary>
     public uint Index2;
     public uint Count;
     public ulong MemOffset;
@@ -478,6 +482,7 @@ internal ref struct InstructionCursor
     {
         instruction.ImmediateKind = InstructionImmediateKind.TryTable;
         ReadBlockType(ref instruction);
+        instruction.Index2 = (uint)_pc;
         DecodeHandlerVector(ref instruction, hasTagIndex: false);
     }
 

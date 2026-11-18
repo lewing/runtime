@@ -153,7 +153,7 @@ internal sealed class WitWorld
         while (r.HasMore)
         {
             byte id = r.ReadByte();
-            CtReader section = r.Sub(checked((int)r.ReadU32()));
+            CtReader section = r.Sub(r.ReadLength());
             switch ((ComponentSectionId)id)
             {
                 case ComponentSectionId.Custom:

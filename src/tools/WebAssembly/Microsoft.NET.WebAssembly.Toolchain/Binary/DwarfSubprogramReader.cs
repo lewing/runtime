@@ -66,7 +66,7 @@ internal static class DwarfSubprogramReader
             if (pos + 6 > infoData.Length) { skipped++; break; }
             int cuStart = pos;
             uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen == 0xFFFFFFFF) { skipped++; break; } // 64-bit DWARF not supported
+            if (unitLen >= DwarfUnitLength.ReservedMin) { skipped++; break; } // 64-bit DWARF and reserved lengths are not supported
             long cuEndLong = (long)pos + 4 + unitLen;
             if (cuEndLong > infoData.Length || cuEndLong < pos + 6) { skipped++; break; }
             int cuEnd = (int)cuEndLong;

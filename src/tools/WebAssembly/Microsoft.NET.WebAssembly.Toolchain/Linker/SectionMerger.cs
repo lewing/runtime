@@ -1094,7 +1094,16 @@ public sealed class SectionMerger
     {
         ArgumentNullException.ThrowIfNull(module);
 
-        using var stream = new MemoryStream();
+        // Sized for the bulk of the output (code, data and custom sections) so a large module is not copied
+        // through repeated buffer doublings.
+        long estimate = 4096;
+        foreach (WasmFunction function in module.Functions)
+            estimate += function.Body.Length + 16;
+        foreach (Data segment in module.DataSegments)
+            estimate += segment.InitData.Length + 16;
+        foreach (CustomSection section in module.CustomSections)
+            estimate += section.Content.Length + section.Name.Length + 16;
+        using var stream = new MemoryStream((int)Math.Min(estimate, Array.MaxLength));
         WriteBinary(stream, module);
         return stream.ToArray();
     }
@@ -1144,7 +1153,14 @@ public sealed class SectionMerger
                     encodedFunctions,
                     CountFunctionImports(module.Imports)));
             }
-            WriteSection(output, WasmSectionId.Code, s => WriteCodeSection(s, encodedFunctions));
+            // Written straight to the output: the code section is most of a module, so it is sized up front
+            // rather than buffered.
+            long codeSize = WasmLeb128.GetULeb128Size((ulong)encodedFunctions.Count);
+            foreach (EncodedFunctionBody body in encodedFunctions)
+                codeSize += WasmLeb128.GetULeb128Size((ulong)body.Length) + body.Length;
+            output.WriteByte((byte)WasmSectionId.Code);
+            WasmEncoder.WriteU32Leb(output, checked((uint)codeSize));
+            WriteCodeSection(output, encodedFunctions);
         }
         if (module.DataSegments.Count > 0)
             WriteSection(output, WasmSectionId.Data, s => WriteDataSection(s, module.DataSegments));
@@ -1157,7 +1173,7 @@ public sealed class SectionMerger
                 continue;
             if (!producersWritten && string.Equals(customSection.Name, "target_features", StringComparison.Ordinal))
                 producersWritten = WriteProducers(output, module);
-            WriteSection(output, WasmSectionId.Custom, s => WriteCustomSection(s, customSection));
+            WriteCustomSectionDirect(output, customSection);
         }
 
         if (!producersWritten)
@@ -1367,6 +1383,16 @@ public sealed class SectionMerger
         content.Write(subsection.GetBuffer(), 0, (int)subsection.Length);
 
         return new CustomSection("name", content.ToArray());
+    }
+
+    // A custom section's size is known up front, so its (often large) payload is not buffered.
+    private static void WriteCustomSectionDirect(Stream output, CustomSection section)
+    {
+        int nameLength = Encoding.UTF8.GetByteCount(section.Name);
+        long size = WasmLeb128.GetULeb128Size((ulong)nameLength) + nameLength + section.Content.Length;
+        output.WriteByte((byte)WasmSectionId.Custom);
+        WasmEncoder.WriteU32Leb(output, checked((uint)size));
+        WriteCustomSection(output, section);
     }
 
     private static void WriteCustomSection(Stream stream, CustomSection section)
@@ -2974,30 +3000,62 @@ public sealed class SectionMerger
     private static byte[] GetActiveOffsetExpr(byte[] offsetExpr, string site) =>
         offsetExpr.Length == 0 ? BuildI32ConstExpr(0) : NormalizeConstExpr(offsetExpr, site);
 
+    /// <summary>
+    /// A function body as written: its encoded local declarations, then its instructions (shared with the
+    /// <see cref="WasmFunction"/>, not copied), then an <c>end</c> when the instructions lack one.
+    /// </summary>
     internal sealed record EncodedFunctionBody(
-        byte[] Bytes,
-        IReadOnlyList<(uint Offset, BranchHintKind Kind)> BranchHints);
+        byte[] Locals,
+        byte[] Instructions,
+        bool AppendEnd,
+        IReadOnlyList<(uint Offset, BranchHintKind Kind)> BranchHints)
+    {
+        public int Length => Locals.Length + Instructions.Length + (AppendEnd ? 1 : 0);
+
+        public void WriteTo(Stream stream)
+        {
+            stream.Write(Locals);
+            stream.Write(Instructions);
+            if (AppendEnd)
+                stream.WriteByte(WasmOpcode.End);
+        }
+    }
 
     internal static IReadOnlyList<EncodedFunctionBody> EncodeFunctionBodies(
         IReadOnlyList<WasmFunction> functions,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
         var encoded = new List<EncodedFunctionBody>(functions.Count);
+        using var locals = new MemoryStream();
         for (int i = 0; i < functions.Count; i++)
         {
             WasmFunction function = functions[i];
-            using var bodyStream = new MemoryStream(function.Body.Length + 16);
-            WriteLocals(bodyStream, function, typeDefinitions, $"function {i} local");
-            uint instructionBase = checked((uint)bodyStream.Position);
-            bodyStream.Write(function.Body);
-            if (function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End)
-                bodyStream.WriteByte(0x0B);
-
+            locals.SetLength(0);
+            WriteLocals(locals, function, typeDefinitions, i);
             encoded.Add(new EncodedFunctionBody(
-                bodyStream.ToArray(),
-                ResolveBranchHintOffsets(function, instructionBase, i)));
+                locals.ToArray(),
+                function.Body,
+                function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End,
+                ResolveBranchHintOffsets(function, checked((uint)locals.Length), i)));
         }
         return encoded;
+    }
+
+    /// <summary>The size of each function body as <see cref="EncodeFunctionBodies"/> encodes it, without encoding the instructions.</summary>
+    internal static uint[] GetEncodedFunctionBodySizes(IReadOnlyList<WasmFunction> functions, IReadOnlyList<TypeDefinition>? typeDefinitions)
+    {
+        var sizes = new uint[functions.Count];
+        using var locals = new MemoryStream();
+        for (int i = 0; i < functions.Count; i++)
+        {
+            WasmFunction function = functions[i];
+            locals.SetLength(0);
+            WriteLocals(locals, function, typeDefinitions, i);
+            bool appendEnd = function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End;
+            sizes[i] = checked((uint)(locals.Length + function.Body.Length + (appendEnd ? 1 : 0)));
+        }
+
+        return sizes;
     }
 
     /// <summary>
@@ -3007,7 +3065,7 @@ public sealed class SectionMerger
     internal static int EncodedFunctionBodyLength(WasmFunction function, IReadOnlyList<TypeDefinition>? typeDefinitions, int index, MemoryStream scratch)
     {
         scratch.SetLength(0);
-        WriteLocals(scratch, function, typeDefinitions, $"function {index} local");
+        WriteLocals(scratch, function, typeDefinitions, index);
         return checked((int)scratch.Length + function.Body.Length + (function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End ? 1 : 0));
     }
 
@@ -3098,9 +3156,8 @@ public sealed class SectionMerger
         WasmEncoder.WriteU32Leb(stream, (uint)functions.Count);
         for (int i = 0; i < functions.Count; i++)
         {
-            byte[] body = functions[i].Bytes;
-            WasmEncoder.WriteU32Leb(stream, (uint)body.Length);
-            stream.Write(body);
+            WasmEncoder.WriteU32Leb(stream, (uint)functions[i].Length);
+            functions[i].WriteTo(stream);
         }
     }
 
@@ -3125,53 +3182,83 @@ public sealed class SectionMerger
         Stream stream,
         WasmFunction function,
         IReadOnlyList<TypeDefinition>? typeDefinitions,
-        string site)
+        int functionIndex)
     {
-        var locals = function.Locals;
-        if (locals.Count == 0)
+        int count = function.Locals.Count;
+        if (count == 0)
         {
             WasmEncoder.WriteU32Leb(stream, 0);
             return;
         }
 
-        bool exact = function.ExactLocals.Count == locals.Count;
-        var encoded = new byte[locals.Count][];
-        for (int i = 0; i < locals.Count; i++)
+        // Locals are written as runs of equal encodings, so the run count is counted first.
+        var encodings = new LocalEncodings(function, typeDefinitions, functionIndex);
+        uint groupCount = 1;
+        for (int i = 1; i < count; i++)
         {
-            if (exact)
-            {
-                using var single = new MemoryStream(4);
-                WriteExactValueType(single, function.ExactLocals[i], typeDefinitions, $"{site} {i}");
-                encoded[i] = single.ToArray();
-            }
+            if (!encodings.Equal(i - 1, i))
+                groupCount++;
+        }
+
+        WasmEncoder.WriteU32Leb(stream, groupCount);
+        for (int i = 0; i < count;)
+        {
+            int start = i++;
+            while (i < count && encodings.Equal(start, i))
+                i++;
+            WasmEncoder.WriteU32Leb(stream, (uint)(i - start));
+            encodings.Write(stream, start);
+        }
+    }
+
+    /// <summary>
+    /// Compares and writes a function's local types as they are encoded. A local without an exact type, or with a
+    /// numeric or vector one (nearly every local), is a single byte and is compared without encoding; a reference
+    /// local is encoded into a scratch buffer, which only a function with one allocates.
+    /// </summary>
+    private struct LocalEncodings(WasmFunction function, IReadOnlyList<TypeDefinition>? typeDefinitions, int functionIndex)
+    {
+        private readonly bool _exact = function.ExactLocals.Count == function.Locals.Count;
+        private MemoryStream? _scratch;
+
+        public bool Equal(int a, int b)
+        {
+            if (TryGetByte(a, out byte left) && TryGetByte(b, out byte right))
+                return left == right;
+
+            _scratch ??= new MemoryStream();
+            _scratch.SetLength(0);
+            Write(_scratch, a);
+            int length = (int)_scratch.Length;
+            Write(_scratch, b);
+            ReadOnlySpan<byte> encoded = _scratch.GetBuffer().AsSpan(0, (int)_scratch.Length);
+            return encoded[..length].SequenceEqual(encoded[length..]);
+        }
+
+        public readonly void Write(Stream stream, int index)
+        {
+            if (TryGetByte(index, out byte value))
+                stream.WriteByte(value);
             else
-            {
-                encoded[i] = [(byte)locals[i]];
-            }
+                WriteExactValueType(stream, function.ExactLocals[index], typeDefinitions, $"function {functionIndex} local {index}");
         }
 
-        var groups = new List<(uint Count, byte[] Encoded)>();
-        byte[] current = encoded[0];
-        uint count = 1;
-        for (int index = 1; index < encoded.Length; index++)
+        private readonly bool TryGetByte(int index, out byte value)
         {
-            if (encoded[index].AsSpan().SequenceEqual(current))
+            if (!_exact)
             {
-                count++;
-                continue;
+                value = (byte)function.Locals[index];
+                return true;
             }
 
-            groups.Add((count, current));
-            current = encoded[index];
-            count = 1;
-        }
+            if (function.ExactLocals[index] is Microsoft.NET.WebAssembly.Types.ValueType.Number or Microsoft.NET.WebAssembly.Types.ValueType.Vector)
+            {
+                value = (byte)function.ExactLocals[index].ToStorageValType();
+                return true;
+            }
 
-        groups.Add((count, current));
-        WasmEncoder.WriteU32Leb(stream, (uint)groups.Count);
-        foreach (var (groupCount, bytes) in groups)
-        {
-            WasmEncoder.WriteU32Leb(stream, groupCount);
-            stream.Write(bytes);
+            value = 0;
+            return false;
         }
     }
 

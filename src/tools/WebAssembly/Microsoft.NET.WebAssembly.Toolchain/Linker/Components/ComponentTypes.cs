@@ -113,6 +113,27 @@ internal sealed class CtReader(byte[] bytes, int start, int end)
 
     private ReadOnlySpan<byte> Remaining => _bytes.AsSpan(Position, End - Position);
 
+    /// <summary>Reads a u32 byte length, rejecting one longer than the rest of the data.</summary>
+    public int ReadLength()
+    {
+        uint length = ReadU32();
+        if (length > (uint)(End - Position))
+            throw new FormatException("Section extends past the end of the component.");
+        return (int)length;
+    }
+
+    /// <summary>
+    /// Reads a u32 vector count, rejecting one whose elements, at <paramref name="minElementSize"/> bytes each, cannot
+    /// fit in the rest of the data. Use it before allocating by the count.
+    /// </summary>
+    public int ReadCount(int minElementSize = 1)
+    {
+        uint count = ReadU32();
+        if ((ulong)count * (uint)minElementSize > (ulong)(End - Position))
+            throw new FormatException("Unexpected end of component data.");
+        return (int)count;
+    }
+
     private static FormatException LebException(Leb128Status status, string type) => status switch
     {
         Leb128Status.Truncated => new FormatException("Unexpected end of component data."),
@@ -256,9 +277,9 @@ internal static class ComponentTypeCodec
 
     private static List<(string, CtValType)> ReadLabeledList(CtReader r)
     {
-        uint count = r.ReadU32();
-        var list = new List<(string, CtValType)>((int)count);
-        for (uint i = 0; i < count; i++)
+        int count = r.ReadCount(minElementSize: 2); // name + valtype
+        var list = new List<(string, CtValType)>(count);
+        for (int i = 0; i < count; i++)
             list.Add((r.ReadName(), ReadValType(r)));
         return list;
     }
@@ -275,9 +296,9 @@ internal static class ComponentTypeCodec
 
     private static List<string> ReadNames(CtReader r)
     {
-        uint count = r.ReadU32();
-        var names = new List<string>((int)count);
-        for (uint i = 0; i < count; i++)
+        int count = r.ReadCount();
+        var names = new List<string>(count);
+        for (int i = 0; i < count; i++)
             names.Add(r.ReadName());
         return names;
     }
@@ -341,9 +362,9 @@ internal static class ComponentTypeCodec
             case ComponentTypeCode.Record: return new CtRecord(ReadLabeledList(r));
             case ComponentTypeCode.Variant:
             {
-                uint count = r.ReadU32();
-                var cases = new List<(string, CtValType?)>((int)count);
-                for (uint i = 0; i < count; i++)
+                int count = r.ReadCount(minElementSize: 3); // name + payload flag + refines
+                var cases = new List<(string, CtValType?)>(count);
+                for (int i = 0; i < count; i++)
                 {
                     string name = r.ReadName();
                     CtValType? payload = ReadOptionalValType(r);
@@ -362,9 +383,9 @@ internal static class ComponentTypeCodec
             }
             case ComponentTypeCode.Tuple:
             {
-                uint count = r.ReadU32();
-                var elements = new List<CtValType>((int)count);
-                for (uint i = 0; i < count; i++)
+                int count = r.ReadCount();
+                var elements = new List<CtValType>(count);
+                for (int i = 0; i < count; i++)
                     elements.Add(ReadValType(r));
                 return new CtTuple(elements);
             }
@@ -457,9 +478,9 @@ internal static class ComponentTypeCodec
 
     public static List<CtDecl> ReadDecls(CtReader r, bool allowImports)
     {
-        uint count = r.ReadU32();
-        var decls = new List<CtDecl>((int)count);
-        for (uint i = 0; i < count; i++)
+        int count = r.ReadCount(minElementSize: 2); // kind + declaration
+        var decls = new List<CtDecl>(count);
+        for (int i = 0; i < count; i++)
         {
             byte kind = r.ReadByte();
             decls.Add((ComponentDeclKind)kind switch

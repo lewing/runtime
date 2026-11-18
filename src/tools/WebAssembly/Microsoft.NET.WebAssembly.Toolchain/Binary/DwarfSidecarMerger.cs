@@ -15,10 +15,15 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// Tri-state build-id comparison: null when either side lacks a <c>build_id</c>
 /// (nothing to compare); true/false when both are present and (mis)match.
 /// </param>
+/// <param name="DebugLineErrors">
+/// One error per malformed <c>.debug_line</c> unit. Those units are skipped and the good ones kept,
+/// as <see cref="ModuleReader"/> does. Null or empty for well-formed DWARF.
+/// </param>
 public sealed record SidecarMergeResult(
     IReadOnlyList<string> MergedSections,
     bool DebugInfoRefreshed,
-    bool? BuildIdMatch);
+    bool? BuildIdMatch,
+    IReadOnlyList<DwarfFormatException>? DebugLineErrors = null);
 
 /// <summary>
 /// Overlays the <c>.debug_*</c> custom sections of an external split-DWARF
@@ -95,10 +100,11 @@ public static class DwarfSidecarMerger
         // per repo convention, module structures require external locking for concurrent
         // mutation; only one attach/load writes a given module.)
         if (refreshed)
-            target.DebugInfo = newDebugInfo;
+            target.DebugInfo = newDebugInfo!.Programs;
         target.CustomSections = newSections;
 
-        return new SidecarMergeResult([.. debugSections.Select(s => s.Name)], refreshed, buildIdMatch);
+        return new SidecarMergeResult([.. debugSections.Select(s => s.Name)], refreshed, buildIdMatch,
+            newDebugInfo?.Errors);
     }
 
     /// <summary>
@@ -108,14 +114,14 @@ public static class DwarfSidecarMerger
     /// path — it computes and commits atomically; this in-place variant is for callers
     /// that have already edited a module's sections directly.
     /// </summary>
-    /// <returns>True if a <c>.debug_line</c> section was present and parsed.</returns>
+    /// <returns>True if a <c>.debug_line</c> section was present and parsed (malformed units are skipped).</returns>
     public static bool RefreshDebugLineInfo(WasmModule module)
     {
         ArgumentNullException.ThrowIfNull(module);
         var parsed = BuildDebugLineInfo(module.CustomSections);
         if (parsed is null)
             return false;
-        module.DebugInfo = parsed;
+        module.DebugInfo = parsed.Programs;
         return true;
     }
 
@@ -123,7 +129,7 @@ public static class DwarfSidecarMerger
     /// Parse DWARF line programs from a section list without mutating any module.
     /// Returns null when no <c>.debug_line</c> section is present.
     /// </summary>
-    private static List<DwarfLineProgram>? BuildDebugLineInfo(IReadOnlyList<CustomSection> sections)
+    private static DwarfLineParseResult? BuildDebugLineInfo(IReadOnlyList<CustomSection> sections)
     {
         var debugLine = sections.FirstOrDefault(s => s.Name == ".debug_line");
         if (debugLine is null)
@@ -132,7 +138,7 @@ public static class DwarfSidecarMerger
         var debugLineStr = sections.FirstOrDefault(s => s.Name == ".debug_line_str");
         var debugStr = sections.FirstOrDefault(s => s.Name == ".debug_str");
 
-        return DwarfLineReader.Parse(
+        return DwarfLineReader.ParseUnits(
             debugLine.Content,
             debugLineStr?.Content,
             debugStr?.Content);

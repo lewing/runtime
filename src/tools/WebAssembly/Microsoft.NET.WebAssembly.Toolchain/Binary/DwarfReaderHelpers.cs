@@ -272,21 +272,22 @@ internal static class DwarfReaderHelpers
             // Block/exprloc forms — return raw bytes for location expression parsing
             case DwForm.Block1:
             {
-                int len = data[pos++];
+                int len = CheckedBlockLength(data, pos + 1, ReadFixedLength(data, pos, 1), InfoSection);
+                pos++;
                 var block = data.Slice(pos, len).ToArray();
                 pos += len;
                 return block;
             }
             case DwForm.Block2:
             {
-                int len = ReadU16LE(data, pos); pos += 2;
+                int len = CheckedBlockLength(data, pos + 2, ReadFixedLength(data, pos, 2), InfoSection); pos += 2;
                 var block = data.Slice(pos, len).ToArray();
                 pos += len;
                 return block;
             }
             case DwForm.Block4:
             {
-                int len = (int)ReadU32LE(data, pos); pos += 4;
+                int len = CheckedBlockLength(data, pos + 4, ReadFixedLength(data, pos, 4), InfoSection); pos += 4;
                 var block = data.Slice(pos, len).ToArray();
                 pos += len;
                 return block;
@@ -294,17 +295,15 @@ internal static class DwarfReaderHelpers
             case DwForm.Block:
             case DwForm.Exprloc:
             {
-                int len = (int)ReadULEB128(data, ref pos);
+                ulong rawLen = ReadULEB128U64(data, ref pos);
+                int len = CheckedBlockLength(data, pos, rawLen, InfoSection);
                 var block = data.Slice(pos, len).ToArray();
                 pos += len;
                 return block;
             }
 
             case DwForm.Indirect:
-            {
-                uint actualForm = ReadULEB128(data, ref pos);
-                return ReadAttributeValue(data, ref pos, actualForm, addrSize, ctx, 0);
-            }
+                return ReadAttributeValue(data, ref pos, ReadIndirectForm(data, ref pos), addrSize, ctx, 0);
 
             default:
                 return null;
@@ -556,6 +555,110 @@ internal static class DwarfReaderHelpers
         return value;
     }
 
+    /// <summary>
+    /// An unsigned LEB128 that must be complete: a truncated value is malformed DWARF
+    /// (<see cref="DwarfFormatException"/>), never a silent 0 at the end of the data.
+    /// </summary>
+    internal static ulong ReadULEB128Checked(ReadOnlySpan<byte> data, ref int pos, string section, string what)
+    {
+        int start = pos;
+        if (!WasmLeb128.TryReadUnboundedU64(data, ref pos, out ulong value))
+            throw new DwarfFormatException(section, start, $"the {what} LEB128 at 0x{start:X} is truncated");
+        return value;
+    }
+
+    /// <summary>A signed LEB128 that must be complete; see <see cref="ReadULEB128Checked"/>.</summary>
+    internal static long ReadSLEB128Checked(ReadOnlySpan<byte> data, ref int pos, string section, string what)
+    {
+        int start = pos;
+        if (!WasmLeb128.TryReadUnboundedS64(data, ref pos, out long value))
+            throw new DwarfFormatException(section, start, $"the {what} LEB128 at 0x{start:X} is truncated");
+        return value;
+    }
+
+    /// <summary>
+    /// Reads a unit's initial length (32-bit, or 64-bit after the <c>0xffffffff</c> escape) at
+    /// <paramref name="pos"/>, leaves <paramref name="pos"/> after it, and returns the offset just
+    /// past the unit. The end is computed in 64 bits and checked against the data, so it is always
+    /// after the length field and never past <paramref name="data"/>: a loop that resumes at it
+    /// always advances. Reserved lengths (<c>0xfffffff0</c>–<c>0xfffffffe</c>) and a unit that
+    /// runs past the data throw <see cref="DwarfFormatException"/>. Such an error leaves no next
+    /// unit to resume at, so it ends a parse; an error inside a unit does not.
+    /// </summary>
+    internal static int ReadUnitLength(ReadOnlySpan<byte> data, ref int pos, string section, out bool is64Bit)
+    {
+        int unitStart = pos;
+        if (pos < 0 || data.Length - pos < 4)
+            throw new DwarfFormatException(section, unitStart, $"the unit at 0x{unitStart:X} is truncated: its 4-byte unit_length does not fit in the {data.Length - unitStart} remaining bytes");
+        uint length32 = ReadU32LE(data, pos);
+        pos += 4;
+        ulong length;
+        if (length32 == DwarfUnitLength.Dwarf64Escape)
+        {
+            if (data.Length - pos < 8)
+                throw new DwarfFormatException(section, unitStart, $"the 64-bit DWARF unit at 0x{unitStart:X} is truncated: its 8-byte unit_length does not fit");
+            length = ReadU64LE(data, pos);
+            pos += 8;
+            is64Bit = true;
+        }
+        else if (length32 >= DwarfUnitLength.ReservedMin)
+        {
+            throw new DwarfFormatException(section, unitStart, $"the unit at 0x{unitStart:X} has the reserved unit_length 0x{length32:X8}");
+        }
+        else
+        {
+            length = length32;
+            is64Bit = false;
+        }
+
+        if (length > (ulong)(data.Length - pos))
+            throw new DwarfFormatException(section, unitStart, $"the unit at 0x{unitStart:X} has unit_length {length}, but only {data.Length - pos} bytes follow it");
+        return pos + (int)length;
+    }
+
+    /// <summary>
+    /// Checks that a block of <paramref name="length"/> bytes starting at <paramref name="pos"/>
+    /// lies within <paramref name="data"/> and returns the length. A block length is attacker-chosen
+    /// and must never move a cursor backwards or past the data.
+    /// </summary>
+    internal static int CheckedBlockLength(ReadOnlySpan<byte> data, int pos, ulong length, string section)
+    {
+        if (pos > data.Length || length > (ulong)(data.Length - pos))
+            throw new DwarfFormatException(section, pos, $"a {length}-byte block at 0x{pos:X} runs past the end of its data ({Math.Max(0, data.Length - pos)} bytes remain)");
+        return (int)length;
+    }
+
+    /// <summary>The section every DIE attribute is read from (<see cref="ReadAttributeValue"/>, <see cref="SkipFormValue"/>).</summary>
+    private const string InfoSection = ".debug_info";
+
+    /// <summary>Reads a 1-, 2- or 4-byte block length that must lie within the data.</summary>
+    private static ulong ReadFixedLength(ReadOnlySpan<byte> data, int pos, int size)
+    {
+        if (pos < 0 || pos > data.Length - size)
+            throw new DwarfFormatException(InfoSection, pos, $"the {size}-byte block length at 0x{pos:X} runs past the end of its data");
+        return size switch
+        {
+            1 => data[pos],
+            2 => ReadU16LE(data, pos),
+            _ => ReadU32LE(data, pos),
+        };
+    }
+
+    /// <summary>
+    /// Reads the form a <c>DW_FORM_indirect</c> names, looking through chained indirections
+    /// iteratively so a run of them cannot recurse once per byte.
+    /// </summary>
+    private static uint ReadIndirectForm(ReadOnlySpan<byte> data, ref int pos)
+    {
+        uint form;
+        do
+        {
+            form = ReadULEB128(data, ref pos);
+        }
+        while (form == (uint)DwForm.Indirect && pos < data.Length);
+        return form == (uint)DwForm.Indirect ? 0 : form;
+    }
+
     internal static string? ReadStringFromSection(byte[]? section, int offset)
     {
         if (section is null || offset < 0 || offset >= section.Length) return null;
@@ -579,8 +682,8 @@ internal static class DwarfReaderHelpers
         switch ((DwForm)form)
         {
             case DwForm.Addr: pos += addrSize; break;
-            case DwForm.Block2: pos += 2 + ReadU16LE(data, pos); break;
-            case DwForm.Block4: pos += 4 + (int)ReadU32LE(data, pos); break;
+            case DwForm.Block2: { ulong len = ReadFixedLength(data, pos, 2); pos += 2; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
+            case DwForm.Block4: { ulong len = ReadFixedLength(data, pos, 4); pos += 4; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
             case DwForm.Data2: pos += 2; break;
             case DwForm.Data4: pos += 4; break;
             case DwForm.Data8: pos += 8; break;
@@ -589,9 +692,9 @@ internal static class DwarfReaderHelpers
                 if (pos < data.Length) pos++;
                 break;
             case DwForm.Block:
-                { int blockLen = (int)ReadULEB128(data, ref pos); pos += blockLen; }
+                { ulong blockLen = ReadULEB128U64(data, ref pos); pos += CheckedBlockLength(data, pos, blockLen, InfoSection); }
                 break;
-            case DwForm.Block1: pos += 1 + data[pos]; break;
+            case DwForm.Block1: { ulong len = ReadFixedLength(data, pos, 1); pos += 1; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
             case DwForm.Data1: pos += 1; break;
             case DwForm.Flag: pos += 1; break;
             case DwForm.Sdata: ReadSLEB128(data, ref pos); break;
@@ -604,11 +707,11 @@ internal static class DwarfReaderHelpers
             case DwForm.Ref8: pos += 8; break;
             case DwForm.RefUdata: ReadULEB128(data, ref pos); break;
             case DwForm.Indirect:
-                SkipFormValue(data, ref pos, ReadULEB128(data, ref pos), addrSize);
+                SkipFormValue(data, ref pos, ReadIndirectForm(data, ref pos), addrSize);
                 break;
             case DwForm.SecOffset: pos += 4; break;
             case DwForm.Exprloc:
-                { int exprLen = (int)ReadULEB128(data, ref pos); pos += exprLen; }
+                { ulong exprLen = ReadULEB128U64(data, ref pos); pos += CheckedBlockLength(data, pos, exprLen, InfoSection); }
                 break;
             case DwForm.FlagPresent: break;
             case DwForm.Strx: ReadULEB128(data, ref pos); break;

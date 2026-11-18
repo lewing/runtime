@@ -1,7 +1,7 @@
 diff -ruN a/Binary/DwarfTypeReaderTests.cs b/Binary/DwarfTypeReaderTests.cs
 --- a/Binary/DwarfTypeReaderTests.cs
 +++ b/Binary/DwarfTypeReaderTests.cs
-@@ -499,32 +499,6 @@
+@@ -501,32 +501,6 @@
          Assert.Empty(result);
      }
  

@@ -19,7 +19,9 @@
 
       <!-- Experimental: replace wasm-component-ld (wasm-ld plus component wrapping) with the managed linker
            (src/tools/WebAssembly/wasm-link). clang still drives the link (crt, sysroot libraries, compiler-rt) and
-           invokes it through -fuse-ld, which needs an executable, so a small launcher runs wasm-link.dll. -->
+           invokes it through -fuse-ld, which needs an executable, so a small launcher runs wasm-link.
+           IlcManagedWasmLinkerPath can name the NativeAOT wasm-link executable or wasm-link.dll; given the dll, the launcher
+           prefers a NativeAOT build of the same configuration (../aot/wasm-link) and otherwise runs the dll with dotnet. -->
       <IlcUseManagedWasmLinker Condition="'$(IlcUseManagedWasmLinker)' == ''">false</IlcUseManagedWasmLinker>
       <IlcManagedWasmLinkerPath Condition="'$(IlcManagedWasmLinkerPath)' == ''">$(IlcToolsPath)wasm-link.dll</IlcManagedWasmLinkerPath>
       <_IlcManagedWasmLinkerShim Condition="'$(IlcUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(NativeIntermediateOutputPath)wasm-link.sh</_IlcManagedWasmLinkerShim>
@@ -31,12 +33,17 @@
       <CppLibCreator Condition="'$(IlcUseManagedWasmArchiver)' == 'true'">$(_IlcManagedWasmArchiverShim)</CppLibCreator>
       <_IlcDotNetHostPath>$(DOTNET_HOST_PATH)</_IlcDotNetHostPath>
       <_IlcDotNetHostPath Condition="'$(_IlcDotNetHostPath)' == ''">dotnet</_IlcDotNetHostPath>
+      <_IlcManagedWasmLinkerIsDll>$(IlcManagedWasmLinkerPath.EndsWith('.dll', System.StringComparison.OrdinalIgnoreCase))</_IlcManagedWasmLinkerIsDll>
+      <_IlcManagedWasmLinkerAot Condition="'$(_IlcManagedWasmLinkerIsDll)' == 'true'">$([System.IO.Path]::GetFullPath('$([System.IO.Path]::GetDirectoryName('$(IlcManagedWasmLinkerPath)'))/../aot/wasm-link$(_WasiToolExeSuffix)'))</_IlcManagedWasmLinkerAot>
+      <_IlcManagedWasmLinkerCommand Condition="'$(_IlcManagedWasmLinkerIsDll)' != 'true'">&quot;$(IlcManagedWasmLinkerPath)&quot;</_IlcManagedWasmLinkerCommand>
+      <_IlcManagedWasmLinkerCommand Condition="'$(_IlcManagedWasmLinkerIsDll)' == 'true' and Exists('$(_IlcManagedWasmLinkerAot)')">&quot;$(_IlcManagedWasmLinkerAot)&quot;</_IlcManagedWasmLinkerCommand>
+      <_IlcManagedWasmLinkerCommand Condition="'$(_IlcManagedWasmLinkerCommand)' == ''">&quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot;</_IlcManagedWasmLinkerCommand>
     </PropertyGroup>
 
     <Error Condition="!Exists('$(CppLinker)')" Text="The WASI compiler was not found at '$(CppLinker)'." />
     <Error Condition="'$(IlcUseManagedWasmArchiver)' != 'true' and !Exists('$(CppLibCreator)')" Text="The WASI archive tool was not found at '$(CppLibCreator)'." />
     <Error Condition="('$(IlcUseManagedWasmLinker)' == 'true' or '$(IlcUseManagedWasmArchiver)' == 'true') and !Exists('$(IlcManagedWasmLinkerPath)')"
-           Text="IlcUseManagedWasmLinker and IlcUseManagedWasmArchiver require the managed linker; set IlcManagedWasmLinkerPath to wasm-link.dll (not found at '$(IlcManagedWasmLinkerPath)')." />
+           Text="IlcUseManagedWasmLinker and IlcUseManagedWasmArchiver require the managed linker; set IlcManagedWasmLinkerPath to wasm-link or wasm-link.dll (not found at '$(IlcManagedWasmLinkerPath)')." />
 
     <ItemGroup>
       <NetCoreAppNativeLibrary Include="System.Native" />
@@ -87,13 +94,13 @@
     <MakeDir Directories="$(NativeIntermediateOutputPath)" />
     <WriteLinesToFile Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_IlcManagedWasmLinkerShim)"
-                      Lines="#!/bin/sh;exec &quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; --component &quot;%24@&quot;"
+                      Lines="#!/bin/sh;exec $(_IlcManagedWasmLinkerCommand) --component &quot;%24@&quot;"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
     <Exec Condition="!$([MSBuild]::IsOSPlatform('Windows'))" Command="chmod +x &quot;$(_IlcManagedWasmLinkerShim)&quot;" />
     <WriteLinesToFile Condition="$([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_IlcManagedWasmLinkerShim)"
-                      Lines="@&quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; --component %25*"
+                      Lines="@$(_IlcManagedWasmLinkerCommand) --component %25*"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
   </Target>
@@ -105,13 +112,13 @@
     <MakeDir Directories="$(NativeIntermediateOutputPath)" />
     <WriteLinesToFile Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_IlcManagedWasmArchiverShim)"
-                      Lines="#!/bin/sh;exec &quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; ar &quot;%24@&quot;"
+                      Lines="#!/bin/sh;exec $(_IlcManagedWasmLinkerCommand) ar &quot;%24@&quot;"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
     <Exec Condition="!$([MSBuild]::IsOSPlatform('Windows'))" Command="chmod +x &quot;$(_IlcManagedWasmArchiverShim)&quot;" />
     <WriteLinesToFile Condition="$([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_IlcManagedWasmArchiverShim)"
-                      Lines="@&quot;$(_IlcDotNetHostPath)&quot; &quot;$(IlcManagedWasmLinkerPath)&quot; ar %25*"
+                      Lines="@$(_IlcManagedWasmLinkerCommand) ar %25*"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
   </Target>

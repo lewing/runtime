@@ -230,7 +230,7 @@ public static class ComponentEncoder
             {
                 int start = r.Position;
                 byte id = r.ReadByte();
-                int size = checked((int)r.ReadU32());
+                int size = r.ReadLength();
                 int payload = r.Position;
                 CtReader body = r.Sub(size);
                 bool isComponentType = false;
@@ -278,9 +278,9 @@ public static class ComponentEncoder
 
         private static byte[] ReadValTypes(CtReader r)
         {
-            uint count = r.ReadU32();
+            int count = r.ReadCount();
             var types = new byte[count];
-            for (uint i = 0; i < count; i++)
+            for (int i = 0; i < count; i++)
             {
                 types[i] = r.ReadByte();
                 if (types[i] is 0x63 or 0x64)

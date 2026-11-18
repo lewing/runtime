@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk" DefaultTargets="Publish">
+
+  <!-- Publishes wasm-link as a NativeAOT executable for the host, into the "aot" directory next to the framework-dependent
+       build. The WASI and NativeAOT launchers prefer it over wasm-link.dll. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
+    <AssemblyName>wasm-link</AssemblyName>
+    <RootNamespace>Microsoft.NET.WebAssembly.Link</RootNamespace>
+    <_IsPublishing>true</_IsPublishing>
+    <RuntimeIdentifier>$(NETCoreSdkPortableRuntimeIdentifier)</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <AotOrSingleFile>true</AotOrSingleFile>
+    <UseBootstrapLayout Condition="'$(UseBootstrap)' == 'true'">true</UseBootstrapLayout>
+    <PublishDir>$(ArtifactsBinDir)wasm-link/$(Configuration)/aot/</PublishDir>
+    <!-- A link is short and allocation-heavy: without background GC it is about 30% faster, for about 30% more peak memory. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" />
+  </ItemGroup>
+
+</Project>

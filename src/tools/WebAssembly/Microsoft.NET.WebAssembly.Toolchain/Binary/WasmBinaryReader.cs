@@ -82,13 +82,57 @@ public sealed class WasmBinaryReader
         }
     }
 
+    /// <summary>
+    /// The largest buffer allocated up front for a read whose length cannot be checked against the input (a
+    /// non-seekable stream); a longer read grows from here as data arrives, so a forged length cannot allocate more
+    /// than a small multiple of the bytes actually present.
+    /// </summary>
+    private const int UnknownLengthChunkSize = 64 * 1024;
+
     /// <summary>Read exactly <paramref name="count"/> bytes.</summary>
+    /// <exception cref="WasmFormatException">Fewer than <paramref name="count"/> bytes remain.</exception>
     public byte[] ReadBytes(int count)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (_length is { } total)
+        {
+            ThrowIfPastEnd((uint)count, total);
+        }
+        else if (count > UnknownLengthChunkSize)
+        {
+            return ReadBytesGrowing(count);
+        }
+
         byte[] data = new byte[count];
-        ReadBytes(data);
+        ReadInto(data);
         return data;
     }
+
+    private byte[] ReadBytesGrowing(int count)
+    {
+        byte[] data = new byte[UnknownLengthChunkSize];
+        int filled = 0;
+        while (true)
+        {
+            filled += ReadAvailable(data.AsSpan(filled));
+            if (filled < data.Length)
+                throw UnexpectedEnd((ulong)count, filled);
+            if (filled == count)
+                return data;
+            Array.Resize(ref data, (int)Math.Min(2L * data.Length, count));
+        }
+    }
+
+    /// <summary>Rejects a read of <paramref name="length"/> bytes when fewer remain before <paramref name="total"/>.</summary>
+    private void ThrowIfPastEnd(ulong length, long total)
+    {
+        long remaining = total - _position;
+        if (length > (ulong)remaining)
+            throw UnexpectedEnd(length, remaining);
+    }
+
+    private static WasmFormatException UnexpectedEnd(ulong expected, long available)
+        => new($"Unexpected end of stream: expected {expected} bytes but only {available} available");
 
     /// <summary>Read exactly <paramref name="destination"/>.Length bytes into the provided span.</summary>
     public void ReadBytes(Span<byte> destination) => ReadInto(destination);
@@ -158,13 +202,47 @@ public sealed class WasmBinaryReader
     }
 
     /// <summary>Read a Wasm vector (count + items) using a reader function.</summary>
-    public T[] ReadVector<T>(Func<T> readElement)
+    /// <remarks>Every element is assumed to take at least one byte; see <see cref="ReadVectorCount"/>.</remarks>
+    public T[] ReadVector<T>(Func<T> readElement) => ReadVector(readElement, minElementSize: 1);
+
+    /// <summary>
+    /// Read a Wasm vector whose elements each take at least <paramref name="minElementSize"/> bytes, so a count the
+    /// remaining input cannot hold is rejected before the array is allocated.
+    /// </summary>
+    internal T[] ReadVector<T>(Func<T> readElement, int minElementSize)
     {
-        uint count = ReadU32Leb128();
+        uint count = ReadVectorCount(minElementSize);
+        if (_length is null && count > UnknownLengthVectorCapacity)
+        {
+            // No remaining length to check: grow with the elements actually read.
+            var list = new List<T>(UnknownLengthVectorCapacity);
+            for (uint i = 0; i < count; i++)
+                list.Add(readElement());
+            return list.ToArray();
+        }
+
         var items = new T[count];
         for (uint i = 0; i < count; i++)
             items[i] = readElement();
         return items;
+    }
+
+    private const int UnknownLengthVectorCapacity = 1024;
+
+    /// <summary>
+    /// Read a vector count, rejecting one whose elements, at <paramref name="minElementSize"/> bytes each, cannot fit
+    /// in the rest of the input (when its length is known). Callers that size an allocation by the count use this.
+    /// </summary>
+    internal uint ReadVectorCount(int minElementSize = 1)
+    {
+        uint count = ReadU32Leb128();
+        if (_length is { } total && (ulong)count * (uint)minElementSize > (ulong)(total - _position))
+        {
+            throw new WasmFormatException(
+                $"Unexpected end of stream: vector of {count} elements needs at least {(ulong)count * (uint)minElementSize} bytes but only {total - _position} available");
+        }
+
+        return count;
     }
 
     /// <summary>Read a Wasm vector count and return an iterator for zero-alloc foreach.</summary>
@@ -219,8 +297,8 @@ public sealed class WasmBinaryReader
     private int ReadNameLength()
     {
         uint length = ReadU32Leb128();
-        if (_length is { } total && length > total - _position)
-            throw new WasmFormatException($"Unexpected end of stream: expected {length} bytes but only {total - _position} available");
+        if (_length is { } total)
+            ThrowIfPastEnd(length, total);
         if (length > Array.MaxLength)
             throw new WasmFormatException($"Name length {length} is too large");
         return (int)length;
@@ -267,6 +345,14 @@ public sealed class WasmBinaryReader
     /// <summary>Read exactly <paramref name="destination"/>.Length bytes into the span.</summary>
     private void ReadInto(Span<byte> destination)
     {
+        int read = ReadAvailable(destination);
+        if (read < destination.Length)
+            throw UnexpectedEnd((ulong)destination.Length, read);
+    }
+
+    /// <summary>Fills <paramref name="destination"/> until it is full or the stream ends; returns the bytes read.</summary>
+    private int ReadAvailable(Span<byte> destination)
+    {
         int total = 0;
         if (_hasBufferedByte && !destination.IsEmpty)
         {
@@ -280,11 +366,12 @@ public sealed class WasmBinaryReader
         {
             int read = _reader.BaseStream.Read(destination[total..]);
             if (read == 0)
-                throw new WasmFormatException(
-                    $"Unexpected end of stream: expected {destination.Length} bytes but only {total} available");
+                break;
             total += read;
             _position += read;
         }
+
+        return total;
     }
 
     private bool TryBufferNextByte()

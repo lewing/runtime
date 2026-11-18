@@ -293,7 +293,7 @@ public static class ComponentCoreModules
         {
             int sectionStart = r.Position;
             byte id = r.ReadByte();
-            int size = checked((int)r.ReadU32());
+            int size = r.ReadLength();
             int payload = r.Position;
             r.Sub(size);
             yield return (id, payload, payload + size, sectionStart);
@@ -402,7 +402,7 @@ public static class ComponentCoreModules
         while (r.HasMore)
         {
             byte id = r.ReadByte();
-            CtReader sub = r.Sub(checked((int)r.ReadU32()));
+            CtReader sub = r.Sub(r.ReadLength());
             int start = sub.Position;
             if (id != 0x01)
             {

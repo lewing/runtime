@@ -31,7 +31,7 @@ internal static class AdapterModule
         while (r.HasMore)
         {
             byte id = r.ReadByte();
-            CtReader body = r.Sub(checked((int)r.ReadU32()));
+            CtReader body = r.Sub(r.ReadLength());
             int start = body.Position;
             ReadOnlyMemory<byte> name = id == (byte)WasmSectionId.Custom ? body.ReadNameMemory() : default;
             body.Position = id == (byte)WasmSectionId.Custom ? body.Position : start;
@@ -96,7 +96,7 @@ internal static class AdapterModule
             uint count = cr.ReadU32();
             for (uint i = 0; i < count; i++)
             {
-                int size = checked((int)cr.ReadU32());
+                int size = cr.ReadLength();
                 CtReader b = cr.Sub(size);
                 bodies.Add(codeSection[b.Position..b.End]);
             }
@@ -303,9 +303,9 @@ internal static class AdapterModule
 
     private static byte[] ReadValTypes(CtReader r)
     {
-        uint count = r.ReadU32();
+        int count = r.ReadCount();
         var types = new byte[count];
-        for (uint i = 0; i < count; i++)
+        for (int i = 0; i < count; i++)
         {
             types[i] = r.ReadByte();
             if (types[i] is 0x63 or 0x64)
@@ -345,7 +345,7 @@ internal static class AdapterModule
         while (r.HasMore)
         {
             byte id = r.ReadByte();
-            CtReader sub = r.Sub(checked((int)r.ReadU32()));
+            CtReader sub = r.Sub(r.ReadLength());
             if (id != (byte)NameSubsectionId.Global)
                 continue;
             uint count = sub.ReadU32();
