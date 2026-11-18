@@ -5,6 +5,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using ILCompiler.ObjectWriter.WasmInstructions;
 using Internal.Text;
 using Internal.TypeSystem;
@@ -134,20 +136,11 @@ namespace ILCompiler.ObjectWriter
         public void WriteEntry(SectionWriter writer, TEntry entry)
         {
             Debug.Assert(writer.SectionIndex == SectionIndex);
-            WriteEntryCore(writer, entry);
+            WriteEntryCore(writer, new WasmModuleEntryWriter(writer.Buffer), entry);
             CompleteEntry();
         }
 
-        protected abstract void WriteEntryCore(SectionWriter writer, TEntry entry);
-
-        protected static void WriteEncodable<TEncodable>(SectionWriter writer, TEncodable entry)
-            where TEncodable : IWasmEncodable
-        {
-            int encodeSize = entry.EncodeSize();
-            int bytesWritten = entry.Encode(writer.Buffer.GetSpan(encodeSize));
-            Debug.Assert(bytesWritten == encodeSize);
-            writer.Buffer.Advance(bytesWritten);
-        }
+        protected abstract void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, TEntry entry);
 
         protected WasmSection(WasmSectionId type, Stream stream, Utf8String name, int sectionIndex)
             : base(type, stream, name, sectionIndex)
@@ -162,13 +155,8 @@ namespace ILCompiler.ObjectWriter
         {
         }
 
-        protected override void WriteEntryCore(SectionWriter writer, WasmImport entry)
-        {
-            writer.WriteUtf8WithLength(entry.Module);
-            writer.WriteUtf8WithLength(entry.Name);
-            writer.WriteByte((byte)entry.Kind);
-            WriteEncodable(writer, entry);
-        }
+        protected override void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, WasmImport entry) =>
+            entry.Write(entries);
     }
 
     internal sealed class WasmFunctionSection : WasmSection<int>
@@ -178,10 +166,8 @@ namespace ILCompiler.ObjectWriter
         {
         }
 
-        protected override void WriteEntryCore(SectionWriter writer, int typeIndex)
-        {
-            writer.WriteULEB128((ulong)typeIndex);
-        }
+        protected override void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, int typeIndex) =>
+            entries.Function(checked((uint)typeIndex));
     }
 
     internal sealed class WasmGlobalSection : WasmSection<WasmGlobal>
@@ -191,20 +177,20 @@ namespace ILCompiler.ObjectWriter
         {
         }
 
-        protected override void WriteEntryCore(SectionWriter writer, WasmGlobal entry)
+        protected override void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, WasmGlobal entry)
         {
             writer.EmitSymbolDefinition(new Utf8String(entry.Name));
-            WriteEncodable(writer, entry);
+            entry.Write(entries);
         }
     }
 
     internal readonly struct WasmExport
     {
         public string Name { get; }
-        public WasmExportKind Kind { get; }
+        public WasmExternalKind Kind { get; }
         public int Index { get; }
 
-        public WasmExport(string name, WasmExportKind kind, int index)
+        public WasmExport(string name, WasmExternalKind kind, int index)
         {
             Name = name;
             Kind = kind;
@@ -219,12 +205,8 @@ namespace ILCompiler.ObjectWriter
         {
         }
 
-        protected override void WriteEntryCore(SectionWriter writer, WasmExport entry)
-        {
-            writer.WriteUtf8WithLength(entry.Name);
-            writer.WriteByte((byte)entry.Kind);
-            writer.WriteULEB128((ulong)entry.Index);
-        }
+        protected override void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, WasmExport entry) =>
+            entries.Export(Encoding.UTF8.GetBytes(entry.Name), entry.Kind, checked((uint)entry.Index));
     }
 
     /// <summary>
@@ -250,20 +232,7 @@ namespace ILCompiler.ObjectWriter
         {
         }
 
-        protected override void WriteEntryCore(SectionWriter writer, WasmElementSegment entry)
-        {
-            ReadOnlySpan<int> functionIndices = entry.FunctionIndices.Span;
-
-            // Active element segment, table 0. Flag 0 implies both the table index and the
-            // funcref element type, so no element-type byte follows.
-            writer.WriteByte(0);
-            WriteEncodable(writer, entry.OffsetExpr);
-
-            writer.WriteULEB128((ulong)functionIndices.Length);
-            foreach (int functionIndex in functionIndices)
-            {
-                writer.WriteULEB128((ulong)functionIndex);
-            }
-        }
+        protected override void WriteEntryCore(SectionWriter writer, WasmModuleEntryWriter entries, WasmElementSegment entry) =>
+            entries.ActiveElementSegment(entry.OffsetExpr.Bytes, MemoryMarshal.Cast<int, uint>(entry.FunctionIndices.Span));
     }
 }

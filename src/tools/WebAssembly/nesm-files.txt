@@ -17,6 +17,7 @@ Binary/Linking/LinkingSection.cs
 Binary/Linking/RelocationSection.cs
 Binary/Linking/RelocationTypes.cs
 Binary/Linking/WasmSymbol.cs
+Binary/ModuleEncoding.cs
 Binary/ModuleReader.cs
 Binary/ModuleReaderOptions.cs
 Binary/NameSubsectionId.cs
@@ -40,6 +41,7 @@ Binary/Writing/WasmCodeWriter.cs
 Binary/Writing/WasmLeb128.Buffers.cs
 Binary/Writing/WasmLeb128.Reading.cs
 Binary/Writing/WasmLeb128.cs
+Binary/Writing/WasmModuleEntryWriter.cs
 Binary/Writing/WasmModuleWriter.cs
 Binary/Writing/WasmOp.cs
 Binary/Writing/WasmSectionId.cs

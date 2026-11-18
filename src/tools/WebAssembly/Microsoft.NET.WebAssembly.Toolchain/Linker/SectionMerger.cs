@@ -2616,7 +2616,7 @@ public sealed class SectionMerger
         WasmEncoder.WriteU32Leb(stream, (uint)types.Count);
         for (int i = 0; i < types.Count; i++)
         {
-            stream.WriteByte(0x60);
+            stream.WriteByte((byte)CompositeTypeCode.Func);
             if (exact && typeDefinitions![i].CompositeType is CompositeType.Function function)
             {
                 WriteExactValTypes(stream, function.Parameters, typeDefinitions, $"type {i} parameter");

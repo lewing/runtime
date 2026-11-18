@@ -501,7 +501,7 @@ internal static class ComponentTypeCodec
         byte op = r.ReadByte();
         switch (op)
         {
-            case 0x60:
+            case (byte)CompositeTypeCode.Func:
                 SkipCoreValTypes(r);
                 SkipCoreValTypes(r);
                 break;

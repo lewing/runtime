@@ -61,7 +61,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     }
 
     // Represents a Wasm function body in the code section: its size, locals and instructions.
-    public class WasmFunctionBody : IWasmEncodable
+    public class WasmFunctionBody
     {
         public readonly WasmFuncType Signature;
         private readonly WasmEncodedInstructions _encoded;
@@ -103,7 +103,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     }
 
     // A group of instructions forming a complete expression ending with 'end', such as a constant expression.
-    public class WasmInstructionGroup : IWasmEncodable
+    public class WasmInstructionGroup
     {
         private readonly WasmEncodedInstructions _encoded;
 

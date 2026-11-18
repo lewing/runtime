@@ -55,7 +55,7 @@ public static class DataSegmentEncoder
     /// <summary>The length of an active segment's header.</summary>
     public static int GetActiveHeaderSize(ReadOnlySpan<byte> offsetExpression, long contentSize, int sizeFieldWidth = 0, uint memoryIndex = 0)
     {
-        CheckExpression(offsetExpression);
+        CheckExpression(offsetExpression, "An offset expression", nameof(offsetExpression));
         return 1 + (memoryIndex == 0 ? 0 : WasmLeb128.GetULeb128Size(memoryIndex)) + offsetExpression.Length +
             SizeFieldLength(contentSize, sizeFieldWidth);
     }
@@ -83,7 +83,7 @@ public static class DataSegmentEncoder
     /// <param name="memoryIndex">The memory the segment initializes.</param>
     public static int EncodeActiveHeader(Span<byte> destination, ReadOnlySpan<byte> offsetExpression, long contentSize, int sizeFieldWidth = 0, uint memoryIndex = 0)
     {
-        CheckExpression(offsetExpression);
+        CheckExpression(offsetExpression, "An offset expression", nameof(offsetExpression));
         int sizeLength = SizeFieldLength(contentSize, sizeFieldWidth);
         int length;
         if (memoryIndex == 0)
@@ -103,10 +103,11 @@ public static class DataSegmentEncoder
         return length + sizeLength;
     }
 
-    private static void CheckExpression(ReadOnlySpan<byte> offsetExpression)
+    // what is the expression's kind as a sentence start ("An offset expression"); paramName is the caller's argument.
+    internal static void CheckExpression(ReadOnlySpan<byte> expression, string what, string paramName)
     {
-        if (offsetExpression.IsEmpty || offsetExpression[^1] != WasmOpcode.End)
-            throw new ArgumentException("An offset expression must end with 'end' (0x0B).", nameof(offsetExpression));
+        if (expression.IsEmpty || expression[^1] != WasmOpcode.End)
+            throw new ArgumentException($"{what} must end with 'end' (0x0B).", paramName);
     }
 
     private static int SizeFieldLength(long contentSize, int sizeFieldWidth)

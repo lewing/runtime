@@ -17,14 +17,14 @@ internal enum ComponentSort : byte
     Instance = 0x05,
 }
 
-/// <summary><c>core:sort</c>.</summary>
+/// <summary><c>core:sort</c>. The first five are the core external kinds, which have one definition.</summary>
 internal enum CoreSort : byte
 {
-    Func = 0x00,
-    Table = 0x01,
-    Memory = 0x02,
-    Global = 0x03,
-    Tag = 0x04,
+    Func = Writing.WasmExternalKind.Function,
+    Table = Writing.WasmExternalKind.Table,
+    Memory = Writing.WasmExternalKind.Memory,
+    Global = Writing.WasmExternalKind.Global,
+    Tag = Writing.WasmExternalKind.Tag,
     Type = 0x10,
     Module = 0x11,
     Instance = 0x12,

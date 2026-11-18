@@ -83,7 +83,7 @@ namespace ILCompiler.ObjectWriter
             }
 
             SectionWriter writer = GetOrCreateSection(WasmObjectNodeSection.DataCountSection);
-            writer.WriteULEB128((ulong)dataSegments.Count);
+            new WasmModuleEntryWriter(writer.Buffer).Count((uint)dataSegments.Count);
             _dataSection = new WasmDataSection(dataSegments, new Utf8String("data"));
         }
 
@@ -414,7 +414,7 @@ namespace ILCompiler.ObjectWriter
             WriteImport(new WasmImport("env", WasmWellKnownGlobalSymbolNode.StackPointerName, import: new WasmGlobalImportType(WasmValueType.I32, WasmMutabilityType.Mut)));
             WriteImport(new WasmImport("env", WasmWellKnownGlobalSymbolNode.AsyncContinuationName, import: new WasmGlobalImportType(WasmValueType.I32, WasmMutabilityType.Mut)));
             WriteImport(new WasmImport("env", "__indirect_function_table", new WasmTableImportType()));
-            WriteImport(new WasmImport("env", "memory", new WasmMemoryImportType(WasmLimitType.HasMin, 0)));
+            WriteImport(new WasmImport("env", "memory", new WasmMemoryImportType(0)));
             int tagType = RegisterSignature(new WasmFuncType(new([]), new([])));
             WriteImport(new WasmImport("env", RestoreContextTagName.ToString(), new WasmTagImportType(tagType)));
         }

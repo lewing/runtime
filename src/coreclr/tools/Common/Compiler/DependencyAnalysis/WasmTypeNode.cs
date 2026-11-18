@@ -46,8 +46,7 @@ namespace ILCompiler.DependencyAnalysis
                        definedSymbols: new ISymbolDefinitionNode[] { this });
             }
 
-            byte[] data = new byte[_type.EncodeSize()];
-            _type.Encode(data);
+            byte[] data = _type.Encode();
 
             return new ObjectData(
                    data: data,
