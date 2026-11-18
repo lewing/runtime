@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Writing;
+using Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Wat;
 
@@ -17,7 +18,7 @@ namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
 /// Expected bytes are written out from the format and from runtime's <c>WasmInstructions.cs</c>; opcode encodings
 /// are checked against <see cref="OpcodeTable"/>; real code is re-emitted byte for byte by <see cref="CodeReemitter"/>.
 /// </summary>
-public sealed class WasmCodeWriterTests
+public sealed partial class WasmCodeWriterTests
 {
     private static (WasmCodeWriter Writer, ArrayBufferWriter<byte> Output) NewWriter()
     {
@@ -267,54 +268,6 @@ public sealed class WasmCodeWriterTests
             case WasmImmediateShape.SelectTyped: w.SelectTyped([ValType.I32]); break;
         }
     }
-
-    // ── Validation and execution ────────────────────────────────────────────
-
-    [Fact]
-    public void WrittenCodeValidates()
-    {
-        // f(x): a br_table switch over x (0 → 10, 1 → 20, else → x * 3 computed in a v128 lane).
-        var (w, body) = NewWriter();
-        w.Locals([ValType.V128]);
-        w.Block(WasmOp.Block, WasmBlockType.Empty);
-        w.Block(WasmOp.Block, WasmBlockType.Empty);
-        w.Block(WasmOp.Block, WasmBlockType.Empty);
-        w.LocalGet(0);
-        w.BrTable([0, 1], 2);
-        w.End();
-        w.I32Const(10);
-        w.Emit(WasmOp.Return);
-        w.End();
-        w.I32Const(20);
-        w.Emit(WasmOp.Return);
-        w.End();
-        w.LocalGet(0);
-        w.Emit(WasmOp.I32x4Splat);
-        w.LocalTee(1);
-        w.LocalGet(1);
-        w.Emit(WasmOp.I32x4Add);
-        w.LocalGet(1);
-        w.Emit(WasmOp.I32x4Add);
-        w.Lane(WasmOp.I32x4ExtractLane, 3);
-        w.End();
-
-        using var stream = new MemoryStream();
-        var module = new WasmModuleWriter(stream);
-        module.WriteSection(WasmSectionId.Type, Convert.FromHexString("0160017f017f"));
-        module.WriteSection(WasmSectionId.Function, Convert.FromHexString("0100"));
-        module.WriteSection(WasmSectionId.Export, Convert.FromHexString("01" + "0166" + "0000"));
-        using var code = new MemoryStream();
-        WasmLeb128.WriteULeb128(code, (ulong)body.WrittenCount);
-        code.Write(body.WrittenSpan);
-        code.Position = 0;
-        module.WriteVectorSection(WasmSectionId.Code, 1, code);
-        byte[] bytes = stream.ToArray();
-
-        ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes), new ModuleReaderOptions { Features = WasmFeatures.All });
-        Assert.Equal(body.WrittenSpan.ToArray(), CodeReemitter.Reemit(body.WrittenSpan));
-    }
-
-    // ── Re-emitting real code ───────────────────────────────────────────────
 
     /// <summary>
     /// Every code body of dotnet/runtime's ILCompiler objects and crossgen2 Webcil images (set <c>NESM_OBJCMP_DIR</c> to an

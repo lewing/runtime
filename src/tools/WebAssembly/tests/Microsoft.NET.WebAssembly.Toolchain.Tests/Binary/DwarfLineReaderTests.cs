@@ -89,7 +89,7 @@ public class DwarfLineReaderTests
     /// </summary>
     internal static async Task<DwarfFormatException> AssertRejectedPromptlyAsync(Action parse)
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = CancellationToken.None;
         // A dedicated thread, so the 5 s clock measures the parse, not thread-pool queueing.
         var work = Task.Factory.StartNew(parse, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         var first = await Task.WhenAny(work, Task.Delay(TimeSpan.FromSeconds(5), ct));
@@ -413,7 +413,7 @@ public class DwarfLineReaderTests
         byte[] wasm = ModuleWithCustomSection(".debug_line",
             [0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0xF6, 0xFF, 0xFF, 0xFF, 0x00, 0x00]);
 
-        var ct = TestContext.Current.CancellationToken;
+        var ct = CancellationToken.None;
         var read = Task.Run(() => ModuleReader.ReadModule(
             new MemoryStream(wasm), new ModuleReaderOptions { Features = WasmFeatures.All }), ct);
         Assert.True(await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(5), ct)) == read,

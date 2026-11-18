@@ -349,8 +349,6 @@ public class DwarfVariableReaderTests
         Assert.Equal("acc", vars[1].Name);
     }
 
-    // ── Test: Real fibonacci.wasm integration ──────────────────────────────────
-
     // ── Real-wasm fixtures: robust location resolution ─────────────────────────
     //
     // Provenance of the two fixtures (tests/samples/dwarf/*.wasm), both built from

@@ -217,6 +217,4 @@ public class StreamingTests
 
         Assert.Equal($"local.get 7{Environment.NewLine}", sw.ToString());
     }
-
-    // ── Large-file streaming test ────────────────────────────────────────
 }

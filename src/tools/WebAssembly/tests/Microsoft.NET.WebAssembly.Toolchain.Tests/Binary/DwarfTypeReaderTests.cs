@@ -710,12 +710,12 @@ public class DwarfTypeReaderTests
         // Dedicated threads with the default 1 MB stack, not the test thread's.
         var types = await Task.Factory.StartNew(
             () => DwarfTypeReader.ParseStructTypes(info, abbrev, null, null, null, null, 50),
-            TestContext.Current.CancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         Assert.Equal("S", Assert.Single(types).Name);
 
         var subprograms = await Task.Factory.StartNew(
             () => DwarfSubprogramReader.Parse(info, abbrev, null, null, null, null),
-            TestContext.Current.CancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         var f = Assert.Single(subprograms.Subprograms);
         Assert.Equal("f", f.Name);
         Assert.Equal(0x10, f.LowPc);
