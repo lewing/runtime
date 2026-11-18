@@ -37,10 +37,17 @@ public sealed class ComdatGroup
     public List<ComdatEntry> Entries { get; init; } = [];
 }
 
-public sealed class ComdatEntry
+/// <summary>A member of a COMDAT group: a function, data segment, global, tag, table or custom section, by index.</summary>
+public readonly record struct ComdatEntry(ComdatKind Kind, uint Index);
+
+/// <summary>
+/// The flags of a COMDAT group. LLVM defines none and rejects any set bit, so <see cref="None"/> is the only value
+/// the encoder writes.
+/// </summary>
+[Flags]
+public enum ComdatFlags : uint
 {
-    public ComdatKind Kind { get; init; }
-    public uint Index { get; init; }
+    None = 0,
 }
 
 [Flags]

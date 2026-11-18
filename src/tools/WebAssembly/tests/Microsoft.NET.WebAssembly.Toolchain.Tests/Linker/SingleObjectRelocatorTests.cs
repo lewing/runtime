@@ -15,7 +15,7 @@ using Microsoft.NET.WebAssembly.Validation;
 /// Tests for <see cref="SingleObjectRelocator"/> — single-object self-resolution of
 /// relocatable wasm object files (.wasm.o) without cross-module merging.
 /// </summary>
-public partial class SingleObjectRelocatorTests
+public class SingleObjectRelocatorTests
 {
     // ── Wasm binary builder helpers ──────────────────────────────────────────────
 
@@ -455,5 +455,40 @@ public partial class SingleObjectRelocatorTests
             if ((b & 0x80) == 0) break;
         }
         return result;
+    }
+
+    // ── Structural versions (no interpreter): dotnet/runtime runs these against its copy of the toolchain ──
+
+    [Fact]
+    public void ParseModuleForAnalysis_AllowsTransformAndEmitButRuntimeLoadStillRejectsIt()
+    {
+        byte[] objBytes = BuildRelocatableObject();
+        using var objectStream = new MemoryStream(objBytes, writable: false);
+
+        Assert.NotNull(typeof(ModuleReader).GetMethod(
+            nameof(ModuleReader.ParseModuleForAnalysis),
+            BindingFlags.Public | BindingFlags.Static));
+        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
+
+        Assert.NotNull(module.LinkingSection);
+
+        var data = module.DataSegments[0];
+        module.DataSegments[0] = new Data
+        {
+            IsPassive = data.IsPassive,
+            MemoryIndex = data.MemoryIndex,
+            OffsetExpr = data.OffsetExpr,
+            InitData = [.. data.InitData, 0xFF],
+            IsReadOnly = data.IsReadOnly,
+        };
+        byte[] transformedBytes = new SectionMerger().EmitBinary(module);
+        Assert.NotEmpty(transformedBytes);
+
+        using var loadStream = new MemoryStream(transformedBytes, writable: false);
+        var loadException = Assert.Throws<WasmValidationException>(
+            () => ModuleReader.ReadModule(loadStream));
+        Assert.Contains(
+            loadException.Diagnostics,
+            static diagnostic => diagnostic.Code == WasmValidationCode.FunctionBodyTypeMismatch);
     }
 }

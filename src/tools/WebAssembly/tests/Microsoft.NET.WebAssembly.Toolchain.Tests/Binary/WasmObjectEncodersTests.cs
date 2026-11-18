@@ -198,9 +198,11 @@ public sealed class WasmObjectEncodersTests
         writer.BeginCustomSection("name"u8, NameMapWriter.GetSubsectionSize(2, entries));
         var map = new NameMapWriter(writer, NameSubsectionId.Function, 2, entries);
         map.Write(5, "a"u8);
-        // Name maps must be sorted by index and duplicate-free.
-        Assert.Throws<InvalidOperationException>(() => map.Write(4, "b"u8));
-        Assert.Throws<InvalidOperationException>(() => map.Write(5, "b"u8));
+        // Name maps must be sorted by index and duplicate-free. An index out of order is a bad argument, as a
+        // relocation offset out of order is; an entry beyond the declared count or size is a call the map's state
+        // does not allow.
+        Assert.Throws<ArgumentException>("index", () => map.Write(4, "b"u8));
+        Assert.Throws<ArgumentException>("index", () => map.Write(5, "b"u8));
         Assert.Throws<InvalidOperationException>(map.Complete);
         map.Write(6, "b"u8);
         Assert.Throws<InvalidOperationException>(() => map.Write(7, "c"u8));

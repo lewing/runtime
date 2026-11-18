@@ -16,6 +16,7 @@
 # Tests listed in nesm-test-files.txt (paths under nesm's tests/Nesm.Tests) are adapted by nesm-sync, a syntax-only
 # Roslyn rewriter (see nesm-sync/TestAdapter.cs) that applies nesm's import rule: tests marked
 # [Trait("Requires", ...)] need nesm's interpreter, wasi-sdk parity harness or repository, and are deleted.
+# Test inputs listed in nesm-test-assets.txt (paths under nesm's tests/samples) are copied to TestAssets unchanged.
 # Members that need hand adaptation live in runtime-only <File>.RuntimeLocal.cs partial files, which replace nesm's
 # members of the same name on every sync. Create one with:
 #   dotnet run --project nesm-sync -- extract <synced test file> <member>...
@@ -30,6 +31,7 @@ files_list="$here/nesm-files.txt"
 patch_file="$here/runtime-local.patch"
 tests="$here/tests/Microsoft.NET.WebAssembly.Toolchain.Tests"
 test_files_list="$here/nesm-test-files.txt"
+test_assets_list="$here/nesm-test-assets.txt"
 subset_dirs=(Types Module Validation Binary Linker Wat Debugging/Symbols)
 
 nesm_sync() {
@@ -44,6 +46,12 @@ stage_tests() {
         git -C "$checkout" show "$commit:tests/Nesm.Tests/$f" > "$out/$f"
     done < "$test_files_list"
     nesm_sync tests "$out" --library "$library" --runtime-tests "$tests" --synced "$test_files_list"
+
+    # Test inputs, copied as-is from nesm's tests/samples to TestAssets at the same relative path.
+    while read -r f; do
+        mkdir -p "$out/TestAssets/$(dirname "$f")"
+        git -C "$checkout" show "$commit:tests/samples/$f" > "$out/TestAssets/$f"
+    done < "$test_assets_list"
 }
 
 # Writes a patch from the files under <a> to the matching files under <b>.

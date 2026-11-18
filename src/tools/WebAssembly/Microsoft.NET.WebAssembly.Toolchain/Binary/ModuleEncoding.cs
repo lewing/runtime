@@ -4,7 +4,21 @@
 namespace Microsoft.NET.WebAssembly.Binary;
 
 // Core module binary encodings (core spec binary format, types and modules). Section ids live in WasmSectionId, external kinds in
-// Writing.WasmExternalKind (public, for producers), and value/heap type codes in ValType and AbstractHeapTypeCodes.
+// Writing.WasmExternalKind (public, for producers), value/heap type codes in ValType and AbstractHeapTypeCodes, and the
+// (ref null ht)/(ref ht) prefixes in RefTypePrefix.
+
+/// <summary>
+/// The prefix bytes of the reference value types written with a heap type; an s33 heap type follows each. The other
+/// reference value types are the single-byte shorthands (<c>funcref</c> is <c>(ref null func)</c>, ...).
+/// </summary>
+internal static class RefTypePrefix
+{
+    /// <summary><c>(ref null ht)</c>.</summary>
+    public const byte RefNull = 0x63;
+
+    /// <summary><c>(ref ht)</c>.</summary>
+    public const byte Ref = 0x64;
+}
 
 /// <summary>The leading byte of a composite type in the type section.</summary>
 internal enum CompositeTypeCode : byte

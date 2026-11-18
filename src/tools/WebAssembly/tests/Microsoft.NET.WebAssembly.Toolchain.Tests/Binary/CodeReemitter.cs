@@ -155,7 +155,15 @@ internal static class CodeReemitter
                     tagPositions[i] = kind is WasmCatchKind.Catch or WasmCatchKind.CatchRef ? codeStart + p : -1;
                     int tagWidth = 0;
                     uint tag = kind is WasmCatchKind.Catch or WasmCatchKind.CatchRef ? ReadU(code, ref p, out tagWidth) : 0;
-                    clauses[i] = new WasmCatchClause(kind, tag, ReadU(code, ref p, out _), Padded(tagWidth, tag));
+                    uint label = ReadU(code, ref p, out _);
+                    clauses[i] = kind switch
+                    {
+                        WasmCatchKind.Catch => WasmCatchClause.Catch(tag, label, Padded(tagWidth, tag)),
+                        WasmCatchKind.CatchRef => WasmCatchClause.CatchRef(tag, label, Padded(tagWidth, tag)),
+                        WasmCatchKind.CatchAll => WasmCatchClause.CatchAll(label),
+                        WasmCatchKind.CatchAllRef => WasmCatchClause.CatchAllRef(label),
+                        _ => throw new InvalidOperationException($"Unknown catch kind {kind}."),
+                    };
                 }
 
                 var written = new long[count];

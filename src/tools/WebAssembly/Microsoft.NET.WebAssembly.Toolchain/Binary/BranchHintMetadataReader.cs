@@ -97,15 +97,14 @@ internal static class BranchHintMetadataReader
 
     private static List<EncodedFunctionEntry> ParsePayload(byte[] content)
     {
-        using var stream = new MemoryStream(content, writable: false);
-        var reader = new WasmBinaryReader(stream);
-        uint functionCount = reader.ReadU32Leb128();
+        var reader = new WasmSpanReader(content);
+        uint functionCount = reader.ReadU32();
         var entries = new List<EncodedFunctionEntry>();
         uint? previousFunctionIndex = null;
 
         for (uint functionEntry = 0; functionEntry < functionCount; functionEntry++)
         {
-            uint functionIndex = reader.ReadU32Leb128();
+            uint functionIndex = reader.ReadU32();
             if (previousFunctionIndex.HasValue && functionIndex <= previousFunctionIndex.Value)
             {
                 throw new MetadataReadException(
@@ -115,12 +114,12 @@ internal static class BranchHintMetadataReader
             }
             previousFunctionIndex = functionIndex;
 
-            uint hintCount = reader.ReadU32Leb128();
+            uint hintCount = reader.ReadU32();
             var hints = new List<EncodedHint>();
             uint? previousOffset = null;
             for (uint hintEntry = 0; hintEntry < hintCount; hintEntry++)
             {
-                uint offset = reader.ReadU32Leb128();
+                uint offset = reader.ReadU32();
                 if (previousOffset.HasValue && offset <= previousOffset.Value)
                 {
                     throw new MetadataReadException(
@@ -131,7 +130,7 @@ internal static class BranchHintMetadataReader
                 }
                 previousOffset = offset;
 
-                uint payloadSize = reader.ReadU32Leb128();
+                uint payloadSize = reader.ReadU32();
                 if (payloadSize != 1)
                 {
                     throw new MetadataReadException(

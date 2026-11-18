@@ -13,12 +13,17 @@ namespace Microsoft.NET.WebAssembly.Binary;
 /// Low-level reader for WebAssembly binary format primitives.
 /// Handles LEB128 encoding, vectors, names, and raw bytes for both seekable and non-seekable streams.
 /// </summary>
+/// <remarks>
+/// A compatibility layer for callers that read a stream one value at a time. <see cref="ModuleReader"/> does not
+/// use it: it reads each section once and parses it from memory with <see cref="WasmSpanReader"/>, which reports
+/// the same messages for the same bytes.
+/// </remarks>
 public sealed class WasmBinaryReader
 {
     private static readonly UTF8Encoding StrictUtf8 =
         new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
-    private readonly BinaryReader _reader;
+    private readonly Stream _stream;
     private readonly long? _length;
     private long _position;
     private bool _hasBufferedByte;
@@ -27,7 +32,7 @@ public sealed class WasmBinaryReader
     public WasmBinaryReader(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        _reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+        _stream = stream;
         if (stream.CanSeek)
         {
             _position = stream.Position;
@@ -35,16 +40,10 @@ public sealed class WasmBinaryReader
         }
     }
 
+    /// <summary>Reads from <paramref name="reader"/>'s underlying stream.</summary>
     public WasmBinaryReader(BinaryReader reader)
+        : this((reader ?? throw new ArgumentNullException(nameof(reader))).BaseStream)
     {
-        ArgumentNullException.ThrowIfNull(reader);
-        _reader = reader;
-        Stream stream = reader.BaseStream;
-        if (stream.CanSeek)
-        {
-            _position = stream.Position;
-            _length = stream.Length;
-        }
     }
 
     public long Position => _position;
@@ -70,16 +69,11 @@ public sealed class WasmBinaryReader
             return _bufferedByte;
         }
 
-        try
-        {
-            byte value = _reader.ReadByte();
-            _position++;
-            return value;
-        }
-        catch (EndOfStreamException ex)
-        {
-            throw new WasmFormatException("Unexpected end of stream while reading byte", ex);
-        }
+        int value = _stream.ReadByte();
+        if (value < 0)
+            throw new WasmFormatException("Unexpected end of stream while reading byte");
+        _position++;
+        return (byte)value;
     }
 
     /// <summary>
@@ -364,7 +358,7 @@ public sealed class WasmBinaryReader
 
         while (total < destination.Length)
         {
-            int read = _reader.BaseStream.Read(destination[total..]);
+            int read = _stream.Read(destination[total..]);
             if (read == 0)
                 break;
             total += read;
@@ -379,7 +373,7 @@ public sealed class WasmBinaryReader
         if (_hasBufferedByte)
             return true;
 
-        int value = _reader.BaseStream.ReadByte();
+        int value = _stream.ReadByte();
         if (value < 0)
             return false;
 

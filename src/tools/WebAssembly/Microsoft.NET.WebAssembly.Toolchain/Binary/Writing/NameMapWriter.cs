@@ -73,14 +73,13 @@ public sealed class NameMapWriter
         return 1 + WasmLeb128.GetULeb128Size((ulong)payload) + payload;
     }
 
-    /// <summary>Writes the next entry.</summary>
-    /// <exception cref="InvalidOperationException">
-    /// The index is not greater than the previous one, or the entry exceeds the declared count or size.
-    /// </exception>
+    /// <summary>Writes the next entry. A rejected entry writes nothing, and the map can go on.</summary>
+    /// <exception cref="ArgumentException">The index is not greater than the previous one.</exception>
+    /// <exception cref="InvalidOperationException">The entry exceeds the declared count or size.</exception>
     public void Write(uint index, ReadOnlySpan<byte> utf8Name)
     {
         if (index <= _previous)
-            throw new InvalidOperationException($"Name map indices must be strictly ascending: {index} follows {_previous}.");
+            throw new ArgumentException($"Name map indices must be strictly ascending: {index} follows {_previous}.", nameof(index));
         if (_written == _count)
             throw new InvalidOperationException($"The name map was declared with {_count} entries.");
         long size = GetEntrySize(index, utf8Name.Length);

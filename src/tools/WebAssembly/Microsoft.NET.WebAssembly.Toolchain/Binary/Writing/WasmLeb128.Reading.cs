@@ -379,6 +379,10 @@ public static partial class WasmLeb128
     /// encoding and decode it with <c>Decode*</c> use it so every reader reports the same text.
     /// </summary>
     internal static WasmFormatException CreateException(Leb128Status status, Leb128Kind kind)
+        => new(CreateMessage(status, kind));
+
+    /// <summary>The message <see cref="CreateException"/> uses for a failed decode.</summary>
+    internal static string CreateMessage(Leb128Status status, Leb128Kind kind)
     {
         (string signedness, string type, int maxBytes) = kind switch
         {
@@ -393,10 +397,10 @@ public static partial class WasmLeb128
         {
             // The unsigned readers always reported a continuation bit on the last allowed byte as overflow.
             Leb128Status.Overflow or Leb128Status.TooLong when kind is Leb128Kind.U32 or Leb128Kind.U64 =>
-                new WasmFormatException($"{signedness} LEB128 value overflows {type}"),
-            Leb128Status.Overflow => new WasmFormatException($"{signedness} LEB128 value overflows {type}"),
-            Leb128Status.TooLong => new WasmFormatException($"{signedness} LEB128 encoding exceeds {maxBytes} bytes for {type}"),
-            Leb128Status.Truncated => new WasmFormatException($"Unexpected end of data while reading LEB128 {type}"),
+                $"{signedness} LEB128 value overflows {type}",
+            Leb128Status.Overflow => $"{signedness} LEB128 value overflows {type}",
+            Leb128Status.TooLong => $"{signedness} LEB128 encoding exceeds {maxBytes} bytes for {type}",
+            Leb128Status.Truncated => $"Unexpected end of data while reading LEB128 {type}",
             _ => throw new ArgumentOutOfRangeException(nameof(status), status, "Not a failure status."),
         };
     }

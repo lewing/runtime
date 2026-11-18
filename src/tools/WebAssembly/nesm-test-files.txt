@@ -14,6 +14,7 @@ Binary/WasmLeb128ReaderTests.cs
 Binary/WasmModuleEntryWriterTests.cs
 Binary/WasmObjectEncodersTests.cs
 Binary/WasmObjectWriterApiTests.cs
+Common/WasmAssert.cs
 Linker/ArArchiveReaderTests.cs
 Linker/DeadCodeEliminatorTests.cs
 Linker/DebugAndNameSectionTests.cs

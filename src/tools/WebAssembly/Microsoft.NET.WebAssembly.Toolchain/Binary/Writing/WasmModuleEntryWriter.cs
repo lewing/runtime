@@ -2,28 +2,21 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using Microsoft.NET.WebAssembly.Types;
 
 namespace Microsoft.NET.WebAssembly.Binary.Writing;
 
-/// <summary>The kind byte of an import or export descriptor (core spec §5.5.5, §5.5.10).</summary>
-public enum WasmExternalKind : byte
-{
-    Function = 0x00,
-    Table = 0x01,
-    Memory = 0x02,
-    Global = 0x03,
-    Tag = 0x04,
-}
-
 /// <summary>
 /// Writes the entries of a module's type, import, function, table, memory, global, export, element and tag sections to
 /// an <see cref="IBufferWriter{T}"/>; the section's entry count and framing are the caller's (see
-/// <see cref="WasmModuleWriter"/>). Names are UTF-8 bytes, written as given. Value types are <see cref="ValType"/>s
-/// (single-byte codes), and table element types are their reference shorthands. An index that may be relocated takes a
-/// width it is padded to, and its position, relative to the start of this writer, is returned so the caller can record
-/// a relocation against it. Start the writer at the section's content and write the entry count with
-/// <see cref="Count"/> first, and positions are offsets into the section's content, as <c>reloc.*</c> entries are.
+/// <see cref="WasmModuleWriter"/>). Names are UTF-8 bytes, written as given. Value types and table element types are
+/// <see cref="WasmValType"/>s, so GC and function references types such as <c>(ref null $t)</c> can be written; a
+/// <see cref="ValType"/> converts implicitly. An index that may be relocated takes a
+/// width it is padded to, and its writer-relative position (bytes since this writer was created) is returned so the
+/// caller can record a relocation against it. Start the writer at the section's content and write the entry count with
+/// <see cref="Count"/> first, and positions are also section-relative offsets into the section's content, as
+/// <c>reloc.*</c> entries need; otherwise convert them with <see cref="RelocationSectionEncoder.SectionOffset"/>.
 /// </summary>
 public sealed class WasmModuleEntryWriter
 {
@@ -38,7 +31,7 @@ public sealed class WasmModuleEntryWriter
         _output = output;
     }
 
-    /// <summary>The number of bytes this writer has written.</summary>
+    /// <summary>The number of bytes this writer has written: the writer-relative position of the next entry.</summary>
     public long Position { get; private set; }
 
     /// <summary>Writes a section's entry count (a minimal LEB128), which comes before its first entry.</summary>
@@ -47,10 +40,22 @@ public sealed class WasmModuleEntryWriter
     // ── Type section ─────────────────────────────────────────────────────────
 
     /// <summary>Writes a function type: <c>0x60</c>, the parameter types and the result types.</summary>
+    public void FuncType(ReadOnlySpan<WasmValType> parameters, ReadOnlySpan<WasmValType> results)
+    {
+        CheckValueTypes(parameters, nameof(parameters));
+        CheckValueTypes(results, nameof(results));
+        WriteByte((byte)CompositeTypeCode.Func);
+        WriteTypes(parameters);
+        WriteTypes(results);
+    }
+
+    /// <summary>Writes a function type with single-byte parameter and result types.</summary>
+    // Preferred where both apply (an empty or all-ValType collection expression), which would otherwise be ambiguous.
+    [OverloadResolutionPriority(1)]
     public void FuncType(ReadOnlySpan<ValType> parameters, ReadOnlySpan<ValType> results)
     {
-        CheckValueTypes(parameters);
-        CheckValueTypes(results);
+        CheckValueTypes(parameters, nameof(parameters));
+        CheckValueTypes(results, nameof(results));
         WriteByte((byte)CompositeTypeCode.Func);
         WriteTypes(parameters);
         WriteTypes(results);
@@ -71,12 +76,12 @@ public sealed class WasmModuleEntryWriter
     }
 
     /// <summary>Writes a table import: the reference type and limits.</summary>
-    public void TableImport(ReadOnlySpan<byte> module, ReadOnlySpan<byte> name, ValType elementType, ulong min, ulong? max = null, bool is64 = false)
+    public void TableImport(ReadOnlySpan<byte> module, ReadOnlySpan<byte> name, WasmValType elementType, ulong min, ulong? max = null, bool is64 = false)
     {
         CheckRefType(elementType);
         CheckLimits(min, max, is64, shared: false);
         ImportHeader(module, name, WasmExternalKind.Table);
-        WriteByte((byte)elementType);
+        WriteValueType(elementType);
         WriteLimits(min, max, is64, shared: false);
     }
 
@@ -89,12 +94,12 @@ public sealed class WasmModuleEntryWriter
     }
 
     /// <summary>Writes a global import: the value type and mutability.</summary>
-    public void GlobalImport(ReadOnlySpan<byte> module, ReadOnlySpan<byte> name, ValType valueType, Mutability mutability)
+    public void GlobalImport(ReadOnlySpan<byte> module, ReadOnlySpan<byte> name, WasmValType valueType, Mutability mutability)
     {
-        WasmCodeWriter.CheckValueType(valueType);
+        valueType.Check(nameof(valueType));
         CheckMutability(mutability);
         ImportHeader(module, name, WasmExternalKind.Global);
-        WriteByte((byte)valueType);
+        WriteValueType(valueType);
         WriteByte((byte)mutability);
     }
 
@@ -120,12 +125,17 @@ public sealed class WasmModuleEntryWriter
         return WriteU(typeIndex, width);
     }
 
-    /// <summary>Writes a table section entry: the reference type and limits.</summary>
-    public void Table(ValType elementType, ulong min, ulong? max = null, bool is64 = false)
+    /// <summary>
+    /// Writes a table section entry: the reference type and limits. The element type must be nullable, since this
+    /// form has no initializer expression to fill a table of non-nullable references.
+    /// </summary>
+    public void Table(WasmValType elementType, ulong min, ulong? max = null, bool is64 = false)
     {
         CheckRefType(elementType);
+        if (!elementType.IsNullable)
+            throw new ArgumentException($"A table of {elementType} needs an initializer expression, which this entry does not have.", nameof(elementType));
         CheckLimits(min, max, is64, shared: false);
-        WriteByte((byte)elementType);
+        WriteValueType(elementType);
         WriteLimits(min, max, is64, shared: false);
     }
 
@@ -137,15 +147,15 @@ public sealed class WasmModuleEntryWriter
     }
 
     /// <summary>Writes a global section entry: the value type, mutability and initializer, copied as given.</summary>
-    /// <param name="valueType">The global's single-byte value type.</param>
+    /// <param name="valueType">The global's value type.</param>
     /// <param name="mutability">Whether the global is mutable.</param>
     /// <param name="initExpression">A constant expression including its <c>end</c>.</param>
-    public void Global(ValType valueType, Mutability mutability, ReadOnlySpan<byte> initExpression)
+    public void Global(WasmValType valueType, Mutability mutability, ReadOnlySpan<byte> initExpression)
     {
-        WasmCodeWriter.CheckValueType(valueType);
+        valueType.Check(nameof(valueType));
         CheckMutability(mutability);
         DataSegmentEncoder.CheckExpression(initExpression, "An initializer expression", nameof(initExpression));
-        WriteByte((byte)valueType);
+        WriteValueType(valueType);
         WriteByte((byte)mutability);
         WriteBytes(initExpression);
     }
@@ -229,18 +239,31 @@ public sealed class WasmModuleEntryWriter
             throw new ArgumentOutOfRangeException(nameof(mutability), mutability, "Unknown mutability.");
     }
 
-    private static void CheckValueTypes(ReadOnlySpan<ValType> types)
+    private static void CheckValueTypes(ReadOnlySpan<WasmValType> types, string paramName)
     {
-        foreach (ValType type in types)
-            WasmCodeWriter.CheckValueType(type);
+        foreach (WasmValType type in types)
+            type.Check(paramName);
     }
 
-    // Tables hold references: a reference shorthand (funcref, externref, exnref, ...), not a numeric or vector type.
-    private static void CheckRefType(ValType elementType)
+    private static void CheckValueTypes(ReadOnlySpan<ValType> types, string paramName)
     {
-        WasmCodeWriter.CheckValueType(elementType);
-        if (elementType is >= ValType.V128 and <= ValType.I32)
+        foreach (ValType type in types)
+            WasmCodeWriter.CheckValueType(type, paramName);
+    }
+
+    // Tables hold references, not numbers or vectors.
+    private static void CheckRefType(WasmValType elementType)
+    {
+        elementType.Check(nameof(elementType));
+        if (!elementType.IsReference)
             throw new ArgumentException($"{elementType} is not a reference type.", nameof(elementType));
+    }
+
+    private void WriteTypes(ReadOnlySpan<WasmValType> types)
+    {
+        WriteU((ulong)types.Length, 0);
+        foreach (WasmValType type in types)
+            WriteValueType(type);
     }
 
     private void WriteTypes(ReadOnlySpan<ValType> types)
@@ -249,6 +272,8 @@ public sealed class WasmModuleEntryWriter
         foreach (ValType type in types)
             WriteByte((byte)type);
     }
+
+    private void WriteValueType(WasmValType type) => Advance(type.Encode(_output.GetSpan(1 + WasmLeb128.MaxLength)));
 
     private static void CheckKind(WasmExternalKind kind)
     {

@@ -11,8 +11,18 @@ namespace Microsoft.NET.WebAssembly.Binary.Writing;
 /// (data count, producers, linking and reloc.* sections are all the caller's to write, in the caller's order).
 /// </summary>
 /// <remarks>
+/// <para>
 /// Section indices are file positions (0 for the first section after the header), the numbering the linking
 /// section and reloc.* sections refer to. Every Begin/Write method returns the index of the section it starts.
+/// <see cref="Position"/> is a module offset: the file offset of the next byte, counting <c>startOffset</c>.
+/// </para>
+/// <para>
+/// Any exception thrown by an instance method, including one from the output stream or from a payload,
+/// faults the writer: <see cref="IsFaulted"/> becomes true and every later instance method throws
+/// <see cref="InvalidOperationException"/>. The output then holds a partial module and should be discarded.
+/// This holds even for a call rejected before it writes anything, so that callers need one rule, not one per
+/// method.
+/// </para>
 /// </remarks>
 public sealed class WasmModuleWriter
 {
@@ -21,6 +31,7 @@ public sealed class WasmModuleWriter
 
     private readonly Stream _output;
     private long _sectionEnd = -1;
+    private bool _faulted;
 
     /// <summary>Creates a writer that writes to <paramref name="output"/>.</summary>
     /// <param name="output">The destination. It only needs to be writable.</param>
@@ -49,7 +60,10 @@ public sealed class WasmModuleWriter
     /// <summary>The module header: the <c>\0asm</c> magic and version 1.</summary>
     public static ReadOnlySpan<byte> Header => [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
 
-    /// <summary>The module offset of the next byte to be written.</summary>
+    /// <summary>
+    /// The module offset of the next byte to be written: its offset in the file, counting the <c>startOffset</c> the
+    /// writer was created with.
+    /// </summary>
     public long Position { get; private set; }
 
     /// <summary>The index the next section will have.</summary>
@@ -57,6 +71,12 @@ public sealed class WasmModuleWriter
 
     /// <summary>Whether a section has been begun and not yet ended.</summary>
     public bool IsSectionOpen => _sectionEnd >= 0;
+
+    /// <summary>
+    /// Whether an earlier call threw. A faulted writer throws <see cref="InvalidOperationException"/> from every
+    /// instance method, and its output holds a partial module.
+    /// </summary>
+    public bool IsFaulted => _faulted;
 
     /// <summary>
     /// A write-only stream over the open section's content, for callers that encode content directly to a
@@ -78,12 +98,20 @@ public sealed class WasmModuleWriter
     /// <returns>The section's index.</returns>
     public int BeginSection(WasmSectionId id, long contentSize, int sizeFieldWidth = 0)
     {
-        EnsureNoOpenSection();
-        Span<byte> header = stackalloc byte[1 + MaxSizeFieldWidth];
-        int headerLength = EncodeSectionHeader(header, id, contentSize, sizeFieldWidth);
-        WriteRaw(header[..headerLength]);
-        _sectionEnd = Position + contentSize;
-        return NextSectionIndex++;
+        EnsureNotFaulted();
+        try
+        {
+            EnsureNoOpenSection();
+            Span<byte> header = stackalloc byte[1 + MaxSizeFieldWidth];
+            int headerLength = EncodeSectionHeader(header, id, contentSize, sizeFieldWidth);
+            WriteRaw(header[..headerLength]);
+            _sectionEnd = Position + contentSize;
+            return NextSectionIndex++;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -93,51 +121,91 @@ public sealed class WasmModuleWriter
     /// <returns>The section's index.</returns>
     public int BeginCustomSection(ReadOnlySpan<byte> utf8Name, long payloadSize, int sizeFieldWidth = 0)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(payloadSize);
-        long contentSize = WasmLeb128.GetULeb128Size((ulong)utf8Name.Length) + utf8Name.Length + payloadSize;
-        int index = BeginSection(WasmSectionId.Custom, contentSize, sizeFieldWidth);
-        Span<byte> nameLength = stackalloc byte[WasmLeb128.MaxLength];
-        Write(nameLength[..WasmLeb128.WriteULeb128(nameLength, (ulong)utf8Name.Length)]);
-        Write(utf8Name);
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(payloadSize);
+            long contentSize = WasmLeb128.GetULeb128Size((ulong)utf8Name.Length) + utf8Name.Length + payloadSize;
+            int index = BeginSection(WasmSectionId.Custom, contentSize, sizeFieldWidth);
+            Span<byte> nameLength = stackalloc byte[WasmLeb128.MaxLength];
+            Write(nameLength[..WasmLeb128.WriteULeb128(nameLength, (ulong)utf8Name.Length)]);
+            Write(utf8Name);
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Writes content of the open section.</summary>
     public void Write(ReadOnlySpan<byte> content)
     {
-        if (!IsSectionOpen)
-            throw new InvalidOperationException("No section is open; call BeginSection first.");
-        if (Position + content.Length > _sectionEnd)
-            throw new InvalidOperationException($"Writing {content.Length} bytes would overrun the section's declared size by {Position + content.Length - _sectionEnd} bytes.");
-        WriteRaw(content);
+        EnsureNotFaulted();
+        try
+        {
+            if (!IsSectionOpen)
+                throw new InvalidOperationException("No section is open; call BeginSection first.");
+            if (Position + content.Length > _sectionEnd)
+                throw new InvalidOperationException($"Writing {content.Length} bytes would overrun the section's declared size by {Position + content.Length - _sectionEnd} bytes.");
+            WriteRaw(content);
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Copies <paramref name="source"/> from its current position to its end into the open section.</summary>
     public void Write(Stream source)
     {
-        ArgumentNullException.ThrowIfNull(source);
-        // A MemoryStream source writes its buffer directly; other streams copy through a pooled buffer.
-        source.CopyTo(ContentStream);
+        EnsureNotFaulted();
+        try
+        {
+            ArgumentNullException.ThrowIfNull(source);
+            // A MemoryStream source writes its buffer directly; other streams copy through a pooled buffer.
+            source.CopyTo(ContentStream);
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Ends the open section, checking that exactly its declared content was written.</summary>
     public void EndSection()
     {
-        if (!IsSectionOpen)
-            throw new InvalidOperationException("No section is open.");
-        if (Position != _sectionEnd)
-            throw new InvalidOperationException($"The section's declared size is {_sectionEnd - Position} bytes more than its content.");
-        _sectionEnd = -1;
+        EnsureNotFaulted();
+        try
+        {
+            if (!IsSectionOpen)
+                throw new InvalidOperationException("No section is open.");
+            if (Position != _sectionEnd)
+                throw new InvalidOperationException($"The section's declared size is {_sectionEnd - Position} bytes more than its content.");
+            _sectionEnd = -1;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Writes a section whose content is <paramref name="content"/>.</summary>
     /// <returns>The section's index.</returns>
     public int WriteSection(WasmSectionId id, ReadOnlySpan<byte> content, int sizeFieldWidth = 0)
     {
-        int index = BeginSection(id, content.Length, sizeFieldWidth);
-        Write(content);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            int index = BeginSection(id, content.Length, sizeFieldWidth);
+            Write(content);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -147,23 +215,39 @@ public sealed class WasmModuleWriter
     /// <returns>The section's index.</returns>
     public int WriteSection(WasmSectionId id, Stream content, ReadOnlySpan<byte> contentPrefix = default, int sizeFieldWidth = 0)
     {
-        long length = RemainingLength(content);
-        int index = BeginSection(id, contentPrefix.Length + length, sizeFieldWidth);
-        Write(contentPrefix);
-        Write(content);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            long length = RemainingLength(content);
+            int index = BeginSection(id, contentPrefix.Length + length, sizeFieldWidth);
+            Write(contentPrefix);
+            Write(content);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Writes a section whose content is supplied by <paramref name="payload"/>.</summary>
     /// <returns>The section's index.</returns>
     public int WriteSection(WasmSectionId id, IWasmSectionPayload payload, int sizeFieldWidth = 0)
     {
-        ArgumentNullException.ThrowIfNull(payload);
-        int index = BeginSection(id, payload.Length, sizeFieldWidth);
-        payload.WriteTo(ContentStream);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            ArgumentNullException.ThrowIfNull(payload);
+            int index = BeginSection(id, payload.Length, sizeFieldWidth);
+            payload.WriteTo(ContentStream);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -173,18 +257,34 @@ public sealed class WasmModuleWriter
     /// <returns>The section's index.</returns>
     public int WriteVectorSection(WasmSectionId id, uint count, Stream entries, int sizeFieldWidth = 0)
     {
-        Span<byte> prefix = stackalloc byte[WasmLeb128.MaxLength];
-        return WriteSection(id, entries, prefix[..WasmLeb128.WriteULeb128(prefix, count)], sizeFieldWidth);
+        EnsureNotFaulted();
+        try
+        {
+            Span<byte> prefix = stackalloc byte[WasmLeb128.MaxLength];
+            return WriteSection(id, entries, prefix[..WasmLeb128.WriteULeb128(prefix, count)], sizeFieldWidth);
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Writes a custom section named <paramref name="utf8Name"/> with payload <paramref name="payload"/>.</summary>
     /// <returns>The section's index.</returns>
     public int WriteCustomSection(ReadOnlySpan<byte> utf8Name, ReadOnlySpan<byte> payload, int sizeFieldWidth = 0)
     {
-        int index = BeginCustomSection(utf8Name, payload.Length, sizeFieldWidth);
-        Write(payload);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            int index = BeginCustomSection(utf8Name, payload.Length, sizeFieldWidth);
+            Write(payload);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -194,23 +294,39 @@ public sealed class WasmModuleWriter
     /// <returns>The section's index.</returns>
     public int WriteCustomSection(ReadOnlySpan<byte> utf8Name, Stream payload, ReadOnlySpan<byte> payloadPrefix = default, int sizeFieldWidth = 0)
     {
-        long length = RemainingLength(payload);
-        int index = BeginCustomSection(utf8Name, payloadPrefix.Length + length, sizeFieldWidth);
-        Write(payloadPrefix);
-        Write(payload);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            long length = RemainingLength(payload);
+            int index = BeginCustomSection(utf8Name, payloadPrefix.Length + length, sizeFieldWidth);
+            Write(payloadPrefix);
+            Write(payload);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>Writes a custom section whose payload is supplied by <paramref name="payload"/>.</summary>
     /// <returns>The section's index.</returns>
     public int WriteCustomSection(ReadOnlySpan<byte> utf8Name, IWasmSectionPayload payload, int sizeFieldWidth = 0)
     {
-        ArgumentNullException.ThrowIfNull(payload);
-        int index = BeginCustomSection(utf8Name, payload.Length, sizeFieldWidth);
-        payload.WriteTo(ContentStream);
-        EndSection();
-        return index;
+        EnsureNotFaulted();
+        try
+        {
+            ArgumentNullException.ThrowIfNull(payload);
+            int index = BeginCustomSection(utf8Name, payload.Length, sizeFieldWidth);
+            payload.WriteTo(ContentStream);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -221,28 +337,36 @@ public sealed class WasmModuleWriter
     /// <returns>The padding section's index, or -1 when no padding is needed.</returns>
     public int WritePaddingSection(int followingSectionAlignment)
     {
-        EnsureNoOpenSection();
-        int size = GetPaddingSectionSize(followingSectionAlignment, Position);
-        if (size == 0)
-            return -1;
-
-        int sizeFieldWidth = 1;
-        int payloadLength = 0;
-        for (; sizeFieldWidth <= MaxSizeFieldWidth; sizeFieldWidth++)
+        EnsureNotFaulted();
+        try
         {
-            payloadLength = size - 1 - sizeFieldWidth;
-            if (WasmLeb128.GetULeb128Size((ulong)payloadLength) <= sizeFieldWidth)
-                break;
-        }
+            EnsureNoOpenSection();
+            int size = GetPaddingSectionSize(followingSectionAlignment, Position);
+            if (size == 0)
+                return -1;
 
-        // The payload's first zero byte reads as an empty name, so the section is a valid unnamed custom section.
-        int index = BeginSection(WasmSectionId.Custom, payloadLength, sizeFieldWidth);
-        Span<byte> zeros = stackalloc byte[256];
-        zeros.Clear();
-        for (int remaining = payloadLength; remaining > 0; remaining -= zeros.Length)
-            Write(zeros[..Math.Min(remaining, zeros.Length)]);
-        EndSection();
-        return index;
+            int sizeFieldWidth = 1;
+            int payloadLength = 0;
+            for (; sizeFieldWidth <= MaxSizeFieldWidth; sizeFieldWidth++)
+            {
+                payloadLength = size - 1 - sizeFieldWidth;
+                if (WasmLeb128.GetULeb128Size((ulong)payloadLength) <= sizeFieldWidth)
+                    break;
+            }
+
+            // The payload's first zero byte reads as an empty name, so the section is a valid unnamed custom section.
+            int index = BeginSection(WasmSectionId.Custom, payloadLength, sizeFieldWidth);
+            Span<byte> zeros = stackalloc byte[256];
+            zeros.Clear();
+            for (int remaining = payloadLength; remaining > 0; remaining -= zeros.Length)
+                Write(zeros[..Math.Min(remaining, zeros.Length)]);
+            EndSection();
+            return index;
+        }
+        catch (Exception) when (Fault())
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -282,6 +406,19 @@ public sealed class WasmModuleWriter
 
         WasmLeb128.WritePaddedULeb128(destination.Slice(1, sizeFieldWidth), (ulong)contentSize);
         return 1 + sizeFieldWidth;
+    }
+
+    private void EnsureNotFaulted()
+    {
+        if (_faulted)
+            throw new InvalidOperationException("The writer is faulted: an earlier call threw, so its output holds a partial module.");
+    }
+
+    // An exception filter, so that faulting the writer does not catch or rethrow the exception.
+    private bool Fault()
+    {
+        _faulted = true;
+        return false;
     }
 
     private void EnsureNoOpenSection()

@@ -17,7 +17,7 @@ using Microsoft.NET.WebAssembly.Wat;
 /// End-to-end integration tests that compile WAT modules, link them with WasmLinker,
 /// and (where applicable) execute the result through the interpreter.
 /// </summary>
-public partial class WatIntegrationTests
+public class WatIntegrationTests
 {
     private readonly WasmLinker _linker = new();
 
@@ -300,5 +300,78 @@ public partial class WatIntegrationTests
         // Object module's unexported function should be stripped; plain module's function kept.
         Assert.Single(merged.Functions);
         Assert.True(merged.Exports.ContainsKey("plain_fn"));
+    }
+
+    // ── Structural versions (no interpreter): dotnet/runtime runs these against its copy of the toolchain ──
+
+    [Fact]
+    public void Link_TwoWatModules_MergedModulePreservesFunctionBodies()
+    {
+        var modA = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "triple") (param i32) (result i32)
+                (i32.mul (local.get 0) (i32.const 3))))
+            """);
+
+        var modB = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "inc") (param i32) (result i32)
+                (i32.add (local.get 0) (i32.const 1))))
+            """);
+
+        var merged = WasmAssert.Valid(_linker.LinkToBinary([modA, modB]));
+
+        Assert.Equal(modA.Functions[0].Body, WasmAssert.ExportedFunctionBody(merged, "triple").Body);
+        Assert.Equal(modB.Functions[0].Body, WasmAssert.ExportedFunctionBody(merged, "inc").Body);
+    }
+
+    [Fact]
+    public void Link_ValidProduct_AnalyticalModelAndSerializedProductBothValidate()
+    {
+        var first = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "first") (param i32) (result i32)
+                (local i32)
+                (local.set 1 (local.get 0))
+                (local.get 1)))
+            """);
+        var second = WatCompiler.CompileAndValidate(
+            """
+            (module
+              (func (export "second") (param i32) (result i32)
+                (local.get 0)))
+            """);
+
+        var linked = _linker.Link([first, second]);
+
+        // Compact metadata now makes the analytical model directly validatable despite retaining
+        // linker-only state that is absent from the serialized product.
+        Assert.Single(linked.Types);
+        // The merged module carries an exact type-definition space in lockstep with its compact one.
+        // It used to come out empty, and that emptiness was not free: every writer-side guard that
+        // consults TypeDefinitions then passed on a hole rather than on a type, which is how a
+        // struct-typed table reached the output as a function-typed one (GitHub #383).
+        Assert.Equal(linked.Types.Count, linked.TypeDefinitions.Count);
+        Assert.Equal(
+            linked.Types[0].Parameters,
+            ((CompositeType.Function)linked.TypeDefinitions[0].CompositeType)
+                .Parameters.Select(p => p.ToStorageValType()).ToArray());
+        Assert.Equal(
+            linked.Types[0].Results,
+            ((CompositeType.Function)linked.TypeDefinitions[0].CompositeType)
+                .Results.Select(r => r.ToStorageValType()).ToArray());
+        Assert.Equal(
+            [new Microsoft.NET.WebAssembly.Types.ValueType.Number(NumberType.I32)],
+            linked.Functions[0].ExactLocals);
+        var directResult = WasmModuleValidator.Validate(linked);
+        Assert.True(directResult.IsValid, FormatDiagnostics(directResult));
+
+        byte[] shippedBinary = new SectionMerger().EmitBinary(linked);
+        var shippedModule = ModuleReader.ReadModuleAndValidate(new MemoryStream(shippedBinary));
+        AssertSemanticValidatorsAccept(shippedModule);
+        Assert.Equal(first.Functions[0].Body, WasmAssert.ExportedFunctionBody(shippedModule, "first").Body);
     }
 }
