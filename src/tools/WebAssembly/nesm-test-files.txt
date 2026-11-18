@@ -1,7 +1,9 @@
 Binary/CodeReemitter.cs
+Binary/ConstExpressionWalkerTests.cs
 Binary/DwarfLineReaderTests.cs
 Binary/DwarfLineWriterTests.cs
 Binary/DwarfTypeReaderTests.cs
+Binary/DwarfUnitHeaderTests.cs
 Binary/DwarfVariableReaderTests.cs
 Binary/Memory64Tests.cs
 Binary/ModuleReaderTests.cs
@@ -16,10 +18,12 @@ Binary/WasmObjectEncodersTests.cs
 Binary/WasmObjectWriterApiTests.cs
 Common/WasmAssert.cs
 Linker/ArArchiveReaderTests.cs
+Linker/CaptureParityTests.cs
 Linker/DeadCodeEliminatorTests.cs
 Linker/DebugAndNameSectionTests.cs
 Linker/ExternalTool.cs
 Linker/ImportMergingTests.cs
+Linker/LinkerOutputTests.cs
 Linker/ModuleFacets.cs
 Linker/RelocationEngineTests.cs
 Linker/SectionMergerTests.cs

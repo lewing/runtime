@@ -84,17 +84,17 @@ public static class DwarfVariableReader
     /// </param>
     /// <param name="addrData">Optional .debug_addr section bytes (DWARF 5 <c>DW_FORM_addrx</c>).</param>
     internal static IReadOnlyList<DwarfVariable> ParseVariables(
-        byte[] infoData,
-        byte[] abbrevData,
-        byte[]? strData,
-        byte[]? lineStrData,
-        byte[]? strOffsetsData,
+        ReadOnlySpan<byte> infoData,
+        ReadOnlySpan<byte> abbrevData,
+        ReadOnlySpan<byte> strData,
+        ReadOnlySpan<byte> lineStrData,
+        ReadOnlySpan<byte> strOffsetsData,
         int funcIndex,
         List<(long startOffset, long endOffset, int absIndex)>? funcRanges = null,
-        byte[]? addrData = null)
+        ReadOnlySpan<byte> addrData = default)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
-        int pos = 0;
+        var units = new DwarfUnitEnumerator(infoData, ".debug_info");
 
         // Fix A: run a COMPLETE primary pass over every CU before considering the
         // unrelocated-low_pc fallback. A subprogram that RANGE-MATCHES the requested
@@ -106,55 +106,14 @@ public static class DwarfVariableReader
         List<DwarfVariable>? fallbackResult = null;
         int fallbackCandidates = 0;
 
-        while (pos < infoData.Length)
+        while (units.MoveNext())
         {
-            // Fix F: validate the CU header incrementally before indexing into it.
-            if (pos + 6 > infoData.Length) break; // unit_length(4) + version(2)
-
-            int cuStart = pos;
-            uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen >= DwarfUnitLength.ReservedMin) break; // 64-bit DWARF and reserved lengths are not supported
-
-            // In 64 bits, so a large length cannot wrap the end back before the unit.
-            long cuEndLong = (long)pos + 4 + unitLen;
-            if (cuEndLong > infoData.Length || cuEndLong < pos + 6) break;
-            int cuEnd = (int)cuEndLong;
-
-            ushort version = DwarfReaderHelpers.ReadU16LE(infoData, pos + 4);
-            if (version < 2 || version > 5) { pos = cuEnd; continue; }
-
-            // Minimum header sizes: v2–v4 need abbrev_offset(4)+addr_size(1) after
-            // version (→ pos+11); v5 adds unit_type(1) before them (→ pos+12).
-            int headerEnd = version >= 5 ? pos + 12 : pos + 11;
-            if (headerEnd > cuEnd || headerEnd > infoData.Length) { pos = cuEnd; continue; }
-
-            int abbrevOffset;
-            byte addrSize;
-            int diePos;
-            if (version >= 5)
-            {
-                addrSize = infoData[pos + 7];
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 8);
-                diePos = pos + 12;
-            }
-            else
-            {
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 6);
-                addrSize = infoData[pos + 10];
-                diePos = pos + 11;
-            }
-
-            if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable))
-            {
-                pos = cuEnd;
+            // A bad unit_length leaves no next unit.
+            if (units.Error is not null)
+                break;
+            var dies = ReadUnitDies(infoData, units.Current, abbrevTables, strData, lineStrData, strOffsetsData, addrData, out _);
+            if (dies is null)
                 continue;
-            }
-
-            // DWARF 5 per-unit bases: string offsets and indexed (DW_FORM_addrx) addresses.
-            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(infoData, diePos, cuEnd, version, abbrevTable, addrSize);
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
-                addrData, addrBase, resolveAddrx: true);
-            var dies = DwarfReaderHelpers.ParseDIEs(infoData, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
 
             // Primary pass for this CU. A range-match (or, when funcRanges is null,
             // the synthetic low_pc-as-index match) is authoritative — return it even
@@ -181,11 +140,51 @@ public static class DwarfVariableReader
                         fallbackResult = fb;
                 }
             }
-
-            pos = cuEnd;
         }
 
         return fallbackCandidates == 1 ? fallbackResult ?? [] : [];
+    }
+
+    /// <summary>
+    /// The DIEs of one .debug_info unit, with DWARF 5 per-unit bases (string offsets and indexed
+    /// <c>DW_FORM_addrx</c> addresses) resolved; null when the unit's header is malformed or unsupported,
+    /// its abbreviations are missing, or a DIE in it is malformed — one bad unit skips that unit, not the
+    /// section.
+    /// </summary>
+    private static List<DwarfReaderHelpers.DwarfDIE>? ReadUnitDies(
+        ReadOnlySpan<byte> infoData, in DwarfUnitFrame frame,
+        Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> abbrevTables,
+        ReadOnlySpan<byte> strData, ReadOnlySpan<byte> lineStrData, ReadOnlySpan<byte> strOffsetsData,
+        ReadOnlySpan<byte> addrData, out byte addrSize)
+    {
+        addrSize = 0;
+        DwarfUnitHeader header;
+        try
+        {
+            if (!DwarfUnitHeader.TryRead(infoData, frame, ".debug_info", out header))
+                return null;
+        }
+        catch (DwarfFormatException)
+        {
+            return null;
+        }
+        if (!header.TryGetAbbrevTable(abbrevTables, out var abbrevTable))
+            return null;
+
+        addrSize = header.AddressSize;
+        var unit = infoData[..frame.UnitEnd];
+        var format = header.Format;
+        try
+        {
+            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(unit, header.DieStart, unit.Length, abbrevTable, format);
+            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
+                addrData, addrBase, resolveAddrx: true);
+            return DwarfReaderHelpers.ParseDIEs(unit, header.DieStart, unit.Length, abbrevTable, format, ctx, frame.UnitStart);
+        }
+        catch (Exception ex) when (ex is DwarfFormatException || DwarfReaderHelpers.IsRangeError(ex))
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -451,13 +450,13 @@ public static class DwarfVariableReader
     }
 
     internal static DwarfFunctionVariables ParseVariableInfos(
-        byte[] infoData, byte[] abbrevData,
-        byte[]? strData, byte[]? lineStrData, byte[]? strOffsetsData,
+        ReadOnlySpan<byte> infoData, ReadOnlySpan<byte> abbrevData,
+        ReadOnlySpan<byte> strData, ReadOnlySpan<byte> lineStrData, ReadOnlySpan<byte> strOffsetsData,
         int funcIndex, List<(long startOffset, long endOffset, int absIndex)>? funcRanges = null,
-        byte[]? locData = null, long? queryCodeOffset = null, byte[]? addrData = null)
+        ReadOnlySpan<byte> locData = default, long? queryCodeOffset = null, ReadOnlySpan<byte> addrData = default)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
-        int pos = 0;
+        var units = new DwarfUnitEnumerator(infoData, ".debug_info");
 
         // Fix A: mirror the ReadVariables path — a subprogram that RANGE-MATCHES the
         // requested function is authoritative even with zero classifiable variables;
@@ -466,53 +465,14 @@ public static class DwarfVariableReader
         DwarfFunctionVariables? fallbackResult = null;
         int fallbackCandidates = 0;
 
-        while (pos < infoData.Length)
+        while (units.MoveNext())
         {
-            // Fix F: validate the CU header incrementally before indexing into it.
-            if (pos + 6 > infoData.Length) break; // unit_length(4) + version(2)
-
-            int cuStart = pos;
-            uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen >= DwarfUnitLength.ReservedMin) break; // 64-bit DWARF and reserved lengths are not supported
-
-            // In 64 bits, so a large length cannot wrap the end back before the unit.
-            long cuEndLong = (long)pos + 4 + unitLen;
-            if (cuEndLong > infoData.Length || cuEndLong < pos + 6) break;
-            int cuEnd = (int)cuEndLong;
-
-            ushort version = DwarfReaderHelpers.ReadU16LE(infoData, pos + 4);
-            if (version < 2 || version > 5) { pos = cuEnd; continue; }
-
-            int headerEnd = version >= 5 ? pos + 12 : pos + 11;
-            if (headerEnd > cuEnd || headerEnd > infoData.Length) { pos = cuEnd; continue; }
-
-            int abbrevOffset;
-            byte addrSize;
-            int diePos;
-            if (version >= 5)
-            {
-                addrSize = infoData[pos + 7];
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 8);
-                diePos = pos + 12;
-            }
-            else
-            {
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 6);
-                addrSize = infoData[pos + 10];
-                diePos = pos + 11;
-            }
-
-            if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable))
-            {
-                pos = cuEnd;
+            // A bad unit_length leaves no next unit.
+            if (units.Error is not null)
+                break;
+            var dies = ReadUnitDies(infoData, units.Current, abbrevTables, strData, lineStrData, strOffsetsData, addrData, out byte addrSize);
+            if (dies is null)
                 continue;
-            }
-
-            // DWARF 5 per-unit bases: string offsets and indexed (DW_FORM_addrx) addresses.
-            var (strOffsetsBase, addrBase) = DwarfReaderHelpers.ReadUnitBases(infoData, diePos, cuEnd, version, abbrevTable, addrSize);
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
-                addrData, addrBase, resolveAddrx: true);
-            var dies = DwarfReaderHelpers.ParseDIEs(infoData, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
 
             // Default base address for this CU's location lists: the compile_unit's
             // DW_AT_low_pc (DWARF 5.7.7). Often 0 in unrelocated wasm modules, in
@@ -542,8 +502,6 @@ public static class DwarfVariableReader
                         fallbackResult = fb;
                 }
             }
-
-            pos = cuEnd;
         }
 
         return fallbackCandidates == 1 && fallbackResult is not null
@@ -555,7 +513,7 @@ public static class DwarfVariableReader
         List<DwarfReaderHelpers.DwarfDIE> dies, int funcIndex,
         List<(long startOffset, long endOffset, int absIndex)>? funcRanges,
         byte addrSize, bool fallback,
-        byte[]? locData, long cuBaseLowPc, long? queryCodeOffset)
+        ReadOnlySpan<byte> locData, long cuBaseLowPc, long? queryCodeOffset)
     {
         var byOffset = new Dictionary<int, DwarfReaderHelpers.DwarfDIE>(dies.Count);
         foreach (var die in dies)
@@ -649,7 +607,7 @@ public static class DwarfVariableReader
     /// confident-but-wrong classification. <paramref name="addrSize"/> is the CU
     /// address size, so DW_OP_addr is read as 8 bytes on wasm64.
     /// </summary>
-    internal static (DwarfVarLocationKind Kind, long Value) ParseLocationExpression(byte[] loc, byte addrSize = 4)
+    internal static (DwarfVarLocationKind Kind, long Value) ParseLocationExpression(ReadOnlySpan<byte> loc, byte addrSize = 4)
     {
         if (loc.Length == 0) return (DwarfVarLocationKind.Unknown, 0);
 
@@ -731,9 +689,9 @@ public static class DwarfVariableReader
     /// </para>
     /// </summary>
     internal static (DwarfVarLocationKind Kind, long Value) ResolveLoclistLocation(
-        byte[]? locData, long loclistOffset, long baseAddress, long queryPc, byte addrSize)
+        ReadOnlySpan<byte> locData, long loclistOffset, long baseAddress, long queryPc, byte addrSize)
     {
-        if (locData is null || locData.Length == 0) return (DwarfVarLocationKind.Unknown, 0);
+        if (locData.IsEmpty) return (DwarfVarLocationKind.Unknown, 0);
         if (addrSize != 4 && addrSize != 8) return (DwarfVarLocationKind.Unknown, 0);
         if (loclistOffset < 0 || loclistOffset >= locData.Length) return (DwarfVarLocationKind.Unknown, 0);
 
@@ -768,9 +726,7 @@ public static class DwarfVariableReader
             long hi = baseAddr + end;
             if (queryPc >= lo && queryPc < hi)
             {
-                var expr = new byte[n];
-                Array.Copy(locData, p, expr, 0, n);
-                return ParseLocationExpression(expr, addrSize);
+                return ParseLocationExpression(locData.Slice(p, n), addrSize);
             }
 
             p += n; // not covered — advance past this entry's expression

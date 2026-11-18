@@ -77,3 +77,20 @@ internal static class WasmOpcode
     /// <summary>Threads (atomic) instructions.</summary>
     public const byte AtomicPrefix = 0xFE;
 }
+
+/// <summary>
+/// <c>0xFB</c> (GC) sub-opcodes that code outside the interpreters' dispatch switches matches by value: the GC
+/// instructions a constant expression may contain. Constants rather than an enum for the reason
+/// <see cref="WasmOpcode"/> gives: they are compared with decoded sub-opcodes.
+/// </summary>
+internal static class WasmGcSubOpcode
+{
+    public const uint StructNew = 0x00;
+    public const uint StructNewDefault = 0x01;
+    public const uint ArrayNew = 0x06;
+    public const uint ArrayNewDefault = 0x07;
+    public const uint ArrayNewFixed = 0x08;
+    public const uint AnyConvertExtern = 0x1A;
+    public const uint ExternConvertAny = 0x1B;
+    public const uint RefI31 = 0x1C;
+}

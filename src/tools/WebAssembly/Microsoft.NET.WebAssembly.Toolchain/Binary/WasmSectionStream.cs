@@ -142,6 +142,31 @@ internal sealed class WasmSectionStream : IDisposable
         return new WasmSpanReader(payload, start);
     }
 
+    /// <summary>
+    /// Reads the next <paramref name="length"/> bytes into a new array of exactly that length, for a payload the
+    /// caller keeps. The length is checked, and failures reported, as <see cref="ReadPayload"/> does.
+    /// </summary>
+    /// <exception cref="WasmFormatException">The input ends before <paramref name="length"/> bytes.</exception>
+    public byte[] ReadPayloadArray(int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        long start = _position;
+        if (_length is { } total)
+        {
+            long remaining = total - _position;
+            if ((ulong)length > (ulong)remaining)
+                throw UnexpectedEnd((ulong)length, remaining, start);
+        }
+        else if (length > UnknownLengthChunkSize)
+        {
+            return ReadGrowing(length, start).ToArray();
+        }
+
+        byte[] payload = new byte[length];
+        ReadExactly(payload);
+        return payload;
+    }
+
     private ReadOnlySpan<byte> ReadGrowing(int length, long start)
     {
         int filled = 0;

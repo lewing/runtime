@@ -18,7 +18,8 @@ public readonly record struct WasmLinkInput(string DisplayName, WasmModule Modul
 }
 
 /// <summary>
-/// Runs a link described by a <see cref="WasmLdCommandLine"/>: loads inputs, links, validates the result and writes it.
+/// Runs a link described by a <see cref="WasmLdCommandLine"/>: loads inputs, links, validates the result (unless
+/// <see cref="LinkerOptions.ValidateOutput"/> is off) and writes it.
 /// </summary>
 public static class WasmLdDriver
 {
@@ -26,10 +27,13 @@ public static class WasmLdDriver
     /// <param name="commandLine">Parsed command line.</param>
     /// <param name="log">Receives informational messages; per-input details only when <see cref="WasmLdCommandLine.Verbose"/> is set.</param>
     /// <param name="warn">Receives warnings, such as accepted options that have no effect.</param>
-    /// <returns>The validated output module.</returns>
+    /// <returns>
+    /// The output module as validation read it back, or <see langword="null"/> when
+    /// <see cref="LinkerOptions.ValidateOutput"/> is off.
+    /// </returns>
     /// <exception cref="WasmLdArgumentException">No output or no inputs were specified.</exception>
     /// <exception cref="LinkerException">Linking failed.</exception>
-    public static WasmModule Run(WasmLdCommandLine commandLine, Action<string>? log = null, Action<string>? warn = null)
+    public static WasmModule? Run(WasmLdCommandLine commandLine, Action<string>? log = null, Action<string>? warn = null)
     {
         if (string.IsNullOrEmpty(commandLine.OutputPath))
             throw new WasmLdArgumentException("No output file specified; use -o.");
@@ -51,21 +55,59 @@ public static class WasmLdDriver
             }
         }
 
-        // The linker validates the bytes it produces; that module is the result.
-        byte[] bytes = new WasmLinker().LinkToBinary(ToLinkerInputs(inputs), commandLine.Options, out WasmModule result);
+        // The linker validates the bytes it produces (unless told not to); that module is the result. The output file
+        // is opened only once the link has succeeded, so a failed link leaves an existing output alone.
+        WasmLinker.LinkedOutput output = new WasmLinker().LinkOutput(ToLinkerInputs(inputs), commandLine.Options);
 
         string outputPath = Path.GetFullPath(commandLine.OutputPath);
         string? outputDirectory = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrEmpty(outputDirectory))
             Directory.CreateDirectory(outputDirectory);
-        File.WriteAllBytes(outputPath, bytes);
+        WriteOutput(outputPath, output);
 
-        log?.Invoke($"Linked {inputs.Count} module(s) into '{outputPath}' ({bytes.Length} bytes).");
-        return result;
+        log?.Invoke($"Linked {inputs.Count} module(s) into '{outputPath}' ({output.Length} bytes).");
+        return output.Validated;
+    }
+
+    private static void WriteOutput(string outputPath, WasmLinker.LinkedOutput output) => WriteOutput(outputPath, output.WriteTo);
+
+    /// <summary>
+    /// Creates <paramref name="outputPath"/> and lets <paramref name="write"/> fill it. Unvalidated output is streamed
+    /// from the linked model, so a write can fail part-way; the partial file is then deleted rather than left looking
+    /// linked. A failure to open the file is reported as it is, and leaves an existing file alone.
+    /// </summary>
+    internal static void WriteOutput(string outputPath, Action<Stream> write)
+    {
+        var stream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
+        try
+        {
+            using (stream)
+                write(stream);
+        }
+        catch
+        {
+            TryDelete(outputPath);
+            throw;
+        }
+    }
+
+    // Best effort: the error being reported is the write's, not the cleanup's.
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     /// <summary>Links already-loaded inputs and returns the encoded module.</summary>
-    /// <remarks>The output is validated before it is returned.</remarks>
+    /// <remarks>The output is validated before it is returned, unless <see cref="LinkerOptions.ValidateOutput"/> is off.</remarks>
     public static byte[] Link(IReadOnlyList<WasmLinkInput> inputs, LinkerOptions options) =>
         new WasmLinker().LinkToBinary(ToLinkerInputs(inputs), options);
 

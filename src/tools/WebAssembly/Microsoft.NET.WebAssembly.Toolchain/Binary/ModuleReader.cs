@@ -1569,102 +1569,47 @@ public static partial class ModuleReader
     }
 
     /// <summary>
-    /// Read and validate an init expression (§5.4.6).  Parses the opcode and its
-    /// immediate(s) properly so that LEB128 overflow is detected, then expects 0x0B (end).
-    /// Returns the raw bytes consumed (opcode + immediate + end).
+    /// Reads an init expression (§5.4.6) through the shared <see cref="ConstExpressionWalker"/>, and returns a copy of
+    /// its bytes, <c>end</c> included.
     /// </summary>
+    /// <remarks>
+    /// The walk refuses an instruction outside the constant-expression grammar before decoding it, so the messages
+    /// below name the instruction rather than whatever follows it. A malformed immediate of a constant instruction is
+    /// reported by the instruction decoder, as it is in a function body; bytes that run out before <c>end</c> are
+    /// reported by the section reader, at the missing byte.
+    /// </remarks>
     private static byte[] ReadInitExpr(ref WasmSpanReader reader)
     {
-        // Read a sequence of constant-expression opcodes until END (0x0B).
-        // Supports extended-const proposal: i32/i64 add/sub/mul in init expressions.
-        int start = reader.Position;
-
-        while (true)
+        var walker = new ConstExpressionWalker(reader.RemainingBytes, WasmFeatures.All, reader.AbsolutePosition);
+        while (walker.MoveNext(out ConstOp op, out DecodedInstruction instruction))
         {
-            byte opcode = reader.ReadByte();
-
-            switch (opcode)
-            {
-                case WasmOpcode.End:
-                    return reader.ConsumedSince(start).ToArray();
-                case WasmOpcode.I32Const: // i32.const  — s32 LEB128
-                    reader.ReadS32();
-                    break;
-                case WasmOpcode.I64Const: // i64.const  — s64 LEB128
-                    reader.ReadS64();
-                    break;
-                case WasmOpcode.F32Const: // f32.const  — 4 raw bytes
-                    reader.ReadBytes(4);
-                    break;
-                case WasmOpcode.F64Const: // f64.const  — 8 raw bytes
-                    reader.ReadBytes(8);
-                    break;
-                case WasmOpcode.GlobalGet: // global.get — u32 LEB128 index
-                    reader.ReadU32();
-                    break;
-                case WasmOpcode.RefNull: // ref.null — heap type (s33 LEB128 for GC, single byte for MVP)
-                    reader.ReadS33();
-                    break;
-                case WasmOpcode.RefFunc: // ref.func — u32 LEB128 funcidx
-                    reader.ReadU32();
-                    break;
-                case WasmOpcode.SimdPrefix: // SIMD prefix — v128.const (sub-opcode 12)
-                    uint simdSubOpcode = reader.ReadU32();
-                    if (simdSubOpcode != 0x0C)
-                        throw new WasmFormatException($"Invalid SIMD init expression sub-opcode: 0x{simdSubOpcode:X}");
-                    reader.ReadBytes(16);
-                    break;
-                // Extended constant expressions — no immediates
-                case WasmOpcode.I32Add:
-                case WasmOpcode.I32Sub:
-                case WasmOpcode.I32Mul:
-                case WasmOpcode.I64Add:
-                case WasmOpcode.I64Sub:
-                case WasmOpcode.I64Mul:
-                    break;
-                // GC init expression opcodes
-                case WasmOpcode.GcPrefix: // GC prefix
-                {
-                    uint gcSubOpcode = reader.ReadU32();
-                    switch (gcSubOpcode)
-                    {
-                        // struct.new, struct.new_default, array.new, array.new_default
-                        case 0x00:
-                        case 0x01:
-                        case 0x06:
-                        case 0x07:
-                            reader.ReadU32();
-                            break;
-                        case 0x08: // array.new_fixed
-                            reader.ReadU32();
-                            reader.ReadU32();
-                            break;
-                        // any.convert_extern, extern.convert_any, ref.i31
-                        case 0x1A:
-                        case 0x1B:
-                        case 0x1C:
-                            break;
-                        default:
-                            throw new WasmFormatException($"Invalid GC init expression sub-opcode: 0x{gcSubOpcode:X}");
-                    }
-                    break;
-                }
-                default:
-                    throw new WasmFormatException($"Invalid init expression opcode: 0x{opcode:X2}");
-            }
+            if (op == ConstOp.End)
+                return reader.ReadBytes(walker.Position).ToArray();
+            if (op == ConstOp.NotConstant)
+                throw new WasmFormatException(NotConstantInitExprMessage(instruction.OpcodeId), reader.AbsolutePosition + instruction.ByteOffset);
         }
+
+        reader.ReadBytes(walker.Position);
+        reader.ReadByte();
+        throw new WasmFormatException("Init expression has no end opcode.", reader.AbsolutePosition);
     }
+
+    private static string NotConstantInitExprMessage(OpcodeId opcode) => opcode.Opcode switch
+    {
+        WasmOpcode.SimdPrefix => $"Invalid SIMD init expression sub-opcode: 0x{opcode.SubOpcode:X}",
+        WasmOpcode.GcPrefix => $"Invalid GC init expression sub-opcode: 0x{opcode.SubOpcode:X}",
+        _ => $"Invalid init expression opcode: 0x{opcode.Opcode:X2}",
+    };
 
     private static int ReadElemExprFunctionIndex(byte[] expr)
     {
-        var cursor = new InstructionCursor(expr, WasmFeatures.All);
-        if (!cursor.MoveNext(out var instruction))
+        var walker = new ConstExpressionWalker(expr);
+        if (!walker.MoveNext(out ConstOp op, out DecodedInstruction instruction))
             return -1;
-        return instruction.OpcodeId.Opcode switch
+        return op switch
         {
-            0xD2 => unchecked((int)instruction.Index0),
-            0xD0 => -1,
-            0x23 => unchecked(-((int)instruction.Index0 + 2)),
+            ConstOp.RefFunc => unchecked((int)instruction.Index0),
+            ConstOp.GlobalGet => unchecked(-((int)instruction.Index0 + 2)),
             _ => -1,
         };
     }

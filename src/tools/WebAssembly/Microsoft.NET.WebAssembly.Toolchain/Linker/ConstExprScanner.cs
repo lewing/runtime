@@ -3,12 +3,10 @@
 
 namespace Microsoft.NET.WebAssembly.Linker;
 
-using System.Collections.Generic;
-using System.IO;
+using System.Buffers;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Types;
-using Microsoft.NET.WebAssembly.Wat;
 
 /// <summary>
 /// The single walk over the constant-expression grammar used by the linker.
@@ -29,12 +27,13 @@ using Microsoft.NET.WebAssembly.Wat;
 /// how a writer emits bytes no validator accepts while reporting success.
 /// </para>
 /// <para>
-/// The grammar this walk accepts is the one <c>Microsoft.NET.WebAssembly.Binary.ModuleReader.ReadInitExpr</c> decodes
-/// and <c>Microsoft.NET.WebAssembly.Validation.ConstantExpressionValidator</c> admits, opcode for opcode. Refusing less
-/// than the reader is over-acceptance; refusing <em>more</em> is a valid-input rejection, and that
-/// is the shape the <c>0xFB</c> GC prefix took — <c>wasm-tools 1.253.0</c> validates
-/// <c>(table 1 i31ref (ref.i31 (i32.const 1)))</c> and nesm read it back, but the linker then
-/// refused to re-emit an instruction its own reader had just accepted (GitHub #383).
+/// The grammar is not restated here: the instructions come from
+/// <see cref="ConstExpressionWalker"/>, which the reader, the validator, the evaluator and the
+/// disassembler also walk (#600 P9), so this walk accepts exactly what the reader decodes. It used
+/// to carry its own opcode table, and that is how it once refused the whole <c>0xFB</c> GC prefix
+/// — <c>wasm-tools 1.253.0</c> validates <c>(table 1 i31ref (ref.i31 (i32.const 1)))</c> and nesm
+/// read it back, but the linker then refused to re-emit an instruction its own reader had just
+/// accepted (GitHub #383).
 /// </para>
 /// </remarks>
 internal static class ConstExprScanner
@@ -84,6 +83,11 @@ internal static class ConstExprScanner
     /// Rewrites every index-carrying operand through <paramref name="map"/>, copying the rest of the
     /// expression through unchanged.
     /// </summary>
+    /// <remarks>
+    /// The instructions come from <see cref="ConstExpressionWalker"/>, which owns the grammar; this method owns only
+    /// the encoding policy. Indices and sub-opcodes are written at their minimal width; constants, the
+    /// <c>array.new_fixed</c> count and an unchanged <c>ref.null</c> heap type are copied byte for byte.
+    /// </remarks>
     public static byte[] Rewrite(byte[] expr, Func<OperandKind, long, long> map)
     {
         ArgumentNullException.ThrowIfNull(expr);
@@ -92,95 +96,112 @@ internal static class ConstExprScanner
         if (expr.Length == 0)
             return [];
 
-        using var output = new MemoryStream(expr.Length + 8);
-        int offset = 0;
-        while (offset < expr.Length)
+        // An instruction of n >= 2 bytes grows by at most four bytes per LEB it re-encodes (to the five-byte maximum),
+        // so no instruction more than triples; `end` is copied.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(checked((expr.Length * 3) + 16));
+        try
         {
-            byte opcode = expr[offset++];
-            output.WriteByte(opcode);
-
-            switch (opcode)
+            Span<byte> output = buffer;
+            int written = 0;
+            var walker = new ConstExpressionWalker(expr);
+            try
             {
-                case WasmOpcode.End:
-                    return output.ToArray();
-                case WasmOpcode.I32Const:
-                case WasmOpcode.I64Const:
-                    CopyLebImmediate(expr, ref offset, output);
-                    break;
-                case WasmOpcode.RefNull:
+                while (walker.MoveNext(out ConstOp op, out DecodedInstruction instruction))
                 {
-                    int immediateStart = offset;
-                    long original;
-                    try
-                    {
-                        original = WasmLeb128.ReadS33(expr, ref offset);
-                    }
-                    catch (WasmFormatException ex)
-                    {
-                        throw new LinkerException(ex.Message, ex);
-                    }
+                    if (op == ConstOp.NotConstant)
+                        throw NotConstant(instruction.OpcodeId);
 
-                    long rewritten = map(OperandKind.HeapType, original);
-                    if (rewritten == original)
+                    byte opcode = instruction.OpcodeId.Opcode;
+                    output[written++] = opcode;
+                    ReadOnlySpan<byte> immediates = instruction.ImmediateBytes;
+                    switch (op)
                     {
-                        output.Write(expr, immediateStart, offset - immediateStart);
+                        case ConstOp.End:
+                            return output[..written].ToArray();
+                        case ConstOp.I32Const:
+                        case ConstOp.I64Const:
+                        case ConstOp.F32Const:
+                        case ConstOp.F64Const:
+                            immediates.CopyTo(output[written..]);
+                            written += immediates.Length;
+                            break;
+                        case ConstOp.RefNull:
+                        {
+                            long original = instruction.HeapType0;
+                            long rewritten = map(OperandKind.HeapType, original);
+                            if (rewritten == original)
+                            {
+                                immediates.CopyTo(output[written..]);
+                                written += immediates.Length;
+                            }
+                            else
+                            {
+                                if (!WasmLeb128.IsS33(rewritten))
+                                    throw new LinkerException($"Heap type {rewritten} is outside the signed 33-bit range.");
+                                written += WasmLeb128.WriteSLeb128(output[written..], rewritten);
+                            }
+
+                            break;
+                        }
+
+                        case ConstOp.GlobalGet:
+                            written += WasmLeb128.WriteULeb128(output[written..], ToIndex(map(OperandKind.GlobalIndex, instruction.Index0)));
+                            break;
+                        case ConstOp.RefFunc:
+                            written += WasmLeb128.WriteULeb128(output[written..], ToIndex(map(OperandKind.FunctionIndex, instruction.Index0)));
+                            break;
+                        case ConstOp.V128Const:
+                            written += WasmLeb128.WriteULeb128(output[written..], instruction.OpcodeId.SubOpcode);
+                            immediates[^16..].CopyTo(output[written..]);
+                            written += 16;
+                            break;
+                        case ConstOp.StructNew:
+                        case ConstOp.StructNewDefault:
+                        case ConstOp.ArrayNew:
+                        case ConstOp.ArrayNewDefault:
+                            written += WasmLeb128.WriteULeb128(output[written..], instruction.OpcodeId.SubOpcode);
+                            written += WasmLeb128.WriteULeb128(output[written..], ToIndex(map(OperandKind.TypeIndex, instruction.Index0)));
+                            break;
+                        case ConstOp.ArrayNewFixed:
+                        {
+                            // A typeidx followed by an element COUNT, which is not an index and must not be routed
+                            // through the map: it is copied as it was written.
+                            written += WasmLeb128.WriteULeb128(output[written..], instruction.OpcodeId.SubOpcode);
+                            written += WasmLeb128.WriteULeb128(output[written..], ToIndex(map(OperandKind.TypeIndex, instruction.Index0)));
+                            int countStart = 0;
+                            WasmLeb128.TrySkip(immediates, ref countStart);
+                            WasmLeb128.TrySkip(immediates, ref countStart);
+                            ReadOnlySpan<byte> count = immediates[countStart..];
+                            count.CopyTo(output[written..]);
+                            written += count.Length;
+                            break;
+                        }
+
+                        case ConstOp.AnyConvertExtern:
+                        case ConstOp.ExternConvertAny:
+                        case ConstOp.RefI31:
+                            written += WasmLeb128.WriteULeb128(output[written..], instruction.OpcodeId.SubOpcode);
+                            break;
+                        case ConstOp.I32Add:
+                        case ConstOp.I32Sub:
+                        case ConstOp.I32Mul:
+                        case ConstOp.I64Add:
+                        case ConstOp.I64Sub:
+                        case ConstOp.I64Mul:
+                            break;
+                        default:
+                            throw new LinkerException($"Constant-expression instruction {op} has no rewrite policy.");
                     }
-                    else
-                    {
-                        if (!WasmLeb128.IsS33(rewritten))
-                            throw new LinkerException($"Heap type {rewritten} is outside the signed 33-bit range.");
-                        WasmEncoder.WriteS33Leb(output, rewritten);
-                    }
-                    break;
                 }
-                case WasmOpcode.F32Const:
-                    CopyFixed(expr, ref offset, output, 4, "f32.const");
-                    break;
-                case WasmOpcode.F64Const:
-                    CopyFixed(expr, ref offset, output, 8, "f64.const");
-                    break;
-                case WasmOpcode.GlobalGet:
-                    WasmEncoder.WriteU32Leb(
-                        output,
-                        ToIndex(map(OperandKind.GlobalIndex, ReadU32Leb(expr, ref offset))));
-                    break;
-                case WasmOpcode.RefFunc:
-                    WasmEncoder.WriteU32Leb(
-                        output,
-                        ToIndex(map(OperandKind.FunctionIndex, ReadU32Leb(expr, ref offset))));
-                    break;
-                case WasmOpcode.SimdPrefix:
-                {
-                    // The reader admits exactly one SIMD constant expression, `v128.const`
-                    // (sub-opcode 12), and copying the 16-byte payload after any other sub-opcode
-                    // would resynchronise the walk on operand bytes. Refuse what the reader refuses.
-                    uint simd = ReadU32Leb(expr, ref offset);
-                    if (simd != 0x0C)
-                    {
-                        throw new LinkerException(
-                            $"Constant-expression SIMD sub-opcode 0x{simd:X} is not v128.const (0x0C), which is the " +
-                            "only SIMD instruction permitted in a constant expression.");
-                    }
-
-                    WasmEncoder.WriteU32Leb(output, simd);
-                    CopyFixed(expr, ref offset, output, 16, "SIMD constant");
-                    break;
-                }
-
-                case WasmOpcode.GcPrefix:
-                    RewriteGcConstructor(expr, ref offset, output, map);
-                    break;
-                case WasmOpcode.I32Add:
-                case WasmOpcode.I32Sub:
-                case WasmOpcode.I32Mul:
-                case WasmOpcode.I64Add:
-                case WasmOpcode.I64Sub:
-                case WasmOpcode.I64Mul:
-                    break;
-                default:
-                    throw new LinkerException(
-                        $"Unsupported constant-expression opcode 0x{opcode:X2} while remapping merged sections.");
             }
+            catch (WasmFormatException ex)
+            {
+                throw new LinkerException($"Malformed constant expression: {ex.Message}", ex);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         // Falling out of the loop means the bytes ran out before `end`. Returning what has been
@@ -190,87 +211,23 @@ internal static class ConstExprScanner
             "Constant expression ends without an `end` opcode (0x0B); the bytes run out first.");
     }
 
-    /// <summary>
-    /// Rewrites the immediates of a <c>0xFB</c>-prefixed GC constant expression instruction.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// The sub-opcode set is the one <c>ModuleReader.ReadInitExpr</c> decodes and
-    /// <c>ConstantExpressionValidator.ApplyGc</c> admits — <c>struct.new</c>,
-    /// <c>struct.new_default</c>, <c>array.new</c>, <c>array.new_default</c>,
-    /// <c>array.new_fixed</c>, <c>any.convert_extern</c>, <c>extern.convert_any</c> and
-    /// <c>ref.i31</c>. Anything else is refused, matching the reader rather than widening past it.
-    /// </para>
-    /// <para>
-    /// The linker rejecting the whole prefix was a valid-input rejection with an external witness:
-    /// <c>wasm-tools 1.253.0</c> validates <c>(table 1 i31ref (ref.i31 (i32.const 1)))</c>, nesm's
-    /// reader accepts it, and re-emission then failed on a supported opcode (GitHub #383).
-    /// </para>
-    /// </remarks>
-    private static void RewriteGcConstructor(
-        byte[] expr, ref int offset, Stream output, Func<OperandKind, long, long> map)
+    private static LinkerException NotConstant(OpcodeId opcode) => opcode.Opcode switch
     {
-        uint sub = ReadU32Leb(expr, ref offset);
-        WasmEncoder.WriteU32Leb(output, sub);
-
-        switch (sub)
-        {
-            // struct.new, struct.new_default, array.new, array.new_default — one typeidx.
-            case 0x00:
-            case 0x01:
-            case 0x06:
-            case 0x07:
-                WasmEncoder.WriteU32Leb(
-                    output,
-                    ToIndex(map(OperandKind.TypeIndex, ReadU32Leb(expr, ref offset))));
-                return;
-
-            // array.new_fixed — a typeidx followed by an element COUNT, which is not an index and
-            // must not be routed through the map.
-            case 0x08:
-                WasmEncoder.WriteU32Leb(
-                    output,
-                    ToIndex(map(OperandKind.TypeIndex, ReadU32Leb(expr, ref offset))));
-                CopyLebImmediate(expr, ref offset, output);
-                return;
-
-            // any.convert_extern, extern.convert_any, ref.i31 — no immediates.
-            case 0x1A:
-            case 0x1B:
-            case 0x1C:
-                return;
-
-            default:
-                throw new LinkerException(
-                    $"Unsupported constant-expression GC sub-opcode 0x{sub:X} while remapping merged sections.");
-        }
-    }
+        // The reader admits exactly one SIMD constant expression, `v128.const`; anything else is refused rather than
+        // copied, because copying it would emit bytes no validator accepts.
+        WasmOpcode.SimdPrefix => new LinkerException(
+            $"Constant-expression SIMD sub-opcode 0x{opcode.SubOpcode:X} is not v128.const (0x0C), which is the " +
+            "only SIMD instruction permitted in a constant expression."),
+        WasmOpcode.GcPrefix => new LinkerException(
+            $"Unsupported constant-expression GC sub-opcode 0x{opcode.SubOpcode:X} while remapping merged sections."),
+        _ => new LinkerException(
+            $"Unsupported constant-expression opcode 0x{opcode.Opcode:X2} while remapping merged sections."),
+    };
 
     private static uint ToIndex(long value) =>
         value is >= 0 and <= uint.MaxValue
             ? (uint)value
             : throw new LinkerException($"Constant-expression index {value} is outside the u32 index space.");
-
-    private static void CopyFixed(ReadOnlySpan<byte> expr, ref int offset, Stream output, int count, string what)
-    {
-        if (offset + count > expr.Length)
-            throw new LinkerException($"Malformed {what} in const expression.");
-        output.Write(expr.Slice(offset, count));
-        offset += count;
-    }
-
-    private static void CopyLebImmediate(ReadOnlySpan<byte> expr, ref int offset, Stream output)
-    {
-        int start = offset;
-        if (!WasmLeb128.TrySkip(expr, ref offset))
-            throw new LinkerException("Truncated LEB128 immediate in const expression.");
-        output.Write(expr[start..offset]);
-    }
-
-    private static uint ReadU32Leb(ReadOnlySpan<byte> expr, ref int offset)
-        => WasmLeb128.TryReadU32(expr, ref offset, out uint value)
-            ? value
-            : throw new LinkerException("Truncated or malformed u32 LEB128 immediate in const expression.");
 
     /// <summary>
     /// Maps a negative s33 heap-type immediate onto the canonical code for the kind it denotes.

@@ -7,8 +7,10 @@ using System.Text;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
-/// Shared DWARF parsing infrastructure used by DwarfTypeReader and DwarfVariableReader.
-/// Handles DIE parsing, attribute reading, string resolution, and type name resolution.
+/// The DWARF form and DIE reader every <c>.debug_info</c> reader shares: form widths (one table, for
+/// any address and offset size), attribute values, string and indexed-address resolution, DIE parsing
+/// and type-name resolution. Unit framing and headers are <see cref="DwarfUnitEnumerator"/> and
+/// <see cref="DwarfUnitHeader"/>; abbreviations are <see cref="DwarfAbbrevParser"/>.
 /// </summary>
 internal static class DwarfReaderHelpers
 {
@@ -40,43 +42,47 @@ internal static class DwarfReaderHelpers
     /// mistaken for an address. When false (legacy callers that read no addresses), the raw index is
     /// returned.
     /// </param>
-    internal readonly struct StringContext(byte[]? strData, byte[]? lineStrData, byte[]? strOffsetsData, int strOffsetsBase,
-        byte[]? addrData = null, long addrBase = -1, bool resolveAddrx = false)
+    internal readonly ref struct StringContext(ReadOnlySpan<byte> strData, ReadOnlySpan<byte> lineStrData,
+        ReadOnlySpan<byte> strOffsetsData, long strOffsetsBase,
+        ReadOnlySpan<byte> addrData = default, long addrBase = -1, bool resolveAddrx = false)
     {
-        public readonly byte[]? StrData = strData;
-        public readonly byte[]? LineStrData = lineStrData;
-        public readonly byte[]? StrOffsetsData = strOffsetsData;
-        public readonly int StrOffsetsBase = strOffsetsBase;
-        public readonly byte[]? AddrData = addrData;
+        public readonly ReadOnlySpan<byte> StrData = strData;
+        public readonly ReadOnlySpan<byte> LineStrData = lineStrData;
+        public readonly ReadOnlySpan<byte> StrOffsetsData = strOffsetsData;
+        public readonly long StrOffsetsBase = strOffsetsBase;
+        public readonly ReadOnlySpan<byte> AddrData = addrData;
         public readonly long AddrBase = addrBase;
         public readonly bool ResolveAddrx = resolveAddrx;
     }
 
     /// <summary>
-    /// Reads the per-unit bases a DWARF 5 compile unit DIE carries (<c>DW_AT_str_offsets_base</c>,
+    /// Reads the per-unit bases a DWARF 5 unit's root DIE carries (<c>DW_AT_str_offsets_base</c>,
     /// <c>DW_AT_addr_base</c>) without materializing the DIE, so string and address forms in the
-    /// unit can be resolved while it is parsed. Returns (0, -1) for DWARF &lt; 5 or when absent.
+    /// unit can be resolved while it is parsed — clang writes them after the names that need them.
+    /// Every unit root has its own bases: compile, partial, type (<c>-fdebug-types-section</c>) and
+    /// skeleton units. Returns (0, -1) for DWARF &lt; 5 or when absent.
     /// </summary>
-    internal static (int StrOffsetsBase, long AddrBase) ReadUnitBases(
-        ReadOnlySpan<byte> data, int diePos, int cuEnd, ushort version,
-        Dictionary<uint, DwarfAbbrevEntry> abbrevTable, byte addrSize)
+    internal static (long StrOffsetsBase, long AddrBase) ReadUnitBases(
+        ReadOnlySpan<byte> data, int diePos, int cuEnd,
+        Dictionary<uint, DwarfAbbrevEntry> abbrevTable, in DwarfFormContext format)
     {
-        int strOffsetsBase = 0;
+        long strOffsetsBase = 0;
         long addrBase = -1;
-        if (version < 5 || diePos >= cuEnd)
+        if (format.Version < 5 || diePos >= cuEnd)
             return (strOffsetsBase, addrBase);
         int peekPos = diePos;
         uint code = ReadULEB128(data, ref peekPos);
-        if (code == 0 || !abbrevTable.TryGetValue(code, out var entry) || entry.Tag != DwTag.CompileUnit)
+        if (code == 0 || !abbrevTable.TryGetValue(code, out var entry)
+            || entry.Tag is not (DwTag.CompileUnit or DwTag.PartialUnit or DwTag.TypeUnit or DwTag.SkeletonUnit))
             return (strOffsetsBase, addrBase);
         foreach (var (attrName, attrForm, _) in entry.Attributes)
         {
             if (attrName == DwAt.StrOffsetsBase)
-                strOffsetsBase = (int)ReadUnsignedFormValue(data, ref peekPos, attrForm, addrSize);
+                strOffsetsBase = (long)ReadUnsignedFormValue(data, ref peekPos, attrForm, format);
             else if (attrName == DwAt.AddrBase)
-                addrBase = ReadUnsignedFormValue(data, ref peekPos, attrForm, addrSize);
+                addrBase = (long)ReadUnsignedFormValue(data, ref peekPos, attrForm, format);
             else
-                SkipFormValue(data, ref peekPos, attrForm, addrSize);
+                SkipFormValue(data, ref peekPos, attrForm, format);
         }
         return (strOffsetsBase, addrBase);
     }
@@ -84,7 +90,7 @@ internal static class DwarfReaderHelpers
     internal static List<DwarfDIE> ParseDIEs(
         ReadOnlySpan<byte> data, int start, int end,
         Dictionary<uint, DwarfAbbrevEntry> abbrevTable,
-        byte addrSize,
+        in DwarfFormContext format,
         in StringContext ctx,
         int cuStart,
         Func<ushort, bool>? keepTag = null)
@@ -111,7 +117,7 @@ internal static class DwarfReaderHelpers
             if (keepTag is not null && !keepTag(entry.Tag))
             {
                 foreach (var (_, attrForm, _) in entry.Attributes)
-                    SkipFormValue(data, ref pos, attrForm, addrSize);
+                    SkipFormValue(data, ref pos, attrForm, format);
                 if (entry.HasChildren)
                     depth++;
                 continue;
@@ -132,7 +138,7 @@ internal static class DwarfReaderHelpers
                 uint effectiveForm = attrForm;
                 for (int peek = pos; effectiveForm == (uint)DwForm.Indirect && peek < data.Length;)
                     effectiveForm = ReadULEB128(data, ref peek);
-                var value = ReadAttributeValue(data, ref pos, attrForm, addrSize, ctx, implicitConst);
+                var value = ReadAttributeValue(data, ref pos, attrForm, format, ctx, implicitConst);
                 if (value is not null)
                     die.Attributes[attrName] = value;
                 if (effectiveForm == (uint)DwForm.RefAddr)
@@ -148,167 +154,127 @@ internal static class DwarfReaderHelpers
         return dies;
     }
 
+    /// <summary>
+    /// Reads one attribute value: a <see cref="long"/> for constants, references, offsets and resolved
+    /// addresses; a <see cref="string"/> for a resolved string; a <c>byte[]</c> for a block or expression;
+    /// null for an indexed address that cannot be resolved.
+    /// </summary>
     internal static object? ReadAttributeValue(
-        ReadOnlySpan<byte> data, ref int pos, uint form, byte addrSize,
+        ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format,
         in StringContext ctx, long implicitConst)
     {
         switch ((DwForm)form)
         {
-            case DwForm.Addr:
-                var addr = addrSize == 8
-                    ? (long)ReadU64LE(data, pos)
-                    : (long)ReadU32LE(data, pos);
-                pos += addrSize;
-                return addr;
-
-            case DwForm.Data1:
-            case DwForm.Ref1:
-            case DwForm.Flag:
-                return (long)data[pos++];
-            case DwForm.Addrx1:
-                return IndexedAddress(data[pos++], ctx, addrSize);
-
-            case DwForm.Data2:
-            case DwForm.Ref2:
-            {
-                var v = (long)ReadU16LE(data, pos); pos += 2;
-                return v;
-            }
-            case DwForm.Addrx2:
-            {
-                var v = (long)ReadU16LE(data, pos); pos += 2;
-                return IndexedAddress(v, ctx, addrSize);
-            }
-            case DwForm.Addrx3:
-            {
-                var v = (long)(data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16));
-                pos += 3;
-                return IndexedAddress(v, ctx, addrSize);
-            }
-
-            case DwForm.Data4:
-            case DwForm.Ref4:
-            case DwForm.RefAddr: // 32-bit DWARF
-            case DwForm.SecOffset:
-            case DwForm.RefSup4:
-            case DwForm.StrpSup:
-            {
-                var v = (long)ReadU32LE(data, pos); pos += 4;
-                return v;
-            }
-            case DwForm.Addrx4:
-            {
-                var v = (long)ReadU32LE(data, pos); pos += 4;
-                return IndexedAddress(v, ctx, addrSize);
-            }
-
-            case DwForm.Strp:
-            {
-                var offset = (int)ReadU32LE(data, pos); pos += 4;
-                return ReadStringFromSection(ctx.StrData, offset) ?? (object)(long)offset;
-            }
-            case DwForm.LineStrp:
-            {
-                var offset = (int)ReadU32LE(data, pos); pos += 4;
-                return ReadStringFromSection(ctx.LineStrData, offset) ?? (object)(long)offset;
-            }
-
-            // DWARF 5 indexed strings
-            case DwForm.Strx:
-                return ResolveStrx((int)ReadULEB128(data, ref pos), ctx);
-            case DwForm.Strx1:
-                return ResolveStrx(data[pos++], ctx);
-            case DwForm.Strx2:
-            {
-                int idx = ReadU16LE(data, pos); pos += 2;
-                return ResolveStrx(idx, ctx);
-            }
-            case DwForm.Strx3:
-            {
-                int idx = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16);
-                pos += 3;
-                return ResolveStrx(idx, ctx);
-            }
-            case DwForm.Strx4:
-            {
-                int idx = (int)ReadU32LE(data, pos); pos += 4;
-                return ResolveStrx(idx, ctx);
-            }
-
-            case DwForm.Data8:
-            case DwForm.Ref8:
-            case DwForm.RefSig8:
-            case DwForm.RefSup8:
-            {
-                var v = (long)ReadU64LE(data, pos); pos += 8;
-                return v;
-            }
-
-            case DwForm.Data16:
-                pos += 16;
-                return (long)0;
-
-            case DwForm.Sdata:
-                return ReadSLEB128(data, ref pos);
-
             case DwForm.Addrx:
-                return IndexedAddress(ReadULEB128(data, ref pos), ctx, addrSize);
-
-            case DwForm.Udata:
-            case DwForm.RefUdata:
-            case DwForm.Loclistx:
-            case DwForm.Rnglistx:
-                return (long)ReadULEB128(data, ref pos);
+            case DwForm.Addrx1:
+            case DwForm.Addrx2:
+            case DwForm.Addrx3:
+            case DwForm.Addrx4:
+            case DwForm.GnuAddrIndex:
+                return IndexedAddress((long)ReadFormRaw(data, ref pos, form, format), ctx, format.AddressSize);
+            case DwForm.LlvmAddrxOffset:
+            {
+                long index = (long)ReadULEB128U64(data, ref pos);
+                uint offset = ReadU32LE(data, pos);
+                pos += 4;
+                return IndexedAddress(index, ctx, format.AddressSize) is long address ? address + offset : null;
+            }
 
             case DwForm.String:
                 return ReadNullTerminatedAdvance(data, ref pos);
 
-            case DwForm.FlagPresent:
-                return (long)1;
+            case DwForm.Strp:
+            case DwForm.LineStrp:
+            case DwForm.Strx:
+            case DwForm.Strx1:
+            case DwForm.Strx2:
+            case DwForm.Strx3:
+            case DwForm.Strx4:
+            case DwForm.GnuStrIndex:
+                // An unresolvable string keeps its raw offset or index; an empty one does too.
+                return TryReadString(data, ref pos, form, format, ctx, out var str, out ulong raw) && !str.IsEmpty
+                    ? Encoding.UTF8.GetString(str)
+                    : (long)raw;
+
+            case DwForm.Sdata:
+                return ReadSLEB128(data, ref pos);
 
             case DwForm.ImplicitConst:
                 return implicitConst;
 
             // Block/exprloc forms — return raw bytes for location expression parsing
             case DwForm.Block1:
-            {
-                int len = CheckedBlockLength(data, pos + 1, ReadFixedLength(data, pos, 1), InfoSection);
-                pos++;
-                var block = data.Slice(pos, len).ToArray();
-                pos += len;
-                return block;
-            }
             case DwForm.Block2:
-            {
-                int len = CheckedBlockLength(data, pos + 2, ReadFixedLength(data, pos, 2), InfoSection); pos += 2;
-                var block = data.Slice(pos, len).ToArray();
-                pos += len;
-                return block;
-            }
             case DwForm.Block4:
-            {
-                int len = CheckedBlockLength(data, pos + 4, ReadFixedLength(data, pos, 4), InfoSection); pos += 4;
-                var block = data.Slice(pos, len).ToArray();
-                pos += len;
-                return block;
-            }
             case DwForm.Block:
             case DwForm.Exprloc:
             {
-                ulong rawLen = ReadULEB128U64(data, ref pos);
-                int len = CheckedBlockLength(data, pos, rawLen, InfoSection);
+                int len = ReadBlockLength(data, ref pos, form);
                 var block = data.Slice(pos, len).ToArray();
                 pos += len;
                 return block;
             }
 
+            case DwForm.Data16:
+                pos += 16;
+                return 0L;
+
             case DwForm.Indirect:
-                return ReadAttributeValue(data, ref pos, ReadIndirectForm(data, ref pos), addrSize, ctx, 0);
+                return ReadAttributeValue(data, ref pos, ReadIndirectForm(data, ref pos), format, ctx, 0);
 
             default:
-                return null;
+                return (long)ReadFormRaw(data, ref pos, form, format);
         }
     }
+
+    /// <summary>
+    /// Reads a string-class attribute (<c>DW_FORM_string</c>, <c>strp</c>, <c>line_strp</c>, <c>strx*</c>)
+    /// as its UTF-8 bytes, without decoding it. <paramref name="raw"/> is the section offset or string
+    /// index. Returns false, with <paramref name="value"/> empty, when the string cannot be resolved (no
+    /// section, an offset or index out of range). The cursor always moves past the attribute.
+    /// </summary>
+    internal static bool TryReadString(
+        ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format, in StringContext ctx,
+        out ReadOnlySpan<byte> value, out ulong raw)
+    {
+        if (form == (uint)DwForm.Indirect)
+            form = ReadIndirectForm(data, ref pos);
+        switch ((DwForm)form)
+        {
+            case DwForm.String:
+            {
+                int start = pos;
+                int length = data[start..].IndexOf((byte)0);
+                pos = length < 0 ? data.Length : start + length + 1;
+                value = data[start..(length < 0 ? data.Length : start + length)];
+                raw = 0;
+                return true;
+            }
+            case DwForm.Strp:
+                raw = ReadFormRaw(data, ref pos, form, format);
+                return TrySliceCString(ctx.StrData, raw, out value);
+            case DwForm.LineStrp:
+                raw = ReadFormRaw(data, ref pos, form, format);
+                return TrySliceCString(ctx.LineStrData, raw, out value);
+            case DwForm.Strx:
+            case DwForm.Strx1:
+            case DwForm.Strx2:
+            case DwForm.Strx3:
+            case DwForm.Strx4:
+            case DwForm.GnuStrIndex:
+                raw = ReadFormRaw(data, ref pos, form, format);
+                return TryResolveStrx(raw, ctx, format.OffsetSize, out value);
+            default:
+                SkipFormValue(data, ref pos, form, format);
+                value = default;
+                raw = 0;
+                return false;
+        }
+    }
+
+    /// <summary>Whether <paramref name="form"/> is a string class form <see cref="TryReadString"/> reads.</summary>
+    internal static bool IsStringForm(uint form) => (DwForm)form is DwForm.String or DwForm.Strp or DwForm.LineStrp
+        or DwForm.Strx or DwForm.Strx1 or DwForm.Strx2 or DwForm.Strx3 or DwForm.Strx4 or DwForm.GnuStrIndex;
 
     /// <summary>
     /// Extract a long value from block data. Handles DW_OP_plus_uconst for member locations.
@@ -344,29 +310,34 @@ internal static class DwarfReaderHelpers
     {
         if (!ctx.ResolveAddrx)
             return index;
-        if (ctx.AddrData is null || ctx.AddrBase < 0 || (addrSize != 4 && addrSize != 8))
+        if (ctx.AddrData.IsEmpty || ctx.AddrBase < 0 || (addrSize != 4 && addrSize != 8) || index < 0)
+            return null;
+        if (index > (ctx.AddrData.Length - ctx.AddrBase) / addrSize)
             return null;
         long at = ctx.AddrBase + index * addrSize;
-        if (at < 0 || at + addrSize > ctx.AddrData.Length)
+        if (at + addrSize > ctx.AddrData.Length)
             return null;
         return addrSize == 8
             ? (long)ReadU64LE(ctx.AddrData, (int)at)
             : (long)ReadU32LE(ctx.AddrData, (int)at);
     }
 
-    private static object ResolveStrx(int index, in StringContext ctx)
+    /// <summary>
+    /// The string at <paramref name="index"/> in the unit's .debug_str_offsets contribution, whose entries
+    /// are <paramref name="offsetSize"/> bytes (8 in 64-bit DWARF).
+    /// </summary>
+    private static bool TryResolveStrx(ulong index, in StringContext ctx, byte offsetSize, out ReadOnlySpan<byte> value)
     {
-        if (ctx.StrOffsetsData is not null && ctx.StrData is not null)
-        {
-            int offsetPos = ctx.StrOffsetsBase + index * 4;
-            if (offsetPos >= 0 && offsetPos + 4 <= ctx.StrOffsetsData.Length)
-            {
-                int strOffset = (int)ReadU32LE(ctx.StrOffsetsData, offsetPos);
-                var resolved = ReadStringFromSection(ctx.StrData, strOffset);
-                if (resolved is not null) return resolved;
-            }
-        }
-        return (long)index;
+        value = default;
+        long offsets = ctx.StrOffsetsData.Length;
+        if (ctx.StrData.IsEmpty || ctx.StrOffsetsBase < 0 || ctx.StrOffsetsBase > offsets
+            || index > (ulong)((offsets - ctx.StrOffsetsBase) / offsetSize))
+            return false;
+        int offsetPos = (int)(ctx.StrOffsetsBase + (long)index * offsetSize);
+        if (offsetPos + offsetSize > offsets)
+            return false;
+        ulong strOffset = offsetSize == 8 ? ReadU64LE(ctx.StrOffsetsData, offsetPos) : ReadU32LE(ctx.StrOffsetsData, offsetPos);
+        return TrySliceCString(ctx.StrData, strOffset, out value);
     }
 
     // ── Type resolution ─────────────────────────────────────────────────────────
@@ -504,23 +475,187 @@ internal static class DwarfReaderHelpers
         return 0;
     }
 
-    // ── Binary helpers ──────────────────────────────────────────────────────────
+    // ── Forms ───────────────────────────────────────────────────────────────────
 
-    internal static uint ReadUnsignedFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, byte addrSize)
+    /// <summary>A form whose width depends on its encoded value: LEB128, string, block or indirect.</summary>
+    private const int VariableWidth = -1;
+
+    /// <summary>A form this reader does not know, so it cannot be sized.</summary>
+    private const int UnknownWidth = -2;
+
+    /// <summary>
+    /// The width of a fixed-size form in a unit with <paramref name="format"/>: the one table of form
+    /// widths. <see cref="VariableWidth"/> for LEB128, string, block and indirect forms;
+    /// <see cref="UnknownWidth"/> for a form this reader does not know.
+    /// </summary>
+    internal static int FixedFormSize(uint form, in DwarfFormContext format) => (DwForm)form switch
     {
+        DwForm.Addr => format.AddressSize,
+        DwForm.Data1 or DwForm.Ref1 or DwForm.Flag or DwForm.Strx1 or DwForm.Addrx1 => 1,
+        DwForm.Data2 or DwForm.Ref2 or DwForm.Strx2 or DwForm.Addrx2 => 2,
+        DwForm.Strx3 or DwForm.Addrx3 => 3,
+        DwForm.Data4 or DwForm.Ref4 or DwForm.RefSup4 or DwForm.Strx4 or DwForm.Addrx4 => 4,
+        DwForm.Data8 or DwForm.Ref8 or DwForm.RefSig8 or DwForm.RefSup8 => 8,
+        DwForm.Data16 => 16,
+        DwForm.Strp or DwForm.LineStrp or DwForm.SecOffset or DwForm.StrpSup
+            or DwForm.GnuRefAlt or DwForm.GnuStrpAlt => format.OffsetSize,
+        DwForm.RefAddr => format.RefAddrSize,
+        DwForm.FlagPresent or DwForm.ImplicitConst => 0,
+        DwForm.Udata or DwForm.Sdata or DwForm.RefUdata or DwForm.Strx or DwForm.Addrx or DwForm.Loclistx
+            or DwForm.Rnglistx or DwForm.GnuAddrIndex or DwForm.GnuStrIndex or DwForm.String or DwForm.Block
+            or DwForm.Block1 or DwForm.Block2 or DwForm.Block4 or DwForm.Exprloc or DwForm.Indirect
+            or DwForm.LlvmAddrxOffset => VariableWidth,
+        _ => UnknownWidth,
+    };
+
+    /// <summary>
+    /// Reads one attribute of <paramref name="form"/> as an unsigned number and moves past it: constants,
+    /// references, section offsets and addresses are their value (<c>sdata</c> its two's complement);
+    /// <c>strx</c>, <c>addrx</c>, <c>loclistx</c> and <c>rnglistx</c> are the index; <c>flag_present</c> is 1.
+    /// Strings, blocks and 16-byte constants are skipped and read as 0.
+    /// </summary>
+    /// <exception cref="DwarfFormatException">The form is unknown, so it cannot be sized, or a block runs past the data.</exception>
+    internal static ulong ReadFormRaw(ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format)
+    {
+        int size = FixedFormSize(form, format);
+        if (size >= 0)
+        {
+            ulong value = size switch
+            {
+                0 => form == (uint)DwForm.FlagPresent ? 1UL : 0UL,
+                1 => data[pos],
+                2 => ReadU16LE(data, pos),
+                4 => ReadU32LE(data, pos),
+                8 => ReadU64LE(data, pos),
+                16 => 0,
+                _ => ReadUnsignedLE(data, pos, size),
+            };
+            pos += size;
+            return value;
+        }
+
         switch ((DwForm)form)
         {
-            case DwForm.Data1: return data[pos++];
-            case DwForm.Data2: { var v = ReadU16LE(data, pos); pos += 2; return v; }
-            case DwForm.Data4: { var v = ReadU32LE(data, pos); pos += 4; return v; }
-            case DwForm.Data8: { var v = ReadU32LE(data, pos); pos += 8; return v; }
-            case DwForm.Udata: return ReadULEB128(data, ref pos);
-            case DwForm.SecOffset: { var v = ReadU32LE(data, pos); pos += 4; return v; }
+            case DwForm.Sdata:
+                return (ulong)ReadSLEB128(data, ref pos);
+            case DwForm.Udata:
+            case DwForm.RefUdata:
+            case DwForm.Strx:
+            case DwForm.Addrx:
+            case DwForm.Loclistx:
+            case DwForm.Rnglistx:
+            case DwForm.GnuAddrIndex:
+            case DwForm.GnuStrIndex:
+                return ReadULEB128U64(data, ref pos);
+            case DwForm.LlvmAddrxOffset:
+            {
+                // The index; the 4-byte offset that follows is skipped.
+                ulong index = ReadULEB128U64(data, ref pos);
+                pos += 4;
+                return index;
+            }
+            case DwForm.Indirect:
+                return ReadFormRaw(data, ref pos, ReadIndirectForm(data, ref pos), format);
             default:
-                SkipFormValue(data, ref pos, form, addrSize);
+                SkipFormValue(data, ref pos, form, format);
                 return 0;
         }
     }
+
+    /// <summary>Moves past one attribute of <paramref name="form"/>.</summary>
+    /// <exception cref="DwarfFormatException">The form is unknown, so it cannot be sized, or a block runs past the data.</exception>
+    internal static void SkipFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format)
+    {
+        int size = FixedFormSize(form, format);
+        if (size >= 0)
+        {
+            pos += size;
+            return;
+        }
+
+        switch ((DwForm)form)
+        {
+            case DwForm.Sdata:
+                ReadSLEB128(data, ref pos);
+                break;
+            case DwForm.String:
+            {
+                int length = data[pos..].IndexOf((byte)0);
+                pos = length < 0 ? data.Length : pos + length + 1;
+                break;
+            }
+            case DwForm.Block1:
+            case DwForm.Block2:
+            case DwForm.Block4:
+            case DwForm.Block:
+            case DwForm.Exprloc:
+            {
+                // Read the length first: it moves the cursor past the length field.
+                int length = ReadBlockLength(data, ref pos, form);
+                pos += length;
+                break;
+            }
+            case DwForm.LlvmAddrxOffset:
+                ReadULEB128U64(data, ref pos);
+                pos += 4;
+                break;
+            case DwForm.Indirect:
+                SkipFormValue(data, ref pos, ReadIndirectForm(data, ref pos), format);
+                break;
+            case DwForm.Udata:
+            case DwForm.RefUdata:
+            case DwForm.Strx:
+            case DwForm.Addrx:
+            case DwForm.Loclistx:
+            case DwForm.Rnglistx:
+            case DwForm.GnuAddrIndex:
+            case DwForm.GnuStrIndex:
+                ReadULEB128U64(data, ref pos);
+                break;
+            default:
+                // An unknown form cannot be sized; skipping it as zero bytes would read the rest of the
+                // unit out of step.
+                throw new DwarfFormatException(InfoSection, pos, $"form 0x{form:X} at 0x{pos:X} is not a DWARF form this reader can size");
+        }
+    }
+
+    /// <summary>
+    /// A constant (<c>data1/2/4/8</c>, <c>udata</c>) or <c>sec_offset</c> attribute; any other form is
+    /// skipped and reads as 0.
+    /// </summary>
+    internal static ulong ReadUnsignedFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, in DwarfFormContext format)
+    {
+        if ((DwForm)form is DwForm.Data1 or DwForm.Data2 or DwForm.Data4 or DwForm.Data8 or DwForm.Udata or DwForm.SecOffset)
+            return ReadFormRaw(data, ref pos, form, format);
+        SkipFormValue(data, ref pos, form, format);
+        return 0;
+    }
+
+    /// <summary>Reads a block form's length, leaves the cursor at its content and checks the content fits.</summary>
+    private static int ReadBlockLength(ReadOnlySpan<byte> data, ref int pos, uint form)
+    {
+        int fieldSize = (DwForm)form switch { DwForm.Block1 => 1, DwForm.Block2 => 2, DwForm.Block4 => 4, _ => 0 };
+        ulong length;
+        if (fieldSize == 0)
+        {
+            length = ReadULEB128U64(data, ref pos);
+        }
+        else
+        {
+            length = ReadFixedLength(data, pos, fieldSize);
+            pos += fieldSize;
+        }
+        return CheckedBlockLength(data, pos, length, InfoSection);
+    }
+
+    /// <summary>Wraps a runtime range exception from reading a unit's fields in the unit's <see cref="DwarfFormatException"/>.</summary>
+    internal static DwarfFormatException UnitOverrun(string section, int unitStart, Exception inner) =>
+        new(section, unitStart, $"a field of the unit at 0x{unitStart:X} runs past the end of the unit", inner);
+
+    /// <summary>A runtime range exception: a fixed-size field read past the end of its unit.</summary>
+    internal static bool IsRangeError(Exception ex) => ex is IndexOutOfRangeException or ArgumentOutOfRangeException;
+
+    // ── Binary helpers ──────────────────────────────────────────────────────────
 
     internal static uint ReadU32LE(ReadOnlySpan<byte> data, int pos) =>
         (uint)(data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24));
@@ -530,6 +665,17 @@ internal static class DwarfReaderHelpers
 
     internal static ulong ReadU64LE(ReadOnlySpan<byte> data, int pos) =>
         (ulong)ReadU32LE(data, pos) | ((ulong)ReadU32LE(data, pos + 4) << 32);
+
+    /// <summary>A little-endian unsigned value of 1–8 bytes (a 3-byte <c>strx3</c>, an unusual address size).</summary>
+    private static ulong ReadUnsignedLE(ReadOnlySpan<byte> data, int pos, int size)
+    {
+        if (size > 8)
+            throw new DwarfFormatException(InfoSection, pos, $"a {size}-byte value at 0x{pos:X} is wider than 8 bytes");
+        ulong value = 0;
+        for (int i = size - 1; i >= 0; i--)
+            value = (value << 8) | data[pos + i];
+        return value;
+    }
 
     // DWARF LEB128s have no length limit. These read with WasmLeb128's unbounded decoders: every
     // continuation byte is consumed (a ten-byte DW_FORM_udata of 2^64-1 must not leave the cursor
@@ -659,80 +805,30 @@ internal static class DwarfReaderHelpers
         return form == (uint)DwForm.Indirect ? 0 : form;
     }
 
-    internal static string? ReadStringFromSection(byte[]? section, int offset)
+    /// <summary>
+    /// The NUL-terminated string at <paramref name="offset"/> in <paramref name="section"/> (.debug_str,
+    /// .debug_line_str), without its terminator; an unterminated string runs to the end of the section.
+    /// False when the offset is past the section.
+    /// </summary>
+    internal static bool TrySliceCString(ReadOnlySpan<byte> section, ulong offset, out ReadOnlySpan<byte> value)
     {
-        if (section is null || offset < 0 || offset >= section.Length) return null;
-        int end = offset;
-        while (end < section.Length && section[end] != 0) end++;
-        var str = Encoding.UTF8.GetString(section, offset, end - offset);
-        return str.Length > 0 ? str : null;
+        if (offset >= (ulong)section.Length)
+        {
+            value = default;
+            return false;
+        }
+        value = section[(int)offset..];
+        int length = value.IndexOf((byte)0);
+        if (length >= 0)
+            value = value[..length];
+        return true;
     }
 
     internal static string ReadNullTerminatedAdvance(ReadOnlySpan<byte> data, ref int pos)
     {
         int start = pos;
-        while (pos < data.Length && data[pos] != 0) pos++;
-        var result = Encoding.UTF8.GetString(data[start..pos]);
-        if (pos < data.Length) pos++;
-        return result;
-    }
-
-    internal static void SkipFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, byte addrSize)
-    {
-        switch ((DwForm)form)
-        {
-            case DwForm.Addr: pos += addrSize; break;
-            case DwForm.Block2: { ulong len = ReadFixedLength(data, pos, 2); pos += 2; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
-            case DwForm.Block4: { ulong len = ReadFixedLength(data, pos, 4); pos += 4; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
-            case DwForm.Data2: pos += 2; break;
-            case DwForm.Data4: pos += 4; break;
-            case DwForm.Data8: pos += 8; break;
-            case DwForm.String:
-                while (pos < data.Length && data[pos] != 0) pos++;
-                if (pos < data.Length) pos++;
-                break;
-            case DwForm.Block:
-                { ulong blockLen = ReadULEB128U64(data, ref pos); pos += CheckedBlockLength(data, pos, blockLen, InfoSection); }
-                break;
-            case DwForm.Block1: { ulong len = ReadFixedLength(data, pos, 1); pos += 1; pos += CheckedBlockLength(data, pos, len, InfoSection); } break;
-            case DwForm.Data1: pos += 1; break;
-            case DwForm.Flag: pos += 1; break;
-            case DwForm.Sdata: ReadSLEB128(data, ref pos); break;
-            case DwForm.Strp: pos += 4; break;
-            case DwForm.Udata: ReadULEB128(data, ref pos); break;
-            case DwForm.RefAddr: pos += 4; break;
-            case DwForm.Ref1: pos += 1; break;
-            case DwForm.Ref2: pos += 2; break;
-            case DwForm.Ref4: pos += 4; break;
-            case DwForm.Ref8: pos += 8; break;
-            case DwForm.RefUdata: ReadULEB128(data, ref pos); break;
-            case DwForm.Indirect:
-                SkipFormValue(data, ref pos, ReadIndirectForm(data, ref pos), addrSize);
-                break;
-            case DwForm.SecOffset: pos += 4; break;
-            case DwForm.Exprloc:
-                { ulong exprLen = ReadULEB128U64(data, ref pos); pos += CheckedBlockLength(data, pos, exprLen, InfoSection); }
-                break;
-            case DwForm.FlagPresent: break;
-            case DwForm.Strx: ReadULEB128(data, ref pos); break;
-            case DwForm.Addrx: ReadULEB128(data, ref pos); break;
-            case DwForm.RefSup4: pos += 4; break;
-            case DwForm.StrpSup: pos += 4; break;
-            case DwForm.Data16: pos += 16; break;
-            case DwForm.LineStrp: pos += 4; break;
-            case DwForm.RefSig8: pos += 8; break;
-            case DwForm.ImplicitConst: break;
-            case DwForm.Loclistx: ReadULEB128(data, ref pos); break;
-            case DwForm.Rnglistx: ReadULEB128(data, ref pos); break;
-            case DwForm.RefSup8: pos += 8; break;
-            case DwForm.Strx1: pos += 1; break;
-            case DwForm.Strx2: pos += 2; break;
-            case DwForm.Strx3: pos += 3; break;
-            case DwForm.Strx4: pos += 4; break;
-            case DwForm.Addrx1: pos += 1; break;
-            case DwForm.Addrx2: pos += 2; break;
-            case DwForm.Addrx3: pos += 3; break;
-            case DwForm.Addrx4: pos += 4; break;
-        }
+        int length = data[start..].IndexOf((byte)0);
+        pos = length < 0 ? data.Length : start + length + 1;
+        return Encoding.UTF8.GetString(data[start..(length < 0 ? data.Length : start + length)]);
     }
 }

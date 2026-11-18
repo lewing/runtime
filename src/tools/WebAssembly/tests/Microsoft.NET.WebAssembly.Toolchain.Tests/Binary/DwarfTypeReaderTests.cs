@@ -744,11 +744,16 @@ public class DwarfTypeReaderTests
     {
         var (info, abbrev) = UnitWithRewindingBlock();
 
-        // The filtered parse skips the variable's attributes with SkipFormValue (it looped);
-        // the full parse reads them with ReadAttributeValue (it threw a raw range exception).
-        var skipped = await DwarfLineReaderTests.AssertRejectedPromptlyAsync(
-            () => DwarfSubprogramReader.Parse(info, abbrev, null, null, null, null));
-        Assert.Contains("block", skipped.Message);
+        // The filtered parse skips the variable's attributes with SkipFormValue (it looped); it now
+        // returns promptly and counts the malformed unit as skipped. The full parse reads them with
+        // ReadAttributeValue (it threw a raw range exception).
+        var ct = CancellationToken.None;
+        var filtered = Task.Factory.StartNew(
+            () => DwarfSubprogramReader.Parse(info, abbrev, null, null, null, null),
+            ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert.True(await Task.WhenAny(filtered, Task.Delay(TimeSpan.FromSeconds(5), ct)) == filtered,
+            "the filtered DIE parse did not return within 5 s: it is looping on malformed input");
+        Assert.Equal((0, 1), ((await filtered).Units, (await filtered).SkippedUnits));
         var read = await DwarfLineReaderTests.AssertRejectedPromptlyAsync(
             () => DwarfTypeReader.ParseStructTypes(info, abbrev, null, null, null, null, 50));
         Assert.Contains("block", read.Message);

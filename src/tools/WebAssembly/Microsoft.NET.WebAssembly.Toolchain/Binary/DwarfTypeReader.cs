@@ -11,7 +11,7 @@ public sealed record DwarfMember(string Name, string TypeName, int ByteOffset, i
 
 /// <summary>
 /// Reads DWARF .debug_info to extract struct/class type definitions and their
-/// member layouts. Supports DWARF versions 2–5 in the 32-bit format used by wasm32.
+/// member layouts. Supports DWARF versions 2–5, 32- and 64-bit, and DWARF 5 type units.
 /// Designed for building debug lenses that map managed runtime state from linear memory.
 /// </summary>
 public static class DwarfTypeReader
@@ -75,50 +75,33 @@ public static class DwarfTypeReader
     /// </summary>
     /// <exception cref="DwarfFormatException">A unit is malformed and <paramref name="errors"/> is null.</exception>
     internal static IReadOnlyList<DwarfStructType> ParseStructTypes(
-        byte[] infoData,
-        byte[] abbrevData,
-        byte[]? strData,
-        byte[]? lineStrData,
-        byte[]? strOffsetsData,
+        ReadOnlySpan<byte> infoData,
+        ReadOnlySpan<byte> abbrevData,
+        ReadOnlySpan<byte> strData,
+        ReadOnlySpan<byte> lineStrData,
+        ReadOnlySpan<byte> strOffsetsData,
         string? namePattern,
         int maxResults,
         List<DwarfFormatException>? errors = null)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
         var results = new List<DwarfStructType>();
-        int pos = 0;
+        var units = new DwarfUnitEnumerator(infoData, InfoSection);
 
-        while (pos < infoData.Length && results.Count < maxResults)
+        while (results.Count < maxResults && units.MoveNext())
         {
-            // Zero bytes after the last unit are padding (zero-length units), not a truncated unit.
-            if (infoData.AsSpan(pos).IndexOfAnyExcept((byte)0) < 0)
-                break;
-
-            int cuStart = pos;
-            int cuEnd;
-            bool is64Bit;
-            try
+            if (units.Error is { } lengthError)
             {
-                // The end is checked against the data and is always past the length field, so
-                // resuming at it always advances.
-                cuEnd = DwarfReaderHelpers.ReadUnitLength(infoData, ref pos, InfoSection, out is64Bit);
-            }
-            catch (DwarfFormatException ex) when (errors is not null)
-            {
-                errors.Add(ex);
+                if (errors is null)
+                    throw lengthError;
+                errors.Add(lengthError);
                 break;
             }
-
-            int headerStart = pos;
-            pos = cuEnd;
-            if (is64Bit || cuEnd == headerStart) continue; // 64-bit DWARF is not supported; length 0 is padding
 
             List<DwarfReaderHelpers.DwarfDIE>? dies;
             try
             {
-                // Bounded by the unit's end, so a malformed unit cannot read into the next one.
-                dies = ReadUnitDies(infoData.AsSpan(0, cuEnd), cuStart, headerStart, abbrevTables,
-                    strData, lineStrData, strOffsetsData);
+                dies = ReadUnitDies(infoData, units.Current, abbrevTables, strData, lineStrData, strOffsetsData);
             }
             catch (DwarfFormatException ex) when (errors is not null)
             {
@@ -136,85 +119,34 @@ public static class DwarfTypeReader
     private const string InfoSection = ".debug_info";
 
     /// <summary>
-    /// Reads one unit's DIEs; null when the unit has an unsupported version or unknown
-    /// abbreviations. A fixed-size field past the unit's end is reported, not thrown as a
-    /// runtime exception.
+    /// Reads one unit's DIEs; null when the unit has an unsupported version or unit type, or unknown
+    /// abbreviations. Every read is bounded by the unit's end, so a malformed unit cannot read into the
+    /// next one, and a fixed-size field past the end is reported, not thrown as a runtime exception.
     /// </summary>
     private static List<DwarfReaderHelpers.DwarfDIE>? ReadUnitDies(
-        ReadOnlySpan<byte> unit,
-        int cuStart,
-        int headerStart,
+        ReadOnlySpan<byte> infoData,
+        in DwarfUnitFrame frame,
         Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> abbrevTables,
-        byte[]? strData,
-        byte[]? lineStrData,
-        byte[]? strOffsetsData)
+        ReadOnlySpan<byte> strData,
+        ReadOnlySpan<byte> lineStrData,
+        ReadOnlySpan<byte> strOffsetsData)
     {
         try
         {
-            return ParseUnitDies(unit, cuStart, headerStart, abbrevTables, strData, lineStrData, strOffsetsData);
+            if (!DwarfUnitHeader.TryRead(infoData, frame, InfoSection, out var header)
+                || !header.TryGetAbbrevTable(abbrevTables, out var abbrevTable))
+                return null;
+
+            var unit = infoData[..frame.UnitEnd];
+            var format = header.Format;
+            var (strOffsetsBase, _) = DwarfReaderHelpers.ReadUnitBases(unit, header.DieStart, unit.Length, abbrevTable, format);
+            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
+            return DwarfReaderHelpers.ParseDIEs(unit, header.DieStart, unit.Length, abbrevTable, format, ctx, frame.UnitStart);
         }
-        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException)
+        catch (Exception ex) when (DwarfReaderHelpers.IsRangeError(ex))
         {
-            throw new DwarfFormatException(InfoSection, cuStart,
-                $"a field of the unit at 0x{cuStart:X} runs past the end of the unit", ex);
+            throw DwarfReaderHelpers.UnitOverrun(InfoSection, frame.UnitStart, ex);
         }
-    }
-
-    private static List<DwarfReaderHelpers.DwarfDIE>? ParseUnitDies(
-        ReadOnlySpan<byte> unit,
-        int cuStart,
-        int headerStart,
-        Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> abbrevTables,
-        byte[]? strData,
-        byte[]? lineStrData,
-        byte[]? strOffsetsData)
-    {
-        int cuEnd = unit.Length;
-        if (cuEnd - headerStart < 2)
-            throw new DwarfFormatException(InfoSection, cuStart, $"the unit at 0x{cuStart:X} is too short to hold its version");
-        ushort version = DwarfReaderHelpers.ReadU16LE(unit, headerStart);
-        if (version < 2 || version > 5) return null;
-
-        int abbrevOffset;
-        byte addrSize;
-        int diePos = headerStart + (version >= 5 ? 8 : 7);
-        if (diePos > cuEnd)
-            throw new DwarfFormatException(InfoSection, cuStart, $"the header of the unit at 0x{cuStart:X} runs past its end");
-        if (version >= 5)
-        {
-            addrSize = unit[headerStart + 3];
-            abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(unit, headerStart + 4);
-        }
-        else
-        {
-            abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(unit, headerStart + 2);
-            addrSize = unit[headerStart + 6];
-        }
-
-        if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable))
-            return null;
-
-        // Parse the CU DIE to extract DW_AT_str_offsets_base for DWARF 5 strx resolution
-        int strOffsetsBase = 0;
-        if (version >= 5 && diePos < cuEnd)
-        {
-            int peekPos = diePos;
-            uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(unit, ref peekPos);
-            if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
-                && cuEntry.Tag == DwTag.CompileUnit)
-            {
-                foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
-                {
-                    if (attrName == DwAt.StrOffsetsBase)
-                        strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(unit, ref peekPos, attrForm, addrSize);
-                    else
-                        DwarfReaderHelpers.SkipFormValue(unit, ref peekPos, attrForm, addrSize);
-                }
-            }
-        }
-
-        var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
-        return DwarfReaderHelpers.ParseDIEs(unit, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
     }
 
     private static void ExtractStructTypes(
@@ -286,24 +218,33 @@ internal sealed class DwarfAbbrevEntry
 /// <summary>Parses DWARF .debug_abbrev sections.</summary>
 internal static class DwarfAbbrevParser
 {
-    public static Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> Parse(byte[] data)
+    /// <summary>Every abbreviation table in <paramref name="data"/>, by its section offset.</summary>
+    public static Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> Parse(ReadOnlySpan<byte> data)
     {
         var tables = new Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>>();
         int pos = 0;
-        int tableStart = 0;
-        var currentTable = new Dictionary<uint, DwarfAbbrevEntry>();
+        while (pos < data.Length)
+        {
+            int tableStart = pos;
+            var table = ParseTable(data, ref pos);
+            if (table.Count > 0)
+                tables[tableStart] = table;
+        }
+        return tables;
+    }
 
+    /// <summary>
+    /// The abbreviation table at <paramref name="pos"/>: entries up to its terminating 0 code (or the end
+    /// of the data), after which <paramref name="pos"/> is left.
+    /// </summary>
+    public static Dictionary<uint, DwarfAbbrevEntry> ParseTable(ReadOnlySpan<byte> data, ref int pos)
+    {
+        var table = new Dictionary<uint, DwarfAbbrevEntry>();
         while (pos < data.Length)
         {
             uint code = DwarfReaderHelpers.ReadULEB128(data, ref pos);
             if (code == 0)
-            {
-                if (currentTable.Count > 0)
-                    tables[tableStart] = currentTable;
-                tableStart = pos;
-                currentTable = new Dictionary<uint, DwarfAbbrevEntry>();
-                continue;
-            }
+                break;
 
             var entry = new DwarfAbbrevEntry
             {
@@ -324,12 +265,8 @@ internal static class DwarfAbbrevParser
                 entry.Attributes.Add((attrName, attrForm, implicitConst));
             }
 
-            currentTable[code] = entry;
+            table[code] = entry;
         }
-
-        if (currentTable.Count > 0)
-            tables[tableStart] = currentTable;
-
-        return tables;
+        return table;
     }
 }

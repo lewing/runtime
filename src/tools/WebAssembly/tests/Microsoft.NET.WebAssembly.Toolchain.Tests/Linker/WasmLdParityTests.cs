@@ -163,7 +163,8 @@ public class WasmLdParityTests
         string expectedPath = Path.Combine(dir, "wasm-ld.wasm");
         string actualPath = Path.Combine(dir, "managed.wasm");
         Run(Path.Combine(bin, "wasm-ld"), [.. args, .. inputs, "-o", expectedPath]);
-        WasmModule actual = WasmLdDriver.Run(WasmLdCommandLine.Parse([.. args, .. inputs, "-o", actualPath]));
+        WasmModule? actual = WasmLdDriver.Run(WasmLdCommandLine.Parse([.. args, .. inputs, "-o", actualPath]));
+        Assert.NotNull(actual);
 
         return (ModuleReader.ReadModule(File.OpenRead(expectedPath)), actual, actualPath);
     }
