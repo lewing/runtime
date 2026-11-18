@@ -4,7 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Binary;
 
 /// <summary>Subsection IDs of the <c>name</c> custom section (core spec appendix, extended-name-section proposal).</summary>
-internal enum NameSubsectionId : byte
+public enum NameSubsectionId : byte
 {
     Module = 0,
     Function = 1,

@@ -94,22 +94,25 @@ Mono is out of scope. It is being removed.
 - `WasmModuleWriter` writes the header and frames every section, including Webcil's alignment padding section.
 - `SymbolTableEncoder`, `SegmentInfoEncoder` and `LinkingSectionEncoder` write the `linking` section, and
   `RelocationSectionEncoder` writes the `reloc.*` sections.
-- `WasmLeb128` is used for LEB128 encoding and `WasmSectionId` for section IDs.
+- `DataSegmentEncoder` writes data-segment headers, and `NameMapWriter` writes the `name` section.
+- `WasmCodeWriter` and `WasmOp` encode the instructions of writer-generated stubs and constant expressions
+  (`WasmInstructions.cs` only maps symbol operands to relocations).
+- `WasmLeb128` is used for LEB128 encoding and decoding, and `WasmSectionId` for section IDs.
 
-Runtime's own section framing, padding section, linking and relocation encoding, and `WasmSectionType` were deleted.
-The node-to-symbol front end, relocation resolution, data-segment layout, Webcil layout and the instruction encoder
-stay in runtime.
+Runtime's own section framing, padding section, linking, relocation, data-segment-header and name-section encoding,
+its instruction encoder and `WasmExprKind`/`WasmSectionType` were deleted. The node-to-symbol front end, relocation
+resolution, data-segment layout and Webcil layout stay in runtime.
 
 - `ILCompiler.Compiler` and `ILCompiler.ReadyToRun` have a `ProjectReference` to this library, not linked source. The
   library's types are public, so linking its source would collide in tests that reference both. ilc and crossgen2
   are NativeAOT-published with no trim or AOT warnings. Compared with builds before either referenced the library,
-  ilc grew 31 KB (36,562,356 to 36,593,652 bytes) and crossgen2 20.5 KB (32,984,282 to 33,004,794 bytes).
+  ilc grew 86.7 KB (36,562,356 to 36,649,044 bytes) and crossgen2 56.9 KB (32,984,282 to 33,041,210 bytes).
 - Output is byte-identical before and after. `artifacts/objcmp/run.sh` (a local script, not committed) runs ilc on
   the 14 NativeAOT WASI smoke-test response files, and crossgen2 on CoreLib, five framework libraries and a
   composite. `TrimmingBehaviors.o` also differs between two runs of the same ilc, so it's excluded.
 - `ILCompiler.ReadyToRun.Tests` validates every crossgen2 wasm output with `ModuleReader.ReadModuleAndValidate`.
-  Nesm's `ObjectWriterReferenceTests` re-encode runtime outputs when `NESM_OBJCMP_DIR` points at an objcmp `out`
-  directory.
-- Still runtime-only, tracked in [nesm#592](https://github.com/Blazor-Playground/nesm/issues/592): data-segment
-  headers, the name section's subsection ID, and LEB128 over `IBufferWriter` or streams. The instruction encoder
-  (`WasmInstructions.cs`) is tracked in [nesm#570](https://github.com/Blazor-Playground/nesm/issues/570).
+- Nesm's `ObjectWriterReferenceTests` and `WasmCodeWriterTests.RuntimeCodeReemitsByteIdentically` re-encode
+  runtime outputs and re-emit every code body when `NESM_OBJCMP_DIR` points at an objcmp `out` directory.
+- Still runtime-only: the entries of the type, import, global, export and element sections (function types, import
+  descriptors, global and export entries, element segments), tracked in
+  [nesm#597](https://github.com/Blazor-Playground/nesm/issues/597).

@@ -1,3 +1,4 @@
+Binary/CodeReemitter.cs
 Binary/DwarfLineWriterTests.cs
 Binary/DwarfTypeReaderTests.cs
 Binary/DwarfVariableReaderTests.cs
@@ -6,8 +7,10 @@ Binary/ModuleReaderTests.cs
 Binary/ObjectReencoder.cs
 Binary/ObjectWriterReferenceTests.cs
 Binary/WasmBinaryReaderTests.cs
+Binary/WasmCodeWriterTests.cs
 Binary/WasmFeaturesTests.cs
 Binary/WasmLeb128ReaderTests.cs
+Binary/WasmObjectEncodersTests.cs
 Binary/WasmObjectWriterApiTests.cs
 Linker/ArArchiveReaderTests.cs
 Linker/DeadCodeEliminatorTests.cs

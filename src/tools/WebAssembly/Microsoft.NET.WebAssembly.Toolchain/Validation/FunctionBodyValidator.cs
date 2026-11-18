@@ -240,7 +240,7 @@ internal static class FunctionBodyValidator
 
         public int ImportedFunctionCount => _functionTypeIndices.Count - _module.Functions.Count;
 
-        public IReadOnlyList<TypeDefinition> TypeDefinitions => _module.TypeDefinitions;
+        public List<TypeDefinition> TypeDefinitions => _module.TypeDefinitions;
 
         public SubtypeRelation SubtypeRelation { get; }
 
@@ -1137,7 +1137,7 @@ internal static class FunctionBodyValidator
                     "cont.bind requires source and destination continuation result types to match");
 
             int bindCount = source.Parameters.Length - destination.Parameters.Length;
-            if (bindCount < 0 || !SameTypes(source.Parameters[bindCount..], destination.Parameters))
+            if (bindCount < 0 || !SameTypes(source.Parameters.AsSpan(bindCount..), destination.Parameters))
                 throw Failure(WasmValidationCode.FunctionBodyTypeMismatch,
                     "cont.bind requires destination parameters to be a suffix of source parameters");
 
@@ -1848,7 +1848,7 @@ internal static class FunctionBodyValidator
             throw Failure(WasmValidationCode.TypeIndexOutOfRange, $"Type index {typeIndex} is not a continuation or function type");
         }
 
-        private ExactValueType ContinuationResultType(uint typeIndex)
+        private ExactValueType.Reference ContinuationResultType(uint typeIndex)
             => TypeDefinition(typeIndex).CompositeType is CompositeType.Continuation
                 ? NonNullableDefinedRef(typeIndex)
                 : new ExactValueType.Reference(Nullability.NonNullable, new AbstractHeapType(HeapTypeKind.Cont));
@@ -1905,7 +1905,7 @@ internal static class FunctionBodyValidator
                     $"{context} type does not match continuation signature");
         }
 
-        private ExactValueType CastType(long heapType, Nullability nullability)
+        private ExactValueType.Reference CastType(long heapType, Nullability nullability)
         {
             var heap = HeapTypeFromSigned(heapType);
             if (heap is DefinedHeapType defined)
@@ -1926,13 +1926,13 @@ internal static class FunctionBodyValidator
                 _ = TypeDefinition((uint)defined.TypeIndex);
         }
 
-        private ExactValueType NonNullableDefinedRef(uint typeIndex)
+        private ExactValueType.Reference NonNullableDefinedRef(uint typeIndex)
         {
             _ = TypeDefinition(typeIndex);
             return new ExactValueType.Reference(Nullability.NonNullable, new DefinedHeapType(checked((int)typeIndex)));
         }
 
-        private ExactValueType NullableDefinedRef(uint typeIndex)
+        private ExactValueType.Reference NullableDefinedRef(uint typeIndex)
         {
             _ = TypeDefinition(typeIndex);
             return new ExactValueType.Reference(Nullability.Nullable, new DefinedHeapType(checked((int)typeIndex)));
@@ -1945,7 +1945,7 @@ internal static class FunctionBodyValidator
             _ => throw new InvalidOperationException($"Unknown storage type {storage.GetType().Name}"),
         };
 
-        private ExactValueType StorageResultType(StorageType storage, bool? signed)
+        private static ExactValueType StorageResultType(StorageType storage, bool? signed)
         {
             return storage switch
             {
@@ -1957,18 +1957,18 @@ internal static class FunctionBodyValidator
             };
         }
 
-        private void ValidatePackedAccess(StorageType storage, bool? signed)
+        private static void ValidatePackedAccess(StorageType storage, bool? signed)
         {
             _ = StorageResultType(storage, signed);
         }
 
-        private void EnsureDefaultable(IReadOnlyList<FieldType> fields)
+        private static void EnsureDefaultable(IReadOnlyList<FieldType> fields)
         {
             for (int i = 0; i < fields.Count; i++)
                 EnsureDefaultable(fields[i]);
         }
 
-        private void EnsureDefaultable(FieldType field)
+        private static void EnsureDefaultable(FieldType field)
         {
             if (!IsDefaultableStorage(field.StorageType))
                 throw Failure(WasmValidationCode.FunctionBodyTypeMismatch, "Default allocation requires defaultable field types");
@@ -1981,13 +1981,13 @@ internal static class FunctionBodyValidator
             _ => false,
         };
 
-        private void EnsureMutableArray(FieldType field, uint typeIndex)
+        private static void EnsureMutableArray(FieldType field, uint typeIndex)
         {
             if (field.Mutability != Mutability.Var)
                 throw Failure(WasmValidationCode.FunctionBodyTypeMismatch, $"Array type {typeIndex} element is immutable");
         }
 
-        private void EnsurePackedArrayForData(StorageType storage, uint typeIndex)
+        private static void EnsurePackedArrayForData(StorageType storage, uint typeIndex)
         {
             // The spec permits any numeric, vector or packed element type here — the restriction
             // is only that a data segment cannot initialise a *reference* element, because raw
@@ -2040,21 +2040,21 @@ internal static class FunctionBodyValidator
             PushMany(rule.Outputs);
         }
 
-        private void ValidateMemoryAlignment(DecodedInstruction instruction, uint naturalAlignment)
+        private static void ValidateMemoryAlignment(DecodedInstruction instruction, uint naturalAlignment)
         {
             if (instruction.Index0 > naturalAlignment)
                 throw Failure(WasmValidationCode.FunctionBodyInvalidImmediate,
                     $"Memory alignment {instruction.Index0} exceeds natural alignment {naturalAlignment}");
         }
 
-        private void ValidateLane(byte lane, uint laneCount)
+        private static void ValidateLane(byte lane, uint laneCount)
         {
             if (lane >= laneCount)
                 throw Failure(WasmValidationCode.FunctionBodyInvalidImmediate,
                     $"Lane index {lane} is out of range for {laneCount} lanes");
         }
 
-        private void ValidateShuffle(DecodedInstruction instruction)
+        private static void ValidateShuffle(DecodedInstruction instruction)
         {
             var bytes = instruction.ImmediateBytes;
             if (bytes.Length < 16)
@@ -2288,11 +2288,11 @@ internal static class FunctionBodyValidator
                 $"Select operand types differ: {left.Type!.Key} and {right.Type!.Key}");
         }
 
-        private bool ResultTypesCompatible(IReadOnlyList<ExactValueType> actual, IReadOnlyList<ExactValueType> expected)
+        private bool ResultTypesCompatible(ReadOnlySpan<ExactValueType> actual, ReadOnlySpan<ExactValueType> expected)
         {
-            if (actual.Count != expected.Count)
+            if (actual.Length != expected.Length)
                 return false;
-            for (int i = 0; i < actual.Count; i++)
+            for (int i = 0; i < actual.Length; i++)
             {
                 if (!_subtype.IsSubtype(actual[i], expected[i]))
                     return false;
@@ -2307,12 +2307,12 @@ internal static class FunctionBodyValidator
         private bool IsContinuationReferenceType(ExactValueType type)
             => _subtype.IsSubtype(type, new ExactValueType.Reference(Nullability.Nullable, new AbstractHeapType(HeapTypeKind.Cont)));
 
-        private bool SameTypes(IReadOnlyList<ExactValueType> left, IReadOnlyList<ExactValueType> right)
+        private bool SameTypes(ReadOnlySpan<ExactValueType> left, ReadOnlySpan<ExactValueType> right)
         {
-            if (left.Count != right.Count)
+            if (left.Length != right.Length)
                 return false;
 
-            for (int i = 0; i < left.Count; i++)
+            for (int i = 0; i < left.Length; i++)
             {
                 if (!_subtype.AreEquivalent(left[i], right[i]))
                     return false;
@@ -2321,10 +2321,10 @@ internal static class FunctionBodyValidator
             return true;
         }
 
-        private ValidationFailure Missing(DecodedInstruction instruction)
+        private static ValidationFailure Missing(DecodedInstruction instruction)
             => Failure(WasmValidationCode.InternalRuleMissing, $"No function-body validation rule for opcode {instruction.OpcodeId}");
 
-        private ValidationFailure Failure(WasmValidationCode code, string message) => new(code, message);
+        private static ValidationFailure Failure(WasmValidationCode code, string message) => new(code, message);
     }
 
     private sealed class ControlFrame
@@ -2377,7 +2377,15 @@ internal static class FunctionBodyValidator
         public WasmValidationCode Code { get; } = code;
     }
 
-    private enum ControlKind { Function, Block, Loop, If, Try, TryTable }
+    private enum ControlKind
+    {
+        Function,
+        Block,
+        Loop,
+        If,
+        Try,
+        TryTable
+    }
 
     private static IEnumerable<OpcodeId> PrimaryRuleOpcodes()
     {

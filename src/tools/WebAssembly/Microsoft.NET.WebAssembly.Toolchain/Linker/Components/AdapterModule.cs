@@ -26,14 +26,14 @@ internal static class AdapterModule
 
     public static byte[] Minimize(byte[] adapter, IReadOnlySet<string> required, string? mainRealloc)
     {
-        var sections = new List<(byte Id, byte[] Payload, string Name)>();
+        var sections = new List<(byte Id, byte[] Payload, ReadOnlyMemory<byte> Name)>();
         var r = new CtReader(adapter) { Position = 8 };
         while (r.HasMore)
         {
             byte id = r.ReadByte();
             CtReader body = r.Sub(checked((int)r.ReadU32()));
             int start = body.Position;
-            string name = id == (byte)WasmSectionId.Custom ? body.ReadName() : "";
+            ReadOnlyMemory<byte> name = id == (byte)WasmSectionId.Custom ? body.ReadNameMemory() : default;
             body.Position = id == (byte)WasmSectionId.Custom ? body.Position : start;
             var payload = adapter[body.Position..body.End];
             sections.Add((id, payload, name));
@@ -123,7 +123,7 @@ internal static class AdapterModule
         if (Section(WasmSectionId.Start) is not null)
             throw new NotSupportedException("adapter modules with a start function are not supported.");
 
-        var (stackPointer, allocationState) = FindStackGlobals(sections.FirstOrDefault(s => s.Id == (byte)WasmSectionId.Custom && s.Name == "name").Payload);
+        var (stackPointer, allocationState) = FindStackGlobals(sections.FirstOrDefault(s => s.Id == (byte)WasmSectionId.Custom && s.Name.Span.SequenceEqual("name"u8)).Payload);
 
         // ── Liveness ──
         int importCount = funcImports.Count;
@@ -289,11 +289,11 @@ internal static class AdapterModule
                 s.Bytes(rewritten);
             }
         });
-        foreach (var custom in sections.Where(s => s.Id == (byte)WasmSectionId.Custom && s.Name == "producers"))
+        foreach (var custom in sections.Where(s => s.Id == (byte)WasmSectionId.Custom && s.Name.Span.SequenceEqual("producers"u8)))
         {
             w.Section(WasmSectionId.Custom, s =>
             {
-                s.Name(custom.Name);
+                s.Name(custom.Name.Span);
                 s.Bytes(custom.Payload);
             });
         }
@@ -352,10 +352,10 @@ internal static class AdapterModule
             for (uint i = 0; i < count; i++)
             {
                 uint index = sub.ReadU32();
-                string name = sub.ReadName();
-                if (name == "__stack_pointer")
+                ReadOnlySpan<byte> name = sub.ReadNameBytes();
+                if (name.SequenceEqual("__stack_pointer"u8))
                     sp = index;
-                else if (name == "allocation_state")
+                else if (name.SequenceEqual("allocation_state"u8))
                     state = index;
             }
         }

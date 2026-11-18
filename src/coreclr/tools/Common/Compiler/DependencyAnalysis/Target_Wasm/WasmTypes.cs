@@ -7,6 +7,7 @@ using System.Linq;
 
 using ILCompiler.ObjectWriter;
 using Internal.JitInterface;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.DependencyAnalysis.Wasm
 {
@@ -97,13 +98,12 @@ namespace ILCompiler.DependencyAnalysis.Wasm
 
         public int EncodeSize()
         {
-            uint sizeLength = DwarfHelper.SizeOfULEB128((ulong)_types.Length);
-            return (int)(sizeLength + (uint)_types.Length);
+            return WasmLeb128.GetULeb128Size((ulong)_types.Length) + _types.Length;
         }
 
         public int Encode(Span<byte> buffer)
         {
-            int sizeLength = DwarfHelper.WriteULEB128(buffer, (ulong)_types.Length);
+            int sizeLength = WasmLeb128.WriteULeb128(buffer, (ulong)_types.Length);
             Span<byte> rest = buffer.Slice(sizeLength);
             for (int i = 0; i < _types.Length; i++)
             {

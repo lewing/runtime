@@ -548,9 +548,10 @@ namespace ILCompiler.ObjectWriter
             for (int i = 0; i < frames.Length; i++)
             {
                 FrameInfo frame = frames[i];
-                uint frameSize = checked((uint)DwarfHelper.ReadULEB128(frame.BlobData, out int bytesRead));
+                int position = 0;
+                uint frameSize = WasmLeb128.ReadU32(frame.BlobData, ref position);
                 Debug.Assert(frameSize % _nodeFactory.Target.PointerSize == 0);
-                uint virtualSize = checked((uint)DwarfHelper.ReadULEB128(frame.BlobData.AsSpan(bytesRead)));
+                uint virtualSize = WasmLeb128.ReadU32(frame.BlobData, ref position);
                 Debug.Assert(virtualSize != 0);
                 uint virtualStart = _nextVirtualIP;
                 _nextVirtualIP = checked(virtualStart + virtualSize);

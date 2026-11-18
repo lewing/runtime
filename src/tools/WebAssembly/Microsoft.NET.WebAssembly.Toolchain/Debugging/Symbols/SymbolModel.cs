@@ -32,7 +32,13 @@ internal enum SymbolSource
     Synthetic,
 }
 
-internal enum NameForm { Raw, Mangled, Demangled, Managed }
+internal enum NameForm
+{
+    Raw,
+    Mangled,
+    Demangled,
+    Managed
+}
 
 internal sealed record SymbolName(string Text, SymbolSource Source, NameForm Form = NameForm.Raw);
 
@@ -115,7 +121,12 @@ internal sealed record SymbolCandidate(
     MatchMode MatchedBy,
     DisplayName Display);
 
-internal enum ResolveStatus { Unique, Ambiguous, NotFound }
+internal enum ResolveStatus
+{
+    Unique,
+    Ambiguous,
+    NotFound
+}
 
 internal sealed record ResolveResult(
     ResolveStatus Status,

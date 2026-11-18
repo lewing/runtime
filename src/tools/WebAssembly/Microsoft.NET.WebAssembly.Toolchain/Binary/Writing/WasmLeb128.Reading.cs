@@ -267,25 +267,8 @@ public static partial class WasmLeb128
     /// Reads a u32 from <paramref name="stream"/>. Returns false when the stream ends early or the
     /// encoding is too long or out of range; the bytes examined are consumed either way.
     /// </summary>
-    public static bool TryReadU32(Stream stream, out uint value)
-    {
-        Span<byte> encoded = stackalloc byte[MaxLength32];
-        int length = 0;
-        do
-        {
-            int b = stream.ReadByte();
-            if (b < 0)
-            {
-                value = 0;
-                return false;
-            }
-
-            encoded[length++] = (byte)b;
-        }
-        while ((encoded[length - 1] & 0x80) != 0 && length < encoded.Length);
-
-        return DecodeU32(encoded[..length], out value, out _) == Leb128Status.Ok;
-    }
+    public static bool TryReadU32(Stream stream, out uint value) =>
+        DecodeU32(stream, out value, out _) == Leb128Status.Ok;
 
     // ── Unbounded decoders (DWARF and other formats without a length limit) ─────────
     //
@@ -382,7 +365,14 @@ public static partial class WasmLeb128
     // ── Errors ────────────────────────────────────────────────────────────────
 
     /// <summary>The value widths the core-spec decoders read, for error messages.</summary>
-    internal enum Leb128Kind : byte { U32, S32, U64, S64, S33 }
+    internal enum Leb128Kind : byte
+    {
+        U32,
+        S32,
+        U64,
+        S64,
+        S33
+    }
 
     /// <summary>
     /// The exception the throwing readers raise for a failed decode. Stream readers that buffer an

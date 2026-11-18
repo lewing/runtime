@@ -998,6 +998,269 @@ diff -ruN a/Binary/ObjectWriterReferenceTests.cs b/Binary/ObjectWriterReferenceT
  
          Assert.True(Directory.Exists(dir), $"NESM_OBJCMP_DIR '{dir}' does not exist");
          string[] objects = Directory.GetFiles(dir, "*.o", SearchOption.AllDirectories);
+diff -ruN a/Binary/WasmCodeWriterTests.cs b/Binary/WasmCodeWriterTests.cs
+--- a/Binary/WasmCodeWriterTests.cs
++++ b/Binary/WasmCodeWriterTests.cs
+@@ -1,13 +1,12 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using Microsoft.DotNet.XUnitExtensions;
+ using System.Buffers;
+ using System.Globalization;
+ using System.Text;
+ using Microsoft.NET.WebAssembly.Binary;
+ using Microsoft.NET.WebAssembly.Binary.Writing;
+-using Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
+-using Microsoft.NET.WebAssembly.Toolchain.Tests.WasiConformance;
+ using Microsoft.NET.WebAssembly.Types;
+ using Microsoft.NET.WebAssembly.Wat;
+ 
+@@ -220,125 +219,6 @@
+         Assert.True(compared > 470, $"only {compared} opcodes compared");
+     }
+ 
+-    /// <summary>
+-    /// <c>WasmOp.cs</c> is <see cref="GenerateWasmOpSource"/>'s output. When the table changes, run with
+-    /// <c>NESM_REGENERATE_WASMOP=1</c> to rewrite the file; otherwise a mismatch writes the expected source to a temporary file.
+-    /// </summary>
+-    [Fact]
+-    public void WasmOpSourceIsGeneratedFromTheOpcodeTable()
+-    {
+-        string path = Path.Combine(ProvisionedPaths.RepoRoot, "src", "Nesm", "Binary", "Writing", "WasmOp.cs");
+-        string expected = GenerateWasmOpSource();
+-        string actual = File.ReadAllText(path).ReplaceLineEndings("\n");
+-        string message = "";
+-        if (actual != expected)
+-        {
+-            if (Environment.GetEnvironmentVariable("NESM_REGENERATE_WASMOP") == "1")
+-            {
+-                File.WriteAllText(path, expected);
+-                message = $"WasmOp.cs did not match OpcodeTable; {path} was regenerated, so review the diff and rerun.";
+-            }
+-            else
+-            {
+-                string expectedPath = Path.Combine(Path.GetTempPath(), "WasmOp.cs");
+-                File.WriteAllText(expectedPath, expected);
+-                message = $"WasmOp.cs does not match OpcodeTable: the expected source is in {expectedPath}; rerun with NESM_REGENERATE_WASMOP=1 to update {path}.";
+-            }
+-        }
+-
+-        // Fails after a regeneration too: the run that rewrote the file has not tested it.
+-        Assert.True(actual == expected, message);
+-    }
+-
+-    /// <summary>The source of <c>WasmOp.cs</c>: every <see cref="OpcodeTable"/> opcode except stack switching, plus typed <c>select</c>.</summary>
+-    private static string GenerateWasmOpSource()
+-    {
+-        var ops = new List<(uint Value, string Name, string Mnemonic, WasmImmediateShape Shape)>
+-        {
+-            // Typed select shares the select mnemonic, so it is not in the WAT table.
+-            (0x1C, "SelectTyped", "select (typed)", WasmImmediateShape.SelectTyped),
+-        };
+-        foreach (string mnemonic in OpcodeTable.AllMnemonics)
+-        {
+-            OpcodeEntry entry = OpcodeTable.Get(mnemonic);
+-            if (entry.Opcodes[0] == WasmOpcode.StackSwitchingPrefix)
+-                continue;
+-            uint value = entry.Opcodes[0];
+-            if (entry.Opcodes.Length > 1)
+-            {
+-                int at = 1;
+-                value = value << 24 | WasmLeb128.ReadU32(entry.Opcodes, ref at);
+-                Assert.Equal(entry.Opcodes.Length, at);
+-            }
+-
+-            ops.Add((value, PascalCase(mnemonic), mnemonic, ExpectedShape(entry.Immediate)));
+-        }
+-
+-        ops.Sort((a, b) => a.Value.CompareTo(b.Value));
+-        var s = new StringBuilder();
+-        s.Append("""
+-            // Generated from Microsoft.NET.WebAssembly.Wat.OpcodeTable (stack switching, 0xE0, excluded) by
+-            // WasmCodeWriterTests.GenerateWasmOpSource. Do not edit; regenerate with
+-            // NESM_REGENERATE_WASMOP=1 dotnet test tests/Microsoft.NET.WebAssembly.Toolchain.Tests --filter WasmOpSourceIsGeneratedFromTheOpcodeTable
+-
+-            namespace Microsoft.NET.WebAssembly.Binary.Writing;
+-
+-            /// <summary>
+-            /// WebAssembly instruction opcodes for <see cref="WasmCodeWriter"/>. A single-byte opcode is its value; a prefixed
+-            /// one is <c>prefix &lt;&lt; 24 | sub-opcode</c> (the sub-opcode is written as a u32 LEB128), as dotnet/runtime's
+-            /// <c>WasmExprKind</c> encodes them.
+-            /// </summary>
+-            public enum WasmOp : uint
+-            {
+-
+-            """);
+-        foreach (var op in ops)
+-            s.Append(CultureInfo.InvariantCulture, $"    /// <summary><c>{op.Mnemonic}</c></summary>\n    {op.Name} = 0x{op.Value:X},\n");
+-        s.Append("""
+-            }
+-
+-            /// <summary>Opcode properties.</summary>
+-            public static class WasmOps
+-            {
+-                /// <summary>The immediates <paramref name="op"/> takes.</summary>
+-                /// <exception cref="ArgumentOutOfRangeException"><paramref name="op"/> is not a defined opcode.</exception>
+-                public static WasmImmediateShape GetImmediateShape(WasmOp op) => op switch
+-                {
+-
+-            """);
+-        foreach (WasmImmediateShape shape in Enum.GetValues<WasmImmediateShape>())
+-        {
+-            var line = new StringBuilder("        ");
+-            bool first = true;
+-            foreach (var op in ops)
+-            {
+-                if (op.Shape != shape)
+-                    continue;
+-                string item = (first ? "" : " or ") + "WasmOp." + op.Name;
+-                if (!first && line.Length + item.Length + 3 > 120)
+-                {
+-                    s.Append(line).Append(" or\n");
+-                    line.Clear().Append("            ");
+-                    item = item[4..];
+-                }
+-
+-                line.Append(item);
+-                first = false;
+-            }
+-
+-            Assert.False(first, $"no opcode has shape {shape}");
+-            s.Append(line).Append(CultureInfo.InvariantCulture, $" => WasmImmediateShape.{shape},\n");
+-        }
+-
+-        s.Append("""
+-                    _ => throw new ArgumentOutOfRangeException(nameof(op), op, "Not a defined opcode."),
+-                };
+-            }
+-
+-            """);
+-        return s.ToString();
+-    }
+-
+     private static string PascalCase(string mnemonic) =>
+         string.Concat(mnemonic.Split('.', '_').Select(part => char.ToUpperInvariant(part[0]) + part[1..]));
+ 
+@@ -391,7 +271,7 @@
+     // ── Validation and execution ────────────────────────────────────────────
+ 
+     [Fact]
+-    public void WrittenCodeValidatesAndRuns()
++    public void WrittenCodeValidates()
+     {
+         // f(x): a br_table switch over x (0 → 10, 1 → 20, else → x * 3 computed in a v128 lane).
+         var (w, body) = NewWriter();
+@@ -431,80 +311,21 @@
+         byte[] bytes = stream.ToArray();
+ 
+         ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes), new ModuleReaderOptions { Features = WasmFeatures.All });
+-        Assert.Equal(["f(0) = 10", "f(1) = 20", "f(7) = 21"],
+-            WasmLdParityTests.Execute(bytes, [new("f", 0), new("f", 1), new("f", 7)]));
+         Assert.Equal(body.WrittenSpan.ToArray(), CodeReemitter.Reemit(body.WrittenSpan));
+     }
+ 
+     // ── Re-emitting real code ───────────────────────────────────────────────
+ 
+-    /// <summary>clang objects with SIMD, relaxed SIMD, exceptions and bulk memory: every body re-emits byte for byte.</summary>
+-    [Theory]
+-    [InlineData("-O2")]
+-    [InlineData("-O0")]
+-    public void ClangCodeReemitsByteIdentically(string optimization)
+-    {
+-        const string Source = """
+-            #include <wasm_simd128.h>
+-            #include <string.h>
+-            struct S { int a; long long b; float c; double d; };
+-            extern void sink(void*);
+-            static int counter;
+-            extern int f0(int); extern int f1(int); extern int f2(int); extern int f3(int);
+-            __attribute__((noinline)) int dispatch(int x) {
+-                switch (x) { case 0: return f0(x); case 1: return f1(x + 1); case 2: return f2(x); case 3: return f3(x * 3); case 5: return f0(9); default: return -x; }
+-            }
+-            int simd(const float* p, int n) {
+-                v128_t acc = wasm_f32x4_splat(0);
+-                for (int i = 0; i + 4 <= n; i += 4) acc = wasm_f32x4_relaxed_madd(wasm_v128_load(p + i), acc, acc);
+-                v128_t s = wasm_i8x16_shuffle(acc, acc, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+-                return wasm_i32x4_extract_lane(s, 1) + (int)wasm_f32x4_extract_lane(acc, 2) + wasm_i8x16_bitmask(s);
+-            }
+-            void copy(struct S* d, const struct S* s, int n) { memcpy(d, s, n * sizeof *s); memset(d + n, 0, sizeof *d); sink(d); }
+-            int thrower(int x) { if (x > 3) throw x; return x + counter++; }
+-            int catcher(int x) { try { return thrower(x); } catch (int e) { return e * 2; } catch (...) { return -1; } }
+-            float scale(float y) { return y * 2.75f - 0.125f; }
+-            double floats(double x, float y) { return x * y * 1.25 + (double)(long long)x - __builtin_sqrt(x) + (float)(x / y) + 0.5f; }
+-            """;
+-        string bin = WasmLdParityTests.RequireWasiSdkBin();
+-        string dir = WasmLdParityTests.CreateTempDirectory();
+-        string obj = WasmLdParityTests.Compile(bin, dir, "code", Source, language: "c++",
+-            extraFlags: ["-fexceptions", "-fwasm-exceptions", "-mllvm", "-wasm-use-legacy-eh=false", "-msimd128", "-mrelaxed-simd", "-mbulk-memory", "-mnontrapping-fptoint", "-msign-ext", optimization],
+-            libc: true);
+-        List<byte[]> bodies = CodeReemitter.FunctionBodies(File.ReadAllBytes(obj));
+-        Assert.True(bodies.Count >= 6, $"only {bodies.Count} bodies");
+-
+-        var seen = new HashSet<WasmImmediateShape>();
+-        for (int i = 0; i < bodies.Count; i++)
+-        {
+-            byte[] reemitted = CodeReemitter.Reemit(bodies[i]);
+-            if (!bodies[i].AsSpan().SequenceEqual(reemitted))
+-                ObjectReencoder.AssertBytesEqual(bodies[i], reemitted, $"body {i} {Convert.ToHexString(bodies[i])}");
+-            seen.UnionWith(Shapes(bodies[i]));
+-        }
+-
+-        // The corpus must actually exercise the shapes it is meant to cover; -O0 code keeps the switch as branches
+-        // and vectors in memory, so only the optimized build is held to br_table, lane and v128.const instructions.
+-        WasmImmediateShape[] required =
+-        [
+-            WasmImmediateShape.Index, WasmImmediateShape.I32, WasmImmediateShape.MemArg, WasmImmediateShape.Block,
+-            WasmImmediateShape.Shuffle, WasmImmediateShape.TryTable, WasmImmediateShape.IndexPair,
+-            WasmImmediateShape.F64, WasmImmediateShape.F32,
+-            .. optimization == "-O2" ? (WasmImmediateShape[])[WasmImmediateShape.BrTable, WasmImmediateShape.Lane, WasmImmediateShape.V128] : [],
+-        ];
+-        Assert.True(required.All(seen.Contains), $"missing: {string.Join(", ", required.Except(seen))}");
+-    }
+-
+     /// <summary>
+     /// Every code body of dotnet/runtime's ILCompiler objects and crossgen2 Webcil images (set <c>NESM_OBJCMP_DIR</c> to an
+     /// <c>artifacts/objcmp/&lt;tag&gt;/out</c> directory) re-emits byte for byte.
+     /// </summary>
+-    [Theory]
++    [ConditionalTheory]
+     [MemberData(nameof(ObjectWriterReferenceTests.References), MemberType = typeof(ObjectWriterReferenceTests))]
+     public void RuntimeCodeReemitsByteIdentically(string relativePath)
+     {
+         if (relativePath.Length == 0)
+-            Assert.Skip("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
++            throw new SkipTestException("Set NESM_OBJCMP_DIR to a dotnet/runtime artifacts/objcmp/<tag>/out directory.");
+ 
+         byte[] module = File.ReadAllBytes(Path.Combine(Environment.GetEnvironmentVariable("NESM_OBJCMP_DIR")!, relativePath));
+         List<byte[]> bodies = CodeReemitter.FunctionBodies(module);
+@@ -516,26 +337,5 @@
+             if (!bodies[i].AsSpan().SequenceEqual(reemitted))
+                 ObjectReencoder.AssertBytesEqual(bodies[i], reemitted, $"{relativePath} body {i}");
+         }
+-    }
+-
+-    private static HashSet<WasmImmediateShape> Shapes(byte[] body)
+-    {
+-        int at = 0;
+-        uint groups = WasmLeb128.ReadU32(body, ref at);
+-        for (int i = 0; i < groups; i++)
+-        {
+-            WasmLeb128.ReadU32(body, ref at);
+-            at++;
+-        }
+-
+-        var shapes = new HashSet<WasmImmediateShape>();
+-        var cursor = new InstructionCursor(body[at..], WasmFeatures.All);
+-        while (cursor.MoveNext(out DecodedInstruction instruction))
+-        {
+-            OpcodeId id = instruction.OpcodeId;
+-            shapes.Add(WasmOps.GetImmediateShape((WasmOp)(id.IsPrefixed ? ((uint)id.Opcode << 24) | id.SubOpcode : id.Opcode)));
+-        }
+-
+-        return shapes;
+     }
+ }
 diff -ruN a/Binary/WasmFeaturesTests.cs b/Binary/WasmFeaturesTests.cs
 --- a/Binary/WasmFeaturesTests.cs
 +++ b/Binary/WasmFeaturesTests.cs
@@ -1086,18 +1349,19 @@ diff -ruN a/Binary/WasmFeaturesTests.cs b/Binary/WasmFeaturesTests.cs
 diff -ruN a/Binary/WasmObjectWriterApiTests.cs b/Binary/WasmObjectWriterApiTests.cs
 --- a/Binary/WasmObjectWriterApiTests.cs
 +++ b/Binary/WasmObjectWriterApiTests.cs
-@@ -7,7 +7,6 @@
- using Microsoft.NET.WebAssembly.Binary.Writing;
+@@ -8,6 +8,7 @@
  using Microsoft.NET.WebAssembly.Linker;
  using Microsoft.NET.WebAssembly.Module;
--using Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
+ using Microsoft.NET.WebAssembly.Toolchain.Tests.Linker;
++using Microsoft.DotNet.XUnitExtensions;
  
  namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
  
-@@ -467,54 +466,6 @@
+@@ -466,68 +467,21 @@
+         Assert.Equal(2 * (2 + 4 + 8 + 16 + 32 + 256 + 4096) - 14, padded);
      }
  
-     // ── End to end ──────────────────────────────────────────────────────────
+-    // ── End to end ──────────────────────────────────────────────────────────
 -
 -    [Fact]
 -    public void ObjectWrittenThroughTheApiLinksWithWasmLdAndNesm()
@@ -1146,9 +1410,29 @@ diff -ruN a/Binary/WasmObjectWriterApiTests.cs b/Binary/WasmObjectWriterApiTests
 -
 -        ObjectReencoder.AssertBytesEqual(original, ObjectReencoder.Reencode(original), "clang object");
 -    }
+-
+-    [Fact]
++    [ConditionalFact(typeof(WasmLdParityTests), nameof(WasmLdParityTests.IsWasiSdkAvailable))]
+     public void ClangWasm64ObjectsReencodeByteIdentically()
+     {
+-        string bin = WasmLdParityTests.RequireWasiSdkBin();
+-        string dir = WasmLdParityTests.CreateTempDirectory();
++        string bin = WasmLdParityTests.WasiSdkBin!;
++        string dir = WasmLdCommandLineTests.CreateTempDirectory();
+         const string source = """
+             int a = 5;
+             char big[300] = {1};
+             static const char s[] = "hello";
+             const char* get(void) { return s; }
+             """;
+-        string obj = WasmLdParityTests.Compile(bin, dir, "reencode64", source, extraFlags: ["--target=wasm64-unknown-unknown", "-fdata-sections"]);
++        string c = Path.Combine(dir, "reencode64.c");
++        string obj = Path.Combine(dir, "reencode64.o");
++        File.WriteAllText(c, source);
++        WasmLdParityTests.Run(Path.Combine(bin, "clang"), ["--target=wasm64-unknown-unknown", "-O2", "-fdata-sections", "-c", c, "-o", obj]);
+         byte[] original = File.ReadAllBytes(obj);
  
-     // ── Helpers ─────────────────────────────────────────────────────────────
- 
+         // A 64-bit memory's segments are placed with i64.const offsets, which the re-encoder must rebuild.
 diff -ruN a/Linker/DebugAndNameSectionTests.cs b/Linker/DebugAndNameSectionTests.cs
 --- a/Linker/DebugAndNameSectionTests.cs
 +++ b/Linker/DebugAndNameSectionTests.cs

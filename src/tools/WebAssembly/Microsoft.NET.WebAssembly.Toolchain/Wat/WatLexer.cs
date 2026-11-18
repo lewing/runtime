@@ -207,7 +207,7 @@ public sealed class WatLexer
             else
             {
                 var rune = System.Text.Rune.GetRuneAt(_source, _pos);
-                sb.Append(rune.ToString());
+                sb.Append(rune);
                 int length = rune.EncodeToUtf8(encoded);
                 for (int i = 0; i < length; i++)
                     bytes.Add(encoded[i]);

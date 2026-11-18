@@ -135,7 +135,12 @@ public sealed class WatElem
     public List<List<WatInstruction>> ElementExpressions { get; } = [];
 }
 
-public enum WatElemMode { Active, Passive, Declarative }
+public enum WatElemMode
+{
+    Active,
+    Passive,
+    Declarative
+}
 
 public sealed record WatReferenceType(
     Nullability Nullability,

@@ -9,6 +9,9 @@ internal static class BranchHintMetadataReader
 {
     internal const string SectionName = BranchHint.CustomSectionName;
 
+    /// <summary><see cref="SectionName"/> as UTF-8, for writers.</summary>
+    internal static ReadOnlySpan<byte> SectionNameUtf8 => "metadata.code.branch_hint"u8;
+
     private sealed record EncodedHint(uint FunctionIndex, uint Offset, BranchHintKind Kind);
     private sealed record EncodedFunctionEntry(
         uint FunctionIndex,
@@ -92,7 +95,7 @@ internal static class BranchHintMetadataReader
         module.MetadataDiagnostics = diagnostics;
     }
 
-    private static IReadOnlyList<EncodedFunctionEntry> ParsePayload(byte[] content)
+    private static List<EncodedFunctionEntry> ParsePayload(byte[] content)
     {
         using var stream = new MemoryStream(content, writable: false);
         var reader = new WasmBinaryReader(stream);

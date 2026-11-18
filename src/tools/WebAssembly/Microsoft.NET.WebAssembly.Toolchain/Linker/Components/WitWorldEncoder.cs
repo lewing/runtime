@@ -62,7 +62,7 @@ internal sealed class WitWorldEncoder
         w.Bytes([0x00, 0x61, 0x73, 0x6D, 0x0D, 0x00, 0x01, 0x00]);
         w.Section(ComponentSectionId.Custom, s =>
         {
-            s.Name("wit-component-encoding");
+            s.Name("wit-component-encoding"u8);
             s.Bytes([EncodingVersion, Utf8]);
         });
         w.Section(ComponentSectionId.Type, s =>
