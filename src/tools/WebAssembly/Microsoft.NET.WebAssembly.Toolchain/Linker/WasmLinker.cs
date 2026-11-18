@@ -209,7 +209,18 @@ public enum LinkerInputKind
 /// True for a member of a static archive. When linking relocatable objects, a member is loaded only if it
 /// defines a symbol that is otherwise undefined (pass false for <c>--whole-archive</c> semantics).
 /// </param>
-public sealed record LinkerInput(WasmModule Module, string? Name = null, bool IsArchiveMember = false);
+public sealed record LinkerInput(WasmModule Module, string? Name = null, bool IsArchiveMember = false)
+{
+    /// <summary>
+    /// For a lazily read archive member, parses the complete module; <see cref="Module"/> then needs to hold only what
+    /// decides extraction (its imports, memories, <c>linking</c> section and one entry per <c>reloc.*</c> section),
+    /// and the member is parsed in full only if it is extracted. Null when <see cref="Module"/> is complete.
+    /// <see cref="WasmLdDriver.LoadArchive"/> builds such inputs.
+    /// </summary>
+    public Func<WasmModule>? LoadModule { get; init; }
+
+    internal WasmModule CompleteModule() => LoadModule?.Invoke() ?? Module;
+}
 
 /// <summary>
 /// Managed WebAssembly static linker.  Merges N input <see cref="WasmModule"/> objects
@@ -281,6 +292,17 @@ public sealed class WasmLinker
     public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
         => LinkProduct(inputs, options).Binary;
 
+    /// <summary>
+    /// Links inputs that may include lazily loaded archive members and emits the output as a binary <c>.wasm</c>;
+    /// <paramref name="validatedModule"/> is the output as validation read it back, so callers need not read and
+    /// validate the bytes again.
+    /// </summary>
+    public byte[] LinkToBinary(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options, out WasmModule validatedModule)
+    {
+        (_, byte[] binary, validatedModule) = LinkAndValidate(inputs, options);
+        return binary;
+    }
+
     /// <summary>Links inputs that may include lazily loaded archive members.</summary>
     public WasmModule Link(IReadOnlyList<LinkerInput> inputs, LinkerOptions? options = null)
         => LinkProduct(inputs, options).Module;
@@ -306,6 +328,15 @@ public sealed class WasmLinker
         IReadOnlyList<LinkerInput> inputs,
         LinkerOptions? options)
     {
+        var (module, binary, _) = LinkAndValidate(inputs, options);
+        return (module, binary);
+    }
+
+    /// <summary>Links and returns the analytical model, the encoded bytes and the module validated from those bytes.</summary>
+    private (WasmModule Module, byte[] Binary, WasmModule Validated) LinkAndValidate(
+        IReadOnlyList<LinkerInput> inputs,
+        LinkerOptions? options)
+    {
         ArgumentNullException.ThrowIfNull(inputs);
         options ??= new LinkerOptions();
         WasmModule mergedModule;
@@ -320,7 +351,7 @@ public sealed class WasmLinker
         else
         {
             // Complete modules have no symbol table to drive lazy loading, so archive members are all linked.
-            mergedModule = LinkCore([.. inputs.Select(static i => i.Module)], options);
+            mergedModule = LinkCore([.. inputs.Select(static i => i.CompleteModule())], options);
         }
 
         byte[] binary = new SectionMerger().EmitBinary(mergedModule);
@@ -329,8 +360,8 @@ public sealed class WasmLinker
         // identity. Validate the exact bytes independently because model validation cannot establish
         // that serialization preserved the linked product.
         using var stream = new MemoryStream(binary, writable: false);
-        _ = ModuleReader.ReadModuleAndValidate(stream);
-        return (mergedModule, binary);
+        WasmModule validated = ModuleReader.ReadModuleAndValidate(stream);
+        return (mergedModule, binary, validated);
     }
 
     private static bool UsesObjectSemantics(IReadOnlyList<LinkerInput> inputs, LinkerOptions options)

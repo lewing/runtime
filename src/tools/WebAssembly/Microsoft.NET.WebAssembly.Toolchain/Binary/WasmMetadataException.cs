@@ -16,4 +16,11 @@ public sealed class WasmMetadataException : Exception
     {
         Diagnostic = diagnostic;
     }
+
+    /// <summary>Creates the exception for a diagnostic raised by <paramref name="inner"/>.</summary>
+    public WasmMetadataException(WasmMetadataDiagnostic diagnostic, Exception inner)
+        : base($"{diagnostic.SectionName}: {diagnostic.Message}", inner)
+    {
+        Diagnostic = diagnostic;
+    }
 }

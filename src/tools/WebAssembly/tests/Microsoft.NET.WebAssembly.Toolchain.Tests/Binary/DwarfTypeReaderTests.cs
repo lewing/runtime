@@ -491,9 +491,11 @@ public class DwarfTypeReaderTests
     [Fact]
     public void DebugInfoWithoutAbbrev_ReturnsEmpty()
     {
+        // A well-formed DWARF 4 unit header (length 7, version 4, abbrev offset 0, address size 4)
+        // with no .debug_abbrev to resolve it against.
         var module = new WasmModule
         {
-            CustomSections = { new CustomSection(".debug_info", [0x01, 0x00, 0x00, 0x00]) }
+            CustomSections = { new CustomSection(".debug_info", [0x07, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]) }
         };
         var result = DwarfTypeReader.ReadStructTypes(module);
         Assert.Empty(result);
@@ -552,6 +554,204 @@ public class DwarfTypeReaderTests
         Assert.Equal("Pair", results[0].Name);
         Assert.Equal(0, results[0].Members[0].ByteOffset);
         Assert.Equal(4, results[0].Members[1].ByteOffset);
+    }
+
+    // ── Adversarial lengths (#600 H1, M5b) ──────────────────────────────────────
+
+    [Fact(Timeout = 30_000)]
+    public async Task ParseStructTypes_ReservedUnitLengthThatWrapsBackToItself_FailsFast()
+    {
+        // unit_length 0xFFFFFFFC made `pos + 4 + (int)unitLen` equal the unit's own start; the
+        // unsupported version (0) then resumed there, forever.
+        byte[] info = [0xFC, 0xFF, 0xFF, 0xFF, 0x00, 0x00];
+
+        var ex = await DwarfLineReaderTests.AssertRejectedPromptlyAsync(
+            () => DwarfTypeReader.ParseStructTypes(info, [0], null, null, null, null, 50));
+        Assert.Contains("0xFFFFFFFC", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(0xFFFF_FFEFu)] // the largest non-reserved length: wraps negative as an int
+    [InlineData(1000u)]
+    public void ParseStructTypes_UnitLongerThanTheSection_IsReportedNotDropped(uint unitLength)
+    {
+        var info = new List<byte>();
+        WriteU32LE(info, unitLength);
+        WriteU16LE(info, 4);
+        WriteU32LE(info, 0);
+        info.Add(4);
+
+        var ex = Assert.Throws<DwarfFormatException>(() =>
+            DwarfTypeReader.ParseStructTypes(info.ToArray(), [0], null, null, null, null, 50));
+        Assert.Contains("unit_length", ex.Message);
+    }
+
+    [Fact]
+    public void ParseStructTypes_HeaderPastTheUnit_Throws()
+    {
+        // A DWARF 4 unit holding its version but not the rest of its 7-byte header.
+        var info = new List<byte>();
+        WriteU32LE(info, 3);
+        WriteU16LE(info, 4);
+        info.Add(0);
+
+        var ex = Assert.Throws<DwarfFormatException>(() =>
+            DwarfTypeReader.ParseStructTypes(info.ToArray(), [0], null, null, null, null, 50));
+        Assert.Contains("header of the unit", ex.Message);
+    }
+
+    [Fact]
+    public void ParseStructTypes_FixedSizeFormPastTheUnitEnd_IsAFormatErrorNotARuntimeException()
+    {
+        // The struct's DW_FORM_data4 byte size has 2 of its 4 bytes before the unit ends.
+        var abbrev = BuildAbbrevSection(
+            new AbbrevDef(1, DwTag.CompileUnit, true, []),
+            new AbbrevDef(2, DwTag.StructureType, false, [(DwAt.ByteSize, (uint)DwForm.Data4)]));
+        byte[] info = BuildInfoSection_D4([1, 2, 4, 0]);
+
+        var ex = Assert.Throws<DwarfFormatException>(() =>
+            DwarfTypeReader.ParseStructTypes(info, abbrev, null, null, null, null, 50));
+        Assert.Contains("runs past the end of the unit", ex.Message);
+        Assert.IsType<IndexOutOfRangeException>(ex.InnerException);
+    }
+
+    /// <summary>A unit with one struct "S" (4 bytes, no members), and its abbreviations.</summary>
+    private static (byte[] Info, byte[] Abbrev) UnitWithOneStruct()
+    {
+        var abbrev = BuildAbbrevSection(
+            new AbbrevDef(1, DwTag.CompileUnit, true, []),
+            new AbbrevDef(2, DwTag.StructureType, false, [(DwAt.Name, (uint)DwForm.String), (DwAt.ByteSize, (uint)DwForm.Data1)]));
+        var dies = new List<byte>();
+        WriteUleb128(dies, 1);
+        WriteUleb128(dies, 2);
+        WriteInlineString(dies, "S");
+        dies.Add(4);
+        dies.Add(0);
+        return (BuildInfoSection_D4(dies.ToArray()), abbrev);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 1, 2, 3 }, 1)] // a truncated unit_length: reported
+    [InlineData(new byte[] { 0, 0, 0 }, 0)] // zero padding: not an error
+    [InlineData(new byte[] { 0, 0, 0, 0, 0, 0, 0, 0 }, 0)]
+    public void ParseStructTypes_BytesAfterTheLastUnit_KeepTheUnitsTypes(byte[] tail, int expectedErrors)
+    {
+        var (info, abbrev) = UnitWithOneStruct();
+        byte[] data = [.. info, .. tail];
+        var errors = new List<DwarfFormatException>();
+
+        var types = DwarfTypeReader.ParseStructTypes(data, abbrev, null, null, null, null, 50, errors);
+
+        Assert.Equal("S", Assert.Single(types).Name);
+        Assert.Equal(expectedErrors, errors.Count);
+        if (expectedErrors != 0)
+        {
+            Assert.Equal(".debug_info", errors[0].Section);
+            Assert.Equal(info.Length, errors[0].Offset);
+        }
+    }
+
+    [Fact]
+    public void ReadStructTypes_MalformedUnitBeforeAGoodUnit_KeepsTheGoodUnitsTypes()
+    {
+        // UnitWithRewindingBlock's abbreviations (codes 1 and 2) plus a struct at code 3, so one
+        // table serves both units.
+        var (bad, _) = UnitWithRewindingBlock();
+        var abbrev = BuildAbbrevSection(
+            new AbbrevDef(1, DwTag.CompileUnit, true, [(DwAt.Name, (uint)DwForm.String)]),
+            new AbbrevDef(2, DwTag.Variable, false, [(DwAt.Location, (uint)DwForm.Block)]),
+            new AbbrevDef(3, DwTag.StructureType, false, [(DwAt.Name, (uint)DwForm.String), (DwAt.ByteSize, (uint)DwForm.Data1)]));
+        var dies = new List<byte>();
+        WriteUleb128(dies, 1);
+        WriteInlineString(dies, "c");
+        WriteUleb128(dies, 3);
+        WriteInlineString(dies, "S");
+        dies.Add(4);
+        dies.Add(0);
+        byte[] info = [.. bad, .. BuildInfoSection_D4(dies.ToArray())];
+        var module = new WasmModule
+        {
+            CustomSections = { new CustomSection(".debug_info", info), new CustomSection(".debug_abbrev", abbrev) }
+        };
+
+        var types = DwarfTypeReader.ReadStructTypes(module, null, 50, out var errors);
+
+        Assert.Equal("S", Assert.Single(types).Name);
+        Assert.Contains("block", Assert.Single(errors).Message);
+        Assert.Equal("S", Assert.Single(DwarfTypeReader.ReadStructTypes(module)).Name);
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task SharedDieParser_LongIndirectFormChain_DoesNotRecursePerLink()
+    {
+        // 50,000 chained DW_FORM_indirect before the real form. Read recursively, one frame per
+        // link overflowed the stack and killed the process. The struct's name is read with
+        // ReadAttributeValue (DwarfTypeReader) and skipped with SkipFormValue (DwarfSubprogramReader,
+        // which keeps only subprograms); the subprogram after it proves the cursor ended exactly.
+        const int chain = 50_000;
+        var abbrev = BuildAbbrevSection(
+            new AbbrevDef(1, DwTag.CompileUnit, true, []),
+            new AbbrevDef(2, DwTag.StructureType, false, [(DwAt.Name, (uint)DwForm.Indirect), (DwAt.ByteSize, (uint)DwForm.Data1)]),
+            new AbbrevDef(3, DwTag.Subprogram, false, [(DwAt.Name, (uint)DwForm.String), (DwAt.LowPc, (uint)DwForm.Addr)]));
+        var dies = new List<byte>(chain + 32);
+        WriteUleb128(dies, 1);
+        WriteUleb128(dies, 2);
+        for (int i = 0; i < chain; i++)
+            WriteUleb128(dies, (uint)DwForm.Indirect);
+        WriteUleb128(dies, (uint)DwForm.String);
+        WriteInlineString(dies, "S");
+        dies.Add(4);
+        WriteUleb128(dies, 3);
+        WriteInlineString(dies, "f");
+        WriteU32LE(dies, 0x10);
+        dies.Add(0);
+        var info = BuildInfoSection_D4(dies.ToArray());
+
+        // Dedicated threads with the default 1 MB stack, not the test thread's.
+        var types = await Task.Factory.StartNew(
+            () => DwarfTypeReader.ParseStructTypes(info, abbrev, null, null, null, null, 50),
+            TestContext.Current.CancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert.Equal("S", Assert.Single(types).Name);
+
+        var subprograms = await Task.Factory.StartNew(
+            () => DwarfSubprogramReader.Parse(info, abbrev, null, null, null, null),
+            TestContext.Current.CancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        var f = Assert.Single(subprograms.Subprograms);
+        Assert.Equal("f", f.Name);
+        Assert.Equal(0x10, f.LowPc);
+    }
+
+    /// <summary>
+    /// A compile unit whose second DIE has a DW_FORM_block of length 0xFFFFFFFA: as an int that is
+    /// -6, which moved the shared form skipper back to the DIE's own abbreviation code.
+    /// </summary>
+    private static (byte[] Info, byte[] Abbrev) UnitWithRewindingBlock()
+    {
+        var abbrev = BuildAbbrevSection(
+            new AbbrevDef(1, DwTag.CompileUnit, true, [(DwAt.Name, (uint)DwForm.String)]),
+            new AbbrevDef(2, DwTag.Variable, false, [(DwAt.Location, (uint)DwForm.Block)]));
+        var dies = new List<byte>();
+        WriteUleb128(dies, 1);
+        WriteInlineString(dies, "c");
+        WriteUleb128(dies, 2);
+        WriteUleb128(dies, 0xFFFF_FFFA);
+        dies.AddRange([0, 0, 0, 0, 0, 0]);
+        return (BuildInfoSection_D4(dies.ToArray()), abbrev);
+    }
+
+    [Fact(Timeout = 30_000)]
+    public async Task SharedDieParser_BlockLengthThatRewinds_FailsFast()
+    {
+        var (info, abbrev) = UnitWithRewindingBlock();
+
+        // The filtered parse skips the variable's attributes with SkipFormValue (it looped);
+        // the full parse reads them with ReadAttributeValue (it threw a raw range exception).
+        var skipped = await DwarfLineReaderTests.AssertRejectedPromptlyAsync(
+            () => DwarfSubprogramReader.Parse(info, abbrev, null, null, null, null));
+        Assert.Contains("block", skipped.Message);
+        var read = await DwarfLineReaderTests.AssertRejectedPromptlyAsync(
+            () => DwarfTypeReader.ParseStructTypes(info, abbrev, null, null, null, null, 50));
+        Assert.Contains("block", read.Message);
     }
 
     // ── Encoding helpers ─────────────────────────────────────────────────────────

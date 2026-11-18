@@ -17,7 +17,8 @@ public sealed record DwarfMember(string Name, string TypeName, int ByteOffset, i
 public static class DwarfTypeReader
 {
     /// <summary>
-    /// Search DWARF debug info for struct/class type definitions.
+    /// Search DWARF debug info for struct/class type definitions. Malformed units are skipped (their
+    /// types are not returned); use the overload with <c>errors</c> to see them.
     /// </summary>
     /// <param name="module">The parsed wasm module containing DWARF custom sections.</param>
     /// <param name="namePattern">Optional case-insensitive substring filter on type names.</param>
@@ -25,29 +26,54 @@ public static class DwarfTypeReader
     /// <returns>List of struct types found, filtered and capped at <paramref name="maxResults"/>.</returns>
     public static IReadOnlyList<DwarfStructType> ReadStructTypes(
         Microsoft.NET.WebAssembly.Module.WasmModule module, string? namePattern = null, int maxResults = 50)
+        => ReadStructTypes(module, namePattern, maxResults, out _);
+
+    /// <summary>
+    /// Search DWARF debug info for struct/class type definitions, recovering per unit: a malformed
+    /// unit is reported in <paramref name="errors"/> and skipped, and the units around it are still
+    /// read. Only a bad <c>unit_length</c> ends the search.
+    /// </summary>
+    /// <param name="module">The parsed wasm module containing DWARF custom sections.</param>
+    /// <param name="namePattern">Optional case-insensitive substring filter on type names.</param>
+    /// <param name="maxResults">Maximum number of types to return.</param>
+    /// <param name="errors">One error per malformed .debug_info unit; empty for well-formed DWARF.</param>
+    public static IReadOnlyList<DwarfStructType> ReadStructTypes(
+        Microsoft.NET.WebAssembly.Module.WasmModule module, string? namePattern, int maxResults,
+        out IReadOnlyList<DwarfFormatException> errors)
     {
         ArgumentNullException.ThrowIfNull(module);
 
         var debugInfoSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_info");
         if (debugInfoSection is null)
+        {
+            errors = [];
             return [];
+        }
 
         var debugAbbrevSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_abbrev");
         var debugStrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_str");
         var debugLineStrSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_line_str");
         var debugStrOffsetsSection = module.CustomSections.FirstOrDefault(cs => cs.Name == ".debug_str_offsets");
 
-        return ParseStructTypes(
+        var errorList = new List<DwarfFormatException>();
+        var types = ParseStructTypes(
             debugInfoSection.Content,
             debugAbbrevSection?.Content ?? [],
             debugStrSection?.Content,
             debugLineStrSection?.Content,
             debugStrOffsetsSection?.Content,
             namePattern,
-            maxResults);
+            maxResults,
+            errorList);
+        errors = errorList;
+        return types;
     }
 
-    /// <summary>Core parsing entry point operating on raw section bytes.</summary>
+    /// <summary>
+    /// Core parsing entry point operating on raw section bytes. Malformed units are added to
+    /// <paramref name="errors"/> and skipped; with no list, the first one is thrown.
+    /// </summary>
+    /// <exception cref="DwarfFormatException">A unit is malformed and <paramref name="errors"/> is null.</exception>
     internal static IReadOnlyList<DwarfStructType> ParseStructTypes(
         byte[] infoData,
         byte[] abbrevData,
@@ -55,7 +81,8 @@ public static class DwarfTypeReader
         byte[]? lineStrData,
         byte[]? strOffsetsData,
         string? namePattern,
-        int maxResults)
+        int maxResults,
+        List<DwarfFormatException>? errors = null)
     {
         var abbrevTables = DwarfAbbrevParser.Parse(abbrevData);
         var results = new List<DwarfStructType>();
@@ -63,67 +90,131 @@ public static class DwarfTypeReader
 
         while (pos < infoData.Length && results.Count < maxResults)
         {
-            if (pos + 4 > infoData.Length) break;
+            // Zero bytes after the last unit are padding (zero-length units), not a truncated unit.
+            if (infoData.AsSpan(pos).IndexOfAnyExcept((byte)0) < 0)
+                break;
 
             int cuStart = pos;
-            uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen == 0xFFFFFFFF) break; // 64-bit DWARF not supported
-
-            int cuEnd = pos + 4 + (int)unitLen;
-            if (cuEnd > infoData.Length) break;
-
-            ushort version = DwarfReaderHelpers.ReadU16LE(infoData, pos + 4);
-            if (version < 2 || version > 5) { pos = cuEnd; continue; }
-
-            int abbrevOffset;
-            byte addrSize;
-            int diePos;
-            if (version >= 5)
+            int cuEnd;
+            bool is64Bit;
+            try
             {
-                addrSize = infoData[pos + 7];
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 8);
-                diePos = pos + 12;
+                // The end is checked against the data and is always past the length field, so
+                // resuming at it always advances.
+                cuEnd = DwarfReaderHelpers.ReadUnitLength(infoData, ref pos, InfoSection, out is64Bit);
             }
-            else
+            catch (DwarfFormatException ex) when (errors is not null)
             {
-                abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, pos + 6);
-                addrSize = infoData[pos + 10];
-                diePos = pos + 11;
+                errors.Add(ex);
+                break;
             }
 
-            if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable))
+            int headerStart = pos;
+            pos = cuEnd;
+            if (is64Bit || cuEnd == headerStart) continue; // 64-bit DWARF is not supported; length 0 is padding
+
+            List<DwarfReaderHelpers.DwarfDIE>? dies;
+            try
             {
-                pos = cuEnd;
+                // Bounded by the unit's end, so a malformed unit cannot read into the next one.
+                dies = ReadUnitDies(infoData.AsSpan(0, cuEnd), cuStart, headerStart, abbrevTables,
+                    strData, lineStrData, strOffsetsData);
+            }
+            catch (DwarfFormatException ex) when (errors is not null)
+            {
+                errors.Add(ex);
                 continue;
             }
 
-            // Parse the CU DIE to extract DW_AT_str_offsets_base for DWARF 5 strx resolution
-            int strOffsetsBase = 0;
-            if (version >= 5 && diePos < cuEnd)
-            {
-                int peekPos = diePos;
-                uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(infoData, ref peekPos);
-                if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
-                    && cuEntry.Tag == DwTag.CompileUnit)
-                {
-                    foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
-                    {
-                        if (attrName == DwAt.StrOffsetsBase)
-                            strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(infoData, ref peekPos, attrForm, addrSize);
-                        else
-                            DwarfReaderHelpers.SkipFormValue(infoData, ref peekPos, attrForm, addrSize);
-                    }
-                }
-            }
-
-            var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
-            var dies = DwarfReaderHelpers.ParseDIEs(infoData, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
-            ExtractStructTypes(dies, results, namePattern, maxResults);
-
-            pos = cuEnd;
+            if (dies is not null)
+                ExtractStructTypes(dies, results, namePattern, maxResults);
         }
 
         return results;
+    }
+
+    private const string InfoSection = ".debug_info";
+
+    /// <summary>
+    /// Reads one unit's DIEs; null when the unit has an unsupported version or unknown
+    /// abbreviations. A fixed-size field past the unit's end is reported, not thrown as a
+    /// runtime exception.
+    /// </summary>
+    private static List<DwarfReaderHelpers.DwarfDIE>? ReadUnitDies(
+        ReadOnlySpan<byte> unit,
+        int cuStart,
+        int headerStart,
+        Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> abbrevTables,
+        byte[]? strData,
+        byte[]? lineStrData,
+        byte[]? strOffsetsData)
+    {
+        try
+        {
+            return ParseUnitDies(unit, cuStart, headerStart, abbrevTables, strData, lineStrData, strOffsetsData);
+        }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException)
+        {
+            throw new DwarfFormatException(InfoSection, cuStart,
+                $"a field of the unit at 0x{cuStart:X} runs past the end of the unit", ex);
+        }
+    }
+
+    private static List<DwarfReaderHelpers.DwarfDIE>? ParseUnitDies(
+        ReadOnlySpan<byte> unit,
+        int cuStart,
+        int headerStart,
+        Dictionary<int, Dictionary<uint, DwarfAbbrevEntry>> abbrevTables,
+        byte[]? strData,
+        byte[]? lineStrData,
+        byte[]? strOffsetsData)
+    {
+        int cuEnd = unit.Length;
+        if (cuEnd - headerStart < 2)
+            throw new DwarfFormatException(InfoSection, cuStart, $"the unit at 0x{cuStart:X} is too short to hold its version");
+        ushort version = DwarfReaderHelpers.ReadU16LE(unit, headerStart);
+        if (version < 2 || version > 5) return null;
+
+        int abbrevOffset;
+        byte addrSize;
+        int diePos = headerStart + (version >= 5 ? 8 : 7);
+        if (diePos > cuEnd)
+            throw new DwarfFormatException(InfoSection, cuStart, $"the header of the unit at 0x{cuStart:X} runs past its end");
+        if (version >= 5)
+        {
+            addrSize = unit[headerStart + 3];
+            abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(unit, headerStart + 4);
+        }
+        else
+        {
+            abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(unit, headerStart + 2);
+            addrSize = unit[headerStart + 6];
+        }
+
+        if (!abbrevTables.TryGetValue(abbrevOffset, out var abbrevTable))
+            return null;
+
+        // Parse the CU DIE to extract DW_AT_str_offsets_base for DWARF 5 strx resolution
+        int strOffsetsBase = 0;
+        if (version >= 5 && diePos < cuEnd)
+        {
+            int peekPos = diePos;
+            uint cuAbbrevCode = DwarfReaderHelpers.ReadULEB128(unit, ref peekPos);
+            if (cuAbbrevCode != 0 && abbrevTable.TryGetValue(cuAbbrevCode, out var cuEntry)
+                && cuEntry.Tag == DwTag.CompileUnit)
+            {
+                foreach (var (attrName, attrForm, implicitConst) in cuEntry.Attributes)
+                {
+                    if (attrName == DwAt.StrOffsetsBase)
+                        strOffsetsBase = (int)DwarfReaderHelpers.ReadUnsignedFormValue(unit, ref peekPos, attrForm, addrSize);
+                    else
+                        DwarfReaderHelpers.SkipFormValue(unit, ref peekPos, attrForm, addrSize);
+                }
+            }
+        }
+
+        var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase);
+        return DwarfReaderHelpers.ParseDIEs(unit, diePos, cuEnd, abbrevTable, addrSize, ctx, cuStart);
     }
 
     private static void ExtractStructTypes(

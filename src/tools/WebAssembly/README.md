@@ -14,9 +14,9 @@ is out of scope. Everything below is local and opt-in; defaults are unchanged.
 
 | Replaced | By | How to opt in |
 |----------|----|---------------|
-| `wasm-component-ld` (wasm-ld and component wrapping) for NativeAOT WASI apps | `wasm-link --component`, via clang `-fuse-ld` | `IlcUseManagedWasmLinker=true`, `IlcManagedWasmLinkerPath=<wasm-link.dll>` |
+| `wasm-component-ld` (wasm-ld and component wrapping) for NativeAOT WASI apps | `wasm-link --component`, via clang `-fuse-ld` | `IlcUseManagedWasmLinker=true`, `IlcManagedWasmLinkerPath=<wasm-link or wasm-link.dll>` |
 | `llvm-ar` for NativeAOT WASI `NativeLib=Static` | `wasm-link ar` | `IlcUseManagedWasmArchiver=true` (defaults to `IlcUseManagedWasmLinker`) |
-| `wasm-component-ld` for the WASI CoreCLR per-app host relink | `wasm-link --component`, with WIT text passed directly | `WasiUseManagedWasmLinker=true`, `WasiManagedWasmLinkerPath=<wasm-link.dll>` |
+| `wasm-component-ld` for the WASI CoreCLR per-app host relink | `wasm-link --component`, with WIT text passed directly | `WasiUseManagedWasmLinker=true`, `WasiManagedWasmLinkerPath=<wasm-link or wasm-link.dll>` |
 | `wasm-tools component unbundle`, `wasm-tools parse`/`validate` (shim), `wasm-merge` and the host replace step in WASI ReadyToRun composition | `ComponentCoreModules`, `WatCompiler`, `ModuleMerger`, in-process in `ComposeWasiReadyToRun` | `WasiR2RUseManagedTools=true` (needs MSBuild on .NET) |
 | wasm-ld for places that already run MSBuild tasks | the in-process `WasmLink` task (`src/tasks/WasmBuildTasks`) | use the task |
 | Hand-written wasm encoding in ILCompiler's and crossgen2's ObjectWriter | `Binary.Writing`: `WasmModuleWriter`, linking and relocation encoders, `DataSegmentEncoder`, `NameMapWriter`, `WasmCodeWriter`, `WasmModuleEntryWriter`, `WasmLeb128` | always on (not opt-in): −1,695/+571 lines in `src/coreclr/tools` |
@@ -38,10 +38,18 @@ is out of scope. Everything below is local and opt-in; defaults are unchanged.
   NativeAOT-published with no trim or AOT warnings.
 - ilc and crossgen2 wall time over the 24 objcmp compilations (single-threaded) went from 36.4 s to 37.3 s (+2.5%),
   averaged over two runs. Not profiled.
-- Linking NativeAOT UnitTests: wasm-ld (multi-threaded) takes 0.07 s and 131 MB RSS; `wasm-link` takes about 1.0 s
-  and 296 MB RSS, including about 0.02 s of process startup. `wasm-link` is not tuned for speed yet.
-- The WASI CoreCLR host from `WasiUseManagedWasmLinker` is 214 KB (0.6%) smaller. That was measured before nesm#583
-  demangled the `name` section and hasn't been re-measured.
+- Linking, median of five runs, wall time and peak RSS. Output is byte-identical to wasm-ld's in every case, as long as
+  the output file name is the same (wasm-ld 23 records it as the module name).
+
+  | Capture | wasm-ld (multi-threaded) | `wasm-link` NativeAOT | `wasm-link.dll` |
+  |---------|--------------------------|-----------------------|-----------------|
+  | NativeAOT UnitTests link (`artifacts/linkcap`, 3.9 MB output) | 0.07 s, 125 MB | 0.24 s, 259 MB | 0.81 s, 256 MB |
+  | WASI CoreCLR host core link (`artifacts/hostcap`, 36 MB output) | 0.22 s, 317 MB | 0.59 s, 810 MB | 1.66 s, 794 MB |
+
+  The NativeAOT build is about 3× faster than the dll. Turning off concurrent GC made it about 30% faster (0.34 s to
+  0.24 s on linkcap) but raised its peak RSS by about 30% (195 to 259 MB). `wasm-link` is single-threaded.
+- Since nesm#583 demangles the `name` section, the WASI CoreCLR host's core link is byte-identical to wasm-ld's (the
+  hostcap row above). The size of the wrapped component hasn't been re-measured.
 - With `WasiR2RUseManagedTools` the console sample keeps the host's DWARF (39.2 MB, against 36.2 MB by default), and
   its DWARF passes `llvm-dwarfdump --verify`; wasm-merge's output does not.
 
@@ -60,7 +68,7 @@ is out of scope. Everything below is local and opt-in; defaults are unchanged.
 - No component-level validation (#582).
 - No built-in WASI preview1 adapters. NativeAOT and CoreCLR `wasm32-wasip2` builds don't need them.
 - nesm still doesn't enforce two analyzer rules (CA1859, SA1136), so the project suppresses them (#571).
-- `wasm-link` is slower and uses more memory than wasm-ld (see above).
+- `wasm-link` is still slower than wasm-ld and uses more memory (see above).
 
 **Re-syncing:** run `sync-nesm.sh <fresh nesm clone> <commit>`, add any new tests to `nesm-test-files.txt`, run
 `sync-nesm.sh --update-patch <clone>`, then `./build.sh tools.wasmtoolchain -test`. For changes that affect
@@ -71,7 +79,7 @@ ObjectWriter output, rerun the objcmp comparison. Details are in [Re-syncing fro
 | Path | Contents |
 |------|----------|
 | `Microsoft.NET.WebAssembly.Toolchain/` | Library: binary reader/writer (`Binary`), module model (`Module`, `Types`), validator (`Validation`), static linker (`Linker`), WAT compiler/disassembler (`Wat`). |
-| `wasm-link/` | `wasm-link`, a wasm-ld compatible command-line front end. |
+| `wasm-link/` | `wasm-link`, a wasm-ld compatible command-line front end. `wasm-link_publish.csproj` also publishes it as a NativeAOT executable for the host (`artifacts/bin/wasm-link/<config>/aot/`) when `UseNativeAotForComponents` is set. |
 | `tests/Microsoft.NET.WebAssembly.Toolchain.Tests/` | Ported nesm toolchain tests, command-line/driver tests, `WasmLink` task tests and wasm-ld parity tests. |
 | `../../tasks/WasmBuildTasks/WasmLink.cs` | `WasmLink` MSBuild task that links in-proc using the same library. |
 
@@ -95,7 +103,8 @@ compare the managed linker's output with wasm-ld's. They are skipped when the wa
   (Blazor-Playground/nesm#571), so re-syncs don't need local fixes.
 * `runtime-local.patch` holds the remaining library edits. Today that is only the tool name recorded in the producers
   section.
-* `Linker/WasmComponentLdCommandLine.cs` (wasm-component-ld options) exists only here. `sync-nesm.sh` leaves files that aren't in `nesm-files.txt` alone.
+* `Linker/WasmComponentLdCommandLine.cs` (wasm-component-ld options) and the tests' `XunitV3Shims.cs` (nesm's tests use
+  xunit v3's `TestContext`) exist only here. `sync-nesm.sh` leaves files that aren't in `nesm-files.txt` alone.
 * The tests in `nesm-test-files.txt` come from nesm's `tests/Nesm.Tests`. `runtime-local-tests.patch` adapts them to
   run without nesm's interpreter: tests that executed modules assert structure instead (exports and signatures,
   identical function bodies after a round trip, validation), and tests that need the interpreter, the spec
@@ -140,9 +149,9 @@ Mono is out of scope. It is being removed.
 
 | Tool | Where | Status |
 |------|-------|--------|
-| `wasm-component-ld` (wasm-ld plus component wrapping), driven by `clang` | NativeAOT WASI (`src/coreclr/nativeaot/BuildIntegration/Microsoft.NETCore.Native.Wasm.targets`) | Opt in with `IlcUseManagedWasmLinker=true` (set `IlcManagedWasmLinkerPath` to `wasm-link.dll`). clang runs the managed linker through `-fuse-ld=<launcher>`, which links the core module and builds the component (`wasm-link --component`). All 14 NativeAOT WASI smoke tests pass. On the same objects the core module is identical to wasm-ld's; the component is valid, has an equivalent WIT world, and is about 5 KB smaller than wasm-component-ld's. |
+| `wasm-component-ld` (wasm-ld plus component wrapping), driven by `clang` | NativeAOT WASI (`src/coreclr/nativeaot/BuildIntegration/Microsoft.NETCore.Native.Wasm.targets`) | Opt in with `IlcUseManagedWasmLinker=true` (set `IlcManagedWasmLinkerPath` to `wasm-link` or `wasm-link.dll`; given the dll, the launcher prefers the NativeAOT build in `../aot/` and otherwise runs the dll with dotnet). clang runs the managed linker through `-fuse-ld=<launcher>`, which links the core module and builds the component (`wasm-link --component`). All 14 NativeAOT WASI smoke tests pass. On the same objects the core module is identical to wasm-ld's; the component is valid, has an equivalent WIT world, and is about 5 KB smaller than wasm-component-ld's. |
 | `llvm-ar` | NativeAOT WASI static libraries (`NativeLib=Static`, same targets) | Opt in with `IlcUseManagedWasmArchiver=true`, which defaults to `IlcUseManagedWasmLinker`. A launcher runs `wasm-link ar`. On a NativeAOT static library the archive, including its symbol table, is byte-identical to llvm-ar's. |
-| `wasm-component-ld`, driven by `clang++` | WASI CoreCLR per-app host relink (`src/mono/wasi/build/WasiApp.CoreCLR.targets`) | Opt in with `WasiUseManagedWasmLinker=true` and `WasiManagedWasmLinkerPath`. The console sample runs under wasmtime. Its core module is identical to wasm-ld's apart from the `name` and `producers` sections, the component has an equivalent WIT world, and the host is 214 KB (0.6%) smaller than the default build, mostly from the shorter, non-demangled `name` section. |
+| `wasm-component-ld`, driven by `clang++` | WASI CoreCLR per-app host relink (`src/mono/wasi/build/WasiApp.CoreCLR.targets`) | Opt in with `WasiUseManagedWasmLinker=true` and `WasiManagedWasmLinkerPath` (the same executable-or-dll resolution as above). The console sample runs under wasmtime with the NativeAOT `wasm-link`. Its core module is byte-identical to wasm-ld's, and the component has an equivalent WIT world. |
 | `wasm-tools parse`/`validate`, `wasm-merge`, `wasm-tools component unbundle`, optional `wasm-opt --simplify-globals` | WASI ReadyToRun composition (`src/tasks/WasmAppBuilder/ComposeWasiReadyToRun.cs`) | Opt in with `WasiR2RUseManagedTools=true`. Unbundling the host, compiling and validating the shim, merging and replacing the host module then run in-process; the task needs MSBuild on .NET. On the console sample the app runs under wasmtime, and the host module, the shim and the replace step are byte-identical to the native path. The merged module differs from wasm-merge's but keeps the host's DWARF (39.2 MB, against 36.2 MB for the default build). Its DWARF passes `llvm-dwarfdump --verify` and keeps 486,100 line-table rows. wasm-merge's keeps the line-table prologues but no rows, and fails verification with 10,411 range errors. The managed module also has 267 KB less code. Still native: `wasm-tools validate` of the final component, and `wasm-opt --simplify-globals` when `WasiR2ROptimizeComposite=true` (the managed replace step then takes wasm-opt's output). Without wasm-opt, a C# pass folds the constant globals. |
 | `emcc` link | Browser CoreCLR relink (`src/mono/browser/build/BrowserWasmApp.CoreCLR.targets`) | Also generates the JS glue, so wasm-ld can't be swapped out here. |
 | `wasm-opt -Oz`/`-O2` (opt-in) | Browser CoreCLR relink and ReadyToRun images | Optimizer; not a replacement target. |

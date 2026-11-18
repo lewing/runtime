@@ -559,6 +559,10 @@
   <ItemGroup Condition="$(_subset.Contains('+tools.wasmtoolchain+'))">
     <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\Microsoft.NET.WebAssembly.Toolchain\Microsoft.NET.WebAssembly.Toolchain.csproj" Category="tools" />
     <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\wasm-link\wasm-link.csproj" Category="tools" />
+    <!-- NativeAOT wasm-link for the host, which the WASI and NativeAOT launchers prefer over wasm-link.dll. -->
+    <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\wasm-link\wasm-link_publish.csproj"
+                    Condition="'$(UseNativeAotForComponents)' == 'true' and '$(DotNetBuildSourceOnly)' != 'true'"
+                    Category="tools" />
     <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\tests\Microsoft.NET.WebAssembly.Toolchain.Tests\Microsoft.NET.WebAssembly.Toolchain.Tests.csproj"
                     Condition="'$(DotNetBuildSourceOnly)' != 'true'"
                     Category="tools"

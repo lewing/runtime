@@ -161,7 +161,8 @@ internal sealed class ObjectFileLinker
     {
         public required int InputIndex { get; init; }
         public required string Name { get; init; }
-        public required WasmModule Module { get; init; }
+        public required WasmModule Module { get; set; }
+        public Func<WasmModule>? LoadModule { get; init; }
         public bool Loaded;
 
         public uint FuncImports, GlobalImports, TableImports, TagImports;
@@ -190,6 +191,9 @@ internal sealed class ObjectFileLinker
         public uint[][] PieceOutput = [];
 
         public Dictionary<uint, string> FunctionExportNames = [];
+
+        // Custom section names by file section index, for section symbols (built on first use).
+        public Dictionary<int, string>? SectionNames;
     }
 
     private sealed class OutSegment
@@ -233,7 +237,7 @@ internal sealed class ObjectFileLinker
             LinkerInput input = inputs[i];
             if (input.Module.LinkingSection is not { Version: 2 })
                 throw new LinkerException($"Input '{input.Name ?? $"#{i}"}' is not a relocatable object (no version 2 'linking' section).");
-            all.Add(new ObjFile { InputIndex = i, Name = input.Name ?? $"input #{i}", Module = input.Module });
+            all.Add(new ObjFile { InputIndex = i, Name = input.Name ?? $"input #{i}", Module = input.Module, LoadModule = input.LoadModule });
         }
 
         // As in wasm-ld, an archive member is extracted the moment a strong undefined reference meets its lazy
@@ -315,6 +319,13 @@ internal sealed class ObjectFileLinker
         if (file.Loaded)
             return;
         file.Loaded = true;
+        if (file.LoadModule is { } load)
+        {
+            WasmModule complete = load();
+            if (complete.LinkingSection is not { Version: 2 })
+                throw new LinkerException($"Input '{file.Name}' is not a relocatable object (no version 2 'linking' section).");
+            file.Module = complete;
+        }
 
         WasmModule m = file.Module;
         if (m.Memories.Count > 0 || m.Imports.Count(static i => i.Descriptor is ImportDescriptor.Memory) > 1)
@@ -339,7 +350,7 @@ internal sealed class ObjectFileLinker
 
         foreach (RelocationSection section in m.RelocationSections)
         {
-            Relocation[] sorted = [.. section.Entries.OrderBy(static r => r.Offset)];
+            Relocation[] sorted = SortedByOffset(section.Entries);
             switch (section.Name)
             {
                 case "reloc.CODE": file.CodeRelocs = sorted; break;
@@ -389,6 +400,18 @@ internal sealed class ObjectFileLinker
 
         // Appended after its symbols are processed, so members it extracts come first (post-order, as wasm-ld).
         _files.Add(file);
+    }
+
+    // Producers write relocations in offset order, so the stable sort is needed only when they did not.
+    private static Relocation[] SortedByOffset(List<Relocation> entries)
+    {
+        for (int i = 1; i < entries.Count; i++)
+        {
+            if (entries[i].Offset < entries[i - 1].Offset)
+                return [.. entries.OrderBy(static r => r.Offset)];
+        }
+
+        return [.. entries];
     }
 
     private Sym AddSymbol(ObjFile file, WasmSymbol raw)
@@ -1772,71 +1795,108 @@ internal sealed class ObjectFileLinker
     /// </summary>
     private static List<(uint[] Inputs, uint[] Outputs)> MergeStringPieces(List<(byte[] Data, string Owner)> inputs, out byte[] bytes)
     {
-        var distinct = new Dictionary<string, uint>(StringComparer.Ordinal);
+        // Pieces are byte ranges of the inputs, compared by content; each distinct piece gets an id, and every
+        // piece of every input remembers its id, so nothing is hashed twice and no piece is copied.
+        var comparer = new PieceComparer(inputs);
+        var distinct = new Dictionary<Piece, int>(comparer);
+        var unique = new List<Piece>();
         var starts = new List<uint[]>(inputs.Count);
-        foreach ((byte[] data, string owner) in inputs)
+        var ids = new List<int[]>(inputs.Count);
+        var pieceStarts = new List<uint>();
+        var pieceIds = new List<int>();
+        for (int i = 0; i < inputs.Count; i++)
         {
-            var pieceStarts = new List<uint>();
+            (byte[] data, string owner) = inputs[i];
+            pieceStarts.Clear();
+            pieceIds.Clear();
             for (int start = 0; start < data.Length;)
             {
                 int end = Array.IndexOf(data, (byte)0, start);
                 if (end < 0)
                     throw new LinkerException($"{owner}: string is not null terminated.");
+                var piece = new Piece(i, start, end + 1 - start);
+                if (!distinct.TryGetValue(piece, out int id))
+                {
+                    id = unique.Count;
+                    distinct.Add(piece, id);
+                    unique.Add(piece);
+                }
+
                 pieceStarts.Add((uint)start);
-                distinct.TryAdd(Latin1(data.AsSpan(start, end + 1 - start)), 0);
+                pieceIds.Add(id);
                 start = end + 1;
             }
+
             starts.Add([.. pieceStarts]);
+            ids.Add([.. pieceIds]);
         }
 
-        // Latin-1 maps bytes to chars one-to-one, so ordinal string comparison is byte comparison.
-        string[] strings = [.. distinct.Keys];
-        Array.Sort(strings, static (a, b) =>
+        // Sorted by reversed bytes, descending, so a string directly follows any string it is a suffix of.
+        int[] order = new int[unique.Count];
+        for (int i = 0; i < order.Length; i++)
+            order[i] = i;
+        Array.Sort(order, (x, y) => comparer.CompareReversed(unique[y], unique[x]));
+
+        var offsets = new uint[unique.Count];
+        var content = new MemoryStream();
+        ReadOnlySpan<byte> previous = default;
+        foreach (int id in order)
         {
+            ReadOnlySpan<byte> piece = comparer.Bytes(unique[id]);
+            if (previous.EndsWith(piece))
+            {
+                offsets[id] = (uint)(content.Length - piece.Length);
+                continue;
+            }
+
+            offsets[id] = (uint)content.Length;
+            content.Write(piece);
+            previous = piece;
+        }
+
+        bytes = content.ToArray();
+        var result = new List<(uint[] Inputs, uint[] Outputs)>(inputs.Count);
+        for (int i = 0; i < inputs.Count; i++)
+        {
+            int[] pieceIdsOfInput = ids[i];
+            var outputs = new uint[pieceIdsOfInput.Length];
+            for (int p = 0; p < outputs.Length; p++)
+                outputs[p] = offsets[pieceIdsOfInput[p]];
+            result.Add((starts[i], outputs));
+        }
+
+        return result;
+    }
+
+    private readonly record struct Piece(int Input, int Start, int Length);
+
+    private sealed class PieceComparer(List<(byte[] Data, string Owner)> inputs) : IEqualityComparer<Piece>
+    {
+        public ReadOnlySpan<byte> Bytes(Piece piece) => inputs[piece.Input].Data.AsSpan(piece.Start, piece.Length);
+
+        public bool Equals(Piece x, Piece y) => Bytes(x).SequenceEqual(Bytes(y));
+
+        public int GetHashCode(Piece piece)
+        {
+            HashCode hash = default;
+            hash.AddBytes(Bytes(piece));
+            return hash.ToHashCode();
+        }
+
+        // Compares the bytes from the end, a string that runs out first being smaller.
+        public int CompareReversed(Piece x, Piece y)
+        {
+            ReadOnlySpan<byte> a = Bytes(x), b = Bytes(y);
             for (int k = 0; ; k++)
             {
                 int ca = k < a.Length ? a[a.Length - 1 - k] : -1;
                 int cb = k < b.Length ? b[b.Length - 1 - k] : -1;
                 if (ca != cb)
-                    return cb.CompareTo(ca);
+                    return ca.CompareTo(cb);
                 if (ca == -1)
                     return 0;
             }
-        });
-
-        var content = new System.Text.StringBuilder();
-        string previous = "";
-        foreach (string str in strings)
-        {
-            if (previous.EndsWith(str, StringComparison.Ordinal))
-            {
-                distinct[str] = (uint)(content.Length - str.Length);
-                continue;
-            }
-            distinct[str] = (uint)content.Length;
-            content.Append(str);
-            previous = str;
         }
-        bytes = System.Text.Encoding.Latin1.GetBytes(content.ToString());
-
-        var result = new List<(uint[] Inputs, uint[] Outputs)>(inputs.Count);
-        for (int i = 0; i < inputs.Count; i++)
-        {
-            byte[] data = inputs[i].Data;
-            uint[] pieceStarts = starts[i];
-            var outputs = new uint[pieceStarts.Length];
-            for (int p = 0; p < pieceStarts.Length; p++)
-            {
-                int start = (int)pieceStarts[p];
-                int end = Array.IndexOf(data, (byte)0, start);
-                outputs[p] = distinct[Latin1(data.AsSpan(start, end + 1 - start))];
-            }
-            result.Add((pieceStarts, outputs));
-        }
-
-        return result;
-
-        static string Latin1(ReadOnlySpan<byte> bytes) => System.Text.Encoding.Latin1.GetString(bytes);
     }
 
     /// <summary>The output offset of <paramref name="offset"/> within a merged input, through its piece map.</summary>
@@ -1977,12 +2037,12 @@ internal sealed class ObjectFileLinker
             return [];
 
         // Function code offsets as DWARF sees them: the locals vector of each body in the output code section.
-        IReadOnlyList<SectionMerger.EncodedFunctionBody> encoded = SectionMerger.EncodeFunctionBodies(functions, null);
-        var codeOffsets = new uint[encoded.Count];
-        uint offset = (uint)WasmLeb128.GetULeb128Size((uint)encoded.Count);
-        for (int i = 0; i < encoded.Count; i++)
+        uint[] sizes = SectionMerger.GetEncodedFunctionBodySizes(functions, null);
+        var codeOffsets = new uint[sizes.Length];
+        uint offset = (uint)WasmLeb128.GetULeb128Size((uint)sizes.Length);
+        for (int i = 0; i < sizes.Length; i++)
         {
-            uint length = (uint)encoded[i].Bytes.Length;
+            uint length = sizes[i];
             codeOffsets[i] = offset + (uint)WasmLeb128.GetULeb128Size(length);
             offset += (uint)WasmLeb128.GetULeb128Size(length) + length;
         }
@@ -2084,8 +2144,17 @@ internal sealed class ObjectFileLinker
     // wasm-ld merges these by name (lld/wasm/InputFiles.cpp shouldMerge), as long as -O is not 0.
     private static bool IsMergedStringSection(string name) => name is ".debug_str" or ".debug_str.dwo" or ".debug_line_str";
 
-    private static string? FindSectionName(ObjFile file, uint sectionIndex) =>
-        file.Module.CustomSections.FirstOrDefault(c => c.SectionIndex == (int)sectionIndex)?.Name;
+    private static string? FindSectionName(ObjFile file, uint sectionIndex)
+    {
+        if (file.SectionNames is null)
+        {
+            file.SectionNames = [];
+            foreach (CustomSection section in file.Module.CustomSections)
+                file.SectionNames.TryAdd(section.SectionIndex, section.Name);
+        }
+
+        return file.SectionNames.GetValueOrDefault((int)sectionIndex);
+    }
 
     /// <summary>The value wasm-ld writes for a debug reference to discarded code or data.</summary>
     private static ulong Tombstone(string section, RelocationType type)

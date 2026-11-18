@@ -113,10 +113,12 @@ public static class DwarfVariableReader
 
             int cuStart = pos;
             uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen == 0xFFFFFFFF) break; // 64-bit DWARF not supported
+            if (unitLen >= DwarfUnitLength.ReservedMin) break; // 64-bit DWARF and reserved lengths are not supported
 
-            int cuEnd = pos + 4 + (int)unitLen;
-            if (cuEnd > infoData.Length || cuEnd < pos + 6) break;
+            // In 64 bits, so a large length cannot wrap the end back before the unit.
+            long cuEndLong = (long)pos + 4 + unitLen;
+            if (cuEndLong > infoData.Length || cuEndLong < pos + 6) break;
+            int cuEnd = (int)cuEndLong;
 
             ushort version = DwarfReaderHelpers.ReadU16LE(infoData, pos + 4);
             if (version < 2 || version > 5) { pos = cuEnd; continue; }
@@ -471,10 +473,12 @@ public static class DwarfVariableReader
 
             int cuStart = pos;
             uint unitLen = DwarfReaderHelpers.ReadU32LE(infoData, pos);
-            if (unitLen == 0xFFFFFFFF) break;
+            if (unitLen >= DwarfUnitLength.ReservedMin) break; // 64-bit DWARF and reserved lengths are not supported
 
-            int cuEnd = pos + 4 + (int)unitLen;
-            if (cuEnd > infoData.Length || cuEnd < pos + 6) break;
+            // In 64 bits, so a large length cannot wrap the end back before the unit.
+            long cuEndLong = (long)pos + 4 + unitLen;
+            if (cuEndLong > infoData.Length || cuEndLong < pos + 6) break;
+            int cuEnd = (int)cuEndLong;
 
             ushort version = DwarfReaderHelpers.ReadU16LE(infoData, pos + 4);
             if (version < 2 || version > 5) { pos = cuEnd; continue; }

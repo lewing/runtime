@@ -1,4 +1,5 @@
 Binary/CodeReemitter.cs
+Binary/DwarfLineReaderTests.cs
 Binary/DwarfLineWriterTests.cs
 Binary/DwarfTypeReaderTests.cs
 Binary/DwarfVariableReaderTests.cs

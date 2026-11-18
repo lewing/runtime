@@ -230,10 +230,18 @@
       <_WasiComponentLd Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiComponentLd).exe</_WasiComponentLd>
       <!-- Experimental: link and build the component with the managed linker (src/tools/WebAssembly/wasm-link)
            instead of wasm-component-ld. clang++ runs the linker through an executable path, so a generated
-           launcher runs wasm-link.dll in wasm-component-ld mode. -->
+           launcher runs wasm-link in wasm-component-ld mode. WasiManagedWasmLinkerPath can name the NativeAOT wasm-link
+           executable or wasm-link.dll; given the dll, the launcher prefers a NativeAOT build of the same configuration
+           (../aot/wasm-link) and otherwise runs the dll with dotnet. -->
       <WasiUseManagedWasmLinker Condition="'$(WasiUseManagedWasmLinker)' == ''">false</WasiUseManagedWasmLinker>
       <_WasiDotNetHostPath>$(DOTNET_HOST_PATH)</_WasiDotNetHostPath>
       <_WasiDotNetHostPath Condition="'$(_WasiDotNetHostPath)' == ''">dotnet</_WasiDotNetHostPath>
+      <_WasiManagedWasmLinkerExeSuffix Condition="$([MSBuild]::IsOSPlatform('Windows'))">.exe</_WasiManagedWasmLinkerExeSuffix>
+      <_WasiManagedWasmLinkerIsDll>$(WasiManagedWasmLinkerPath.EndsWith('.dll', System.StringComparison.OrdinalIgnoreCase))</_WasiManagedWasmLinkerIsDll>
+      <_WasiManagedWasmLinkerAot Condition="'$(_WasiManagedWasmLinkerIsDll)' == 'true'">$([System.IO.Path]::GetFullPath('$([System.IO.Path]::GetDirectoryName('$(WasiManagedWasmLinkerPath)'))/../aot/wasm-link$(_WasiManagedWasmLinkerExeSuffix)'))</_WasiManagedWasmLinkerAot>
+      <_WasiManagedWasmLinkerCommand Condition="'$(_WasiManagedWasmLinkerIsDll)' != 'true'">&quot;$(WasiManagedWasmLinkerPath)&quot;</_WasiManagedWasmLinkerCommand>
+      <_WasiManagedWasmLinkerCommand Condition="'$(_WasiManagedWasmLinkerIsDll)' == 'true' and Exists('$(_WasiManagedWasmLinkerAot)')">&quot;$(_WasiManagedWasmLinkerAot)&quot;</_WasiManagedWasmLinkerCommand>
+      <_WasiManagedWasmLinkerCommand Condition="'$(_WasiManagedWasmLinkerCommand)' == ''">&quot;$(_WasiDotNetHostPath)&quot; &quot;$(WasiManagedWasmLinkerPath)&quot;</_WasiManagedWasmLinkerCommand>
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.sh</_WasiComponentLd>
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.cmd</_WasiComponentLd>
       <_WasiSysroot>$(WASI_SDK_PATH)share/wasi-sysroot</_WasiSysroot>
@@ -266,16 +274,16 @@
     <MakeDir Directories="$(_WasiRelinkObjDir)" />
 
     <Error Condition="'$(WasiUseManagedWasmLinker)' == 'true' and ('$(WasiManagedWasmLinkerPath)' == '' or !Exists('$(WasiManagedWasmLinkerPath)'))"
-           Text="WasiUseManagedWasmLinker=true requires WasiManagedWasmLinkerPath to point at wasm-link.dll (got '$(WasiManagedWasmLinkerPath)')." />
+           Text="WasiUseManagedWasmLinker=true requires WasiManagedWasmLinkerPath to point at wasm-link or wasm-link.dll (got '$(WasiManagedWasmLinkerPath)')." />
     <WriteLinesToFile Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_WasiComponentLd)"
-                      Lines="#!/bin/sh;exec &quot;$(_WasiDotNetHostPath)&quot; &quot;$(WasiManagedWasmLinkerPath)&quot; --component &quot;%24@&quot;"
+                      Lines="#!/bin/sh;exec $(_WasiManagedWasmLinkerCommand) --component &quot;%24@&quot;"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
     <Exec Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))" Command="chmod +x &quot;$(_WasiComponentLd)&quot;" />
     <WriteLinesToFile Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))"
                       File="$(_WasiComponentLd)"
-                      Lines="@&quot;$(_WasiDotNetHostPath)&quot; &quot;$(WasiManagedWasmLinkerPath)&quot; --component %25*"
+                      Lines="@$(_WasiManagedWasmLinkerCommand) --component %25*"
                       Overwrite="true"
                       WriteOnlyWhenDifferent="true" />
 

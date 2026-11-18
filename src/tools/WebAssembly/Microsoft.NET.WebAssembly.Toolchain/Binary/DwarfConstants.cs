@@ -216,3 +216,13 @@ internal static class DwLnct
     public const uint Path = 1;
     public const uint DirectoryIndex = 2;
 }
+
+/// <summary>Special values of a unit's initial length field (DWARF 5 §7.4).</summary>
+internal static class DwarfUnitLength
+{
+    /// <summary>The escape that introduces a 64-bit DWARF unit: an 8-byte length follows.</summary>
+    public const uint Dwarf64Escape = 0xFFFF_FFFF;
+
+    /// <summary>The first of the reserved values (<c>0xfffffff0</c>–<c>0xfffffffe</c>).</summary>
+    public const uint ReservedMin = 0xFFFF_FFF0;
+}

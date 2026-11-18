@@ -20,6 +20,12 @@ public static partial class ModuleReader
     private static readonly byte[] Magic = [0x00, 0x61, 0x73, 0x6D];
     private static readonly byte[] Version = [0x01, 0x00, 0x00, 0x00];
 
+    /// <summary>
+    /// Implementation limit on a function's locals, parameters included, as in V8 and wasmtime. The spec only bounds
+    /// the total by 2^32-1, which a 30-byte body can declare; expanding that many would exhaust memory.
+    /// </summary>
+    internal const int MaxFunctionLocals = 50_000;
+
     // Required section ordering (per spec §5.5.2).  Custom sections (id=0) may appear
     // anywhere.  Section 12 (data count) must appear between element (9) and code (10).
     // Map: section_id → required position in the ordered sequence.
@@ -388,11 +394,30 @@ public static partial class ModuleReader
         var debugLine    = module.CustomSections.FirstOrDefault(s => s.Name == ".debug_line");
         var debugLineStr = module.CustomSections.FirstOrDefault(s => s.Name == ".debug_line_str");
         var debugStr     = module.CustomSections.FirstOrDefault(s => s.Name == ".debug_str");
-        if (debugLine is not null)
-            module.DebugInfo = DwarfLineReader.Parse(
-                debugLine.Content,
-                debugLineStr?.Content,
-                debugStr?.Content);
+        if (debugLine is null)
+            return;
+
+        // DWARF is custom-section metadata: malformed debug info never rejects the module. The
+        // reader recovers per unit, so the good units are kept and each bad one is reported like
+        // other recognized metadata (strict mode throws instead).
+        var result = DwarfLineReader.ParseUnits(
+            debugLine.Content,
+            debugLineStr?.Content,
+            debugStr?.Content);
+        if (result.Errors.Count != 0)
+        {
+            var diagnostics = new List<WasmMetadataDiagnostic>(module.MetadataDiagnostics.Count + result.Errors.Count);
+            diagnostics.AddRange(module.MetadataDiagnostics);
+            foreach (var error in result.Errors)
+            {
+                var diagnostic = new WasmMetadataDiagnostic(error.Section, WasmMetadataErrorKind.Malformed, error.Detail);
+                if (options.MetadataValidation == WasmMetadataValidationMode.Strict)
+                    throw new WasmMetadataException(diagnostic, error);
+                diagnostics.Add(diagnostic);
+            }
+            module.MetadataDiagnostics = diagnostics;
+        }
+        module.DebugInfo = result.Programs;
     }
 
     private static void ValidateSectionOrder(byte sectionId, ref int lastSectionPosition)
@@ -668,8 +693,8 @@ public static partial class ModuleReader
             if (tag == 0x4E) // rec group — wraps multiple sub/composite types
             {
                 reader.ReadByte(); // consume 0x4E
-                uint count = reader.ReadU32Leb128();
-                var group = new RecGroupIdentity(recGroupIndex++, types.Count, checked((int)count));
+                uint count = reader.ReadVectorCount();
+                var group = new RecGroupIdentity(recGroupIndex++, types.Count, ToInt32(count, "Rec group size"));
                 for (uint i = 0; i < count; i++)
                     AddType(types, typeDefinitions, ReadSubtypeOrComposite(reader, types, group));
             }
@@ -711,10 +736,10 @@ public static partial class ModuleReader
         if (tag is 0x50 or 0x4F)
         {
             isFinal = tag == 0x4F;
-            uint supertypeCount = reader.ReadU32Leb128();
+            uint supertypeCount = reader.ReadVectorCount();
             supertypes = new int[supertypeCount];
             for (uint i = 0; i < supertypeCount; i++)
-                supertypes[i] = checked((int)reader.ReadU32Leb128());
+                supertypes[i] = ToInt32(reader.ReadU32Leb128(), "Supertype index");
             subtypePrefix = $"sub[{(isFinal ? "final" : "open")}:{string.Join(",", supertypes)}]:";
             tag = reader.ReadByte(); // inner composite type tag
         }
@@ -750,17 +775,17 @@ public static partial class ModuleReader
 
     private static TypeParseResult ReadContType(WasmBinaryReader reader, List<FuncType> existingTypes)
     {
-        int funcTypeIndex = checked((int)reader.ReadU32Leb128());
+        uint funcTypeIndex = reader.ReadU32Leb128();
         if (funcTypeIndex >= (uint)existingTypes.Count)
             throw new WasmFormatException($"Continuation type refers to invalid function type index {funcTypeIndex}");
         return new TypeParseResult(
-            existingTypes[funcTypeIndex],
-            new CompositeType.Continuation(funcTypeIndex));
+            existingTypes[(int)funcTypeIndex],
+            new CompositeType.Continuation((int)funcTypeIndex));
     }
 
     private static TypeParseResult ReadStructType(WasmBinaryReader reader)
     {
-        uint fieldCount = reader.ReadU32Leb128();
+        uint fieldCount = reader.ReadVectorCount(minElementSize: 2); // storage type + mutability
         var fields = new FieldType[fieldCount];
         for (uint i = 0; i < fieldCount; i++)
             fields[i] = ReadFieldType(reader);
@@ -854,7 +879,7 @@ public static partial class ModuleReader
         var nullability = refByte == 0x63 ? Nullability.Nullable : Nullability.NonNullable;
         if (heapType >= 0)
         {
-            return ValInfo(new Microsoft.NET.WebAssembly.Types.ValueType.Reference(nullability, new DefinedHeapType(checked((int)heapType))));
+            return ValInfo(new Microsoft.NET.WebAssembly.Types.ValueType.Reference(nullability, new DefinedHeapType(ToInt32((uint)heapType, "Heap type index"))));
         }
 
         byte code = (byte)(heapType & 0x7F);
@@ -1228,13 +1253,14 @@ public static partial class ModuleReader
     {
         long bodyStart = reader.Position;
 
+        // Each declaration is at least a count byte and a type byte.
         var localDecls = reader.ReadVector(() =>
         {
             uint count = reader.ReadU32Leb128();
             var exactType = ReadExactValType(reader);
             var type = exactType.ToStorageValType();
             return (count, type, exactType);
-        });
+        }, minElementSize: 2);
 
         ulong totalLocals = 0;
         foreach (var (count, _, _) in localDecls)
@@ -1244,8 +1270,18 @@ public static partial class ModuleReader
                 throw new WasmFormatException("Too many locals: total count exceeds 2^32-1");
         }
 
-        var locals = new List<ValType>();
-        var exactLocals = new List<Microsoft.NET.WebAssembly.Types.ValueType>();
+        // Checked before the locals are expanded: one 30-byte declaration can name 2^32-1 of them.
+        int parameterCount = (uint)function.TypeIndex < (uint)decodeModule.Types.Count
+            ? decodeModule.Types[function.TypeIndex].Parameters.Length
+            : 0;
+        if (totalLocals + (ulong)parameterCount > MaxFunctionLocals)
+        {
+            throw new WasmFormatException(
+                $"Too many locals: {parameterCount} parameter(s) and {totalLocals} declared local(s) exceed the implementation limit of {MaxFunctionLocals}");
+        }
+
+        var locals = new List<ValType>((int)totalLocals);
+        var exactLocals = new List<Microsoft.NET.WebAssembly.Types.ValueType>((int)totalLocals);
         foreach (var (count, type, exactType) in localDecls)
         {
             for (uint i = 0; i < count; i++)
@@ -1259,7 +1295,10 @@ public static partial class ModuleReader
         if (remaining < 0)
             throw new WasmFormatException("Code entry body size underflow");
 
-        byte[] body = reader.ReadBytes(checked((int)remaining));
+        if (remaining > int.MaxValue)
+            throw new WasmFormatException($"Function body payload is too large ({bodySize} bytes)");
+
+        byte[] body = reader.ReadBytes((int)remaining);
         function.Locals = locals;
         function.ExactLocals = exactLocals;
         function.Body = body;
@@ -1289,7 +1328,7 @@ public static partial class ModuleReader
             };
             int memoryIndex = flag switch { 0 => 0, 1 => -1, _ => (int)reader.ReadU32Leb128() };
             byte[] offsetExpr = isPassive ? [] : ReadInitExpr(reader);
-            int length = (int)reader.ReadU32Leb128();
+            int length = ToInt32(reader.ReadU32Leb128(), "Data segment length");
             uint payloadOffset = checked((uint)(reader.Position - payloadBase));
             dataSegments.Add(new Data
             {
@@ -1314,12 +1353,13 @@ public static partial class ModuleReader
     {
         long nameStart = reader.Position;
         string name = reader.ReadName();
-        int nameBytes = checked((int)(reader.Position - nameStart));
-        int contentLength = checked((int)sectionSize - nameBytes);
+        long contentLength = sectionSize - (reader.Position - nameStart);
         if (contentLength < 0)
             throw new WasmFormatException($"Custom section '{name}' has an invalid payload length.");
+        if (contentLength > int.MaxValue)
+            throw new WasmFormatException($"Custom section '{name}' payload is too large ({contentLength} bytes)");
 
-        byte[] content = contentLength > 0 ? reader.ReadBytes(contentLength) : [];
+        byte[] content = contentLength > 0 ? reader.ReadBytes((int)contentLength) : [];
         customSections.Add(new CustomSection(name, content)
         {
             AppearedAfterCode = appearedAfterCode,
@@ -1384,8 +1424,9 @@ public static partial class ModuleReader
     {
         using var stream = new MemoryStream(content, writable: false);
         var reader = new WasmBinaryReader(stream);
-        uint count = reader.ReadU32Leb128();
-        var features = new List<(char Prefix, string Name)>(checked((int)count));
+        // Each entry is at least a prefix byte and a name length.
+        uint count = reader.ReadVectorCount(minElementSize: 2);
+        var features = new List<(char Prefix, string Name)>((int)count);
 
         for (uint i = 0; i < count; i++)
         {
@@ -1404,12 +1445,12 @@ public static partial class ModuleReader
         };
     }
 
-    private static LinkingSection ParseLinkingSection(byte[] content)
+    // Subsections are read in place: neither the section nor its subsections are copied.
+    private static LinkingSection ParseLinkingSection(ReadOnlyMemory<byte> content)
     {
-        using var stream = new MemoryStream(content, writable: false);
-        var reader = new WasmBinaryReader(stream);
-
-        uint version = reader.ReadU32Leb128();
+        ReadOnlySpan<byte> span = content.Span;
+        int position = 0;
+        uint version = WasmLeb128.ReadU32(span, ref position);
         if (version != LinkingSection.CurrentVersion)
             throw new WasmFormatException($"Unsupported linking section version: {version}");
 
@@ -1418,14 +1459,14 @@ public static partial class ModuleReader
         var initFunctions = new List<InitFunction>();
         var comdatGroups = new List<ComdatGroup>();
 
-        while (reader.HasMore)
+        while (position < span.Length)
         {
-            byte subsectionType = reader.ReadByte();
-            uint payloadLength = reader.ReadU32Leb128();
-            byte[] payload = reader.ReadBytes(checked((int)payloadLength));
-
-            using var payloadStream = new MemoryStream(payload, writable: false);
-            var payloadReader = new WasmBinaryReader(payloadStream);
+            byte subsectionType = span[position++];
+            uint payloadLength = WasmLeb128.ReadU32(span, ref position);
+            if ((ulong)position + payloadLength > (ulong)span.Length)
+                throw new WasmFormatException($"Linking subsection {subsectionType} extends past the end of the linking section.");
+            WasmBinaryReader payloadReader = ReaderOver(content.Slice(position, (int)payloadLength));
+            position += (int)payloadLength;
 
             switch (subsectionType)
             {
@@ -1535,7 +1576,7 @@ public static partial class ModuleReader
                     {
                         Type = type,
                         Flags = flags,
-                        Index = checked((int)index),
+                        Index = ToInt32(index, "Symbol index"),
                         Name = SymbolHasInlineName(flags) ? reader.ReadName() : null,
                     });
                     break;
@@ -1582,19 +1623,24 @@ public static partial class ModuleReader
 
     private static RelocationSection ParseRelocationSection(string name, byte[] content)
     {
-        using var stream = new MemoryStream(content, writable: false);
-        var reader = new WasmBinaryReader(stream);
-
-        uint targetSectionIndex = reader.ReadU32Leb128();
-        var entries = new List<Relocation>();
-        foreach (var _ in reader.ReadVectorHeader())
+        // Decoded from the span: relocation sections hold a large share of an object's entries, and the
+        // stream reader's per-byte reads dominated linking.
+        ReadOnlySpan<byte> span = content;
+        int position = 0;
+        uint targetSectionIndex = WasmLeb128.ReadU32(span, ref position);
+        uint count = WasmLeb128.ReadU32(span, ref position);
+        // Each entry is at least three bytes, which bounds the capacity a malformed count can request.
+        var entries = new List<Relocation>((int)Math.Min(count, (uint)(span.Length - position) / 3));
+        for (uint i = 0; i < count; i++)
         {
-            RelocationType type = (RelocationType)reader.ReadByte();
-            uint offset = reader.ReadU32Leb128();
-            uint index = reader.ReadU32Leb128();
+            if (position >= span.Length)
+                throw new WasmFormatException($"Unexpected end of relocation section '{name}'.");
+            RelocationType type = (RelocationType)span[position++];
+            uint offset = WasmLeb128.ReadU32(span, ref position);
+            uint index = WasmLeb128.ReadU32(span, ref position);
             // LLVM writes every addend as an SLEB128 of int64; wasm32 addends fit in 32 bits.
             int addend = RelocationTypes.HasAddend(type)
-                ? checked((int)reader.ReadS64Leb128())
+                ? ToAddend(WasmLeb128.ReadS64(span, ref position))
                 : 0;
 
             entries.Add(new Relocation
@@ -1606,7 +1652,8 @@ public static partial class ModuleReader
             });
         }
 
-        ValidateReaderConsumed(reader, $"relocation section '{name}'");
+        if (position != span.Length)
+            throw new WasmFormatException($"Unexpected trailing bytes in relocation section '{name}'.");
 
         return new RelocationSection
         {
@@ -1618,6 +1665,15 @@ public static partial class ModuleReader
 
     private static bool SymbolHasInlineName(SymbolFlags flags)
         => !flags.HasFlag(SymbolFlags.Undefined) || flags.HasFlag(SymbolFlags.ExplicitName);
+
+    private static int ToAddend(long addend)
+        => addend is >= int.MinValue and <= int.MaxValue
+            ? (int)addend
+            : throw new WasmFormatException($"Relocation addend {addend} does not fit in 32 bits");
+
+    /// <summary>Converts a decoded length, count or index to <see cref="int"/>, rejecting one that does not fit.</summary>
+    private static int ToInt32(ulong value, string what)
+        => value <= int.MaxValue ? (int)value : throw new WasmFormatException($"{what} {value} is too large");
 
     private static void ValidateReaderConsumed(WasmBinaryReader reader, string context)
     {

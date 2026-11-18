@@ -4,6 +4,7 @@ Binary/BoundedStream.cs
 Binary/BranchHintMetadataReader.cs
 Binary/ComponentEncoding.cs
 Binary/DwarfConstants.cs
+Binary/DwarfFormatException.cs
 Binary/DwarfLineReader.cs
 Binary/DwarfLineWriter.cs
 Binary/DwarfReaderHelpers.cs
@@ -18,6 +19,7 @@ Binary/Linking/RelocationSection.cs
 Binary/Linking/RelocationTypes.cs
 Binary/Linking/WasmSymbol.cs
 Binary/ModuleEncoding.cs
+Binary/ModuleReader.LinkingView.cs
 Binary/ModuleReader.cs
 Binary/ModuleReaderOptions.cs
 Binary/NameSubsectionId.cs
