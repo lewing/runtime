@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 
 namespace Microsoft.NET.WebAssembly.Binary;
@@ -105,26 +106,17 @@ public sealed record ExternalDebugInfo(string Path, byte[]? BuildId)
         return true;
     }
 
-    private static bool TryReadU32Leb(byte[] buf, out int value, out int bytesRead)
+    private static bool TryReadU32Leb(ReadOnlySpan<byte> buf, out int value, out int bytesRead)
     {
+        // A length we can index with: a valid u32 that also fits an int.
+        if (WasmLeb128.DecodeU32(buf, out uint result, out bytesRead) == Leb128Status.Ok && result <= int.MaxValue)
+        {
+            value = (int)result;
+            return true;
+        }
+
         value = 0;
         bytesRead = 0;
-        ulong result = 0;
-        int shift = 0;
-        for (int i = 0; i < buf.Length && i < 5; i++)
-        {
-            byte b = buf[i];
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                if (result > int.MaxValue)
-                    return false; // not a u32 length we can index with
-                value = (int)result;
-                bytesRead = i + 1;
-                return true;
-            }
-            shift += 7;
-        }
         return false;
     }
 }

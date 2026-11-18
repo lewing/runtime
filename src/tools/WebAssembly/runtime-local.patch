@@ -1,7 +1,7 @@
 diff -ruN a/Linker/SectionMerger.cs b/Linker/SectionMerger.cs
 --- a/Linker/SectionMerger.cs
 +++ b/Linker/SectionMerger.cs
-@@ -19,7 +19,7 @@
+@@ -20,7 +20,7 @@
  public sealed class SectionMerger
  {
      /// <summary>Tool name recorded in the <c>processed-by</c> field of the producers section.</summary>

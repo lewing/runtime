@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Validation;
 
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using ExactValueType = Microsoft.NET.WebAssembly.Types.ValueType;
@@ -132,15 +133,15 @@ internal static class FunctionBodyValidator
             InstructionOpcodeBucket.Primary => PrimaryRuleOpcodes()
                 .Concat(NumericRules.Keys.Select(op => new OpcodeId(op)))
                 .OrderBy(id => id.Opcode).ThenBy(id => id.SubOpcode).ToArray(),
-            InstructionOpcodeBucket.Fc => FcSignatureRules.Keys.Select(sub => new OpcodeId(0xFC, sub))
-                .Concat(Enumerable.Range(8, 10).Select(sub => new OpcodeId(0xFC, (uint)sub)))
+            InstructionOpcodeBucket.Fc => FcSignatureRules.Keys.Select(sub => new OpcodeId(WasmOpcode.MiscPrefix, sub))
+                .Concat(Enumerable.Range(8, 10).Select(sub => new OpcodeId(WasmOpcode.MiscPrefix, (uint)sub)))
                 .OrderBy(id => id.SubOpcode).ToArray(),
-            InstructionOpcodeBucket.FbGc => GcRuleOpcodes.Select(sub => new OpcodeId(0xFB, sub))
+            InstructionOpcodeBucket.FbGc => GcRuleOpcodes.Select(sub => new OpcodeId(WasmOpcode.GcPrefix, sub))
                 .OrderBy(id => id.SubOpcode).ToArray(),
-            InstructionOpcodeBucket.FdSimd => SimdSignatureRules.Keys.Select(sub => new OpcodeId(0xFD, sub))
-                .Concat(SimdMemoryRules.Select(sub => new OpcodeId(0xFD, sub)))
+            InstructionOpcodeBucket.FdSimd => SimdSignatureRules.Keys.Select(sub => new OpcodeId(WasmOpcode.SimdPrefix, sub))
+                .Concat(SimdMemoryRules.Select(sub => new OpcodeId(WasmOpcode.SimdPrefix, sub)))
                 .OrderBy(id => id.SubOpcode).ToArray(),
-            InstructionOpcodeBucket.FdRelaxedSimd => RelaxedSimdSignatureRules.Keys.Select(sub => new OpcodeId(0xFD, sub))
+            InstructionOpcodeBucket.FdRelaxedSimd => RelaxedSimdSignatureRules.Keys.Select(sub => new OpcodeId(WasmOpcode.SimdPrefix, sub))
                 .OrderBy(id => id.SubOpcode).ToArray(),
             InstructionOpcodeBucket.E0StackSwitching => Enumerable.Range(0, 5)
                 .Select(sub => new OpcodeId(0xE0, (uint)sub)).ToArray(),
@@ -313,14 +314,14 @@ internal static class FunctionBodyValidator
         private bool IsFunctionIndex(int index)
             => index >= 0 && index < _functionTypeIndices.Count;
 
-        private static bool TryReadRefFuncIndex(byte[] expression, out int functionIndex)
+        private static bool TryReadRefFuncIndex(ReadOnlySpan<byte> expression, out int functionIndex)
         {
             functionIndex = -1;
-            if (expression.Length < 3 || expression[0] != 0xD2)
+            if (expression.Length < 3 || expression[0] != WasmOpcode.RefFunc)
                 return false;
 
             int offset = 1;
-            uint value = ReadU32(expression, ref offset);
+            uint value = WasmLeb128.ReadU32(expression, ref offset);
             if (offset >= expression.Length || expression[offset] != 0x0B || value > int.MaxValue)
                 return false;
 
@@ -592,13 +593,13 @@ internal static class FunctionBodyValidator
                 case 0x44:
                     Push(F64);
                     break;
-                case 0xFC:
+                case WasmOpcode.MiscPrefix:
                     ApplyFc(instruction);
                     break;
-                case 0xFB:
+                case WasmOpcode.GcPrefix:
                     ApplyFb(instruction);
                     break;
-                case 0xFD:
+                case WasmOpcode.SimdPrefix:
                     ApplyFd(instruction);
                     break;
                 case 0xE0:
@@ -2167,14 +2168,14 @@ internal static class FunctionBodyValidator
             ReadOnlySpan<byte> bytes = instruction.ImmediateBytes;
             int offset = 0;
             _ = ReadBlockTypeFromBytes(bytes, ref offset);
-            uint handlerCount = ReadU32(bytes, ref offset);
+            uint handlerCount = WasmLeb128.ReadU32(bytes, ref offset);
             for (uint h = 0; h < handlerCount; h++)
             {
                 byte catchKind = bytes[offset++];
                 ExactValueType[] payload;
                 if (catchKind is 0x00 or 0x01)
                 {
-                    uint tagIndex = ReadU32(bytes, ref offset);
+                    uint tagIndex = WasmLeb128.ReadU32(bytes, ref offset);
                     var tag = ExceptionTagType(tagIndex);
                     payload = catchKind == 0x01
                         ? tag.Parameters.Concat([NonNullableExnRef]).ToArray()
@@ -2193,7 +2194,7 @@ internal static class FunctionBodyValidator
                     throw Failure(WasmValidationCode.FunctionBodyInvalidImmediate, $"Unknown try_table catch kind 0x{catchKind:X2}");
                 }
 
-                uint labelDepth = ReadU32(bytes, ref offset);
+                uint labelDepth = WasmLeb128.ReadU32(bytes, ref offset);
                 var target = Target(labelDepth);
                 if (payload.Length != target.BranchTypes.Length)
                     throw Failure(WasmValidationCode.FunctionBodyTypeMismatch,
@@ -2211,13 +2212,13 @@ internal static class FunctionBodyValidator
         {
             ReadOnlySpan<byte> bytes = instruction.ImmediateBytes;
             int offset = 0;
-            _ = ReadU32(bytes, ref offset); // sub-opcode
-            _ = ReadU32(bytes, ref offset); // continuation type index
-            uint handlerCount = ReadU32(bytes, ref offset);
+            _ = WasmLeb128.ReadU32(bytes, ref offset); // sub-opcode
+            _ = WasmLeb128.ReadU32(bytes, ref offset); // continuation type index
+            uint handlerCount = WasmLeb128.ReadU32(bytes, ref offset);
             for (uint h = 0; h < handlerCount; h++)
             {
-                uint tagIndex = ReadU32(bytes, ref offset);
-                uint labelDepth = ReadU32(bytes, ref offset);
+                uint tagIndex = WasmLeb128.ReadU32(bytes, ref offset);
+                uint labelDepth = WasmLeb128.ReadU32(bytes, ref offset);
                 var tag = StackSwitchingTagType(tagIndex);
                 var target = Target(labelDepth);
                 if (target.BranchTypes.Length != tag.Parameters.Length + 1)
@@ -2668,25 +2669,25 @@ internal static class FunctionBodyValidator
     private static uint[] DecodeBrTableLabels(ReadOnlySpan<byte> bytes)
     {
         int offset = 0;
-        uint count = ReadU32(bytes, ref offset);
+        uint count = WasmLeb128.ReadU32(bytes, ref offset);
         var labels = new uint[checked((int)count + 1)];
         for (int i = 0; i < labels.Length; i++)
-            labels[i] = ReadU32(bytes, ref offset);
+            labels[i] = WasmLeb128.ReadU32(bytes, ref offset);
         return labels;
     }
 
     private static long ReadBlockTypeFromBytes(ReadOnlySpan<byte> bytes, ref int offset)
     {
-        long blockType = ReadS33(bytes, ref offset);
+        long blockType = WasmLeb128.ReadS33(bytes, ref offset);
         if (blockType is -0x1D or -0x1C)
-            _ = ReadS33(bytes, ref offset);
+            _ = WasmLeb128.ReadS33(bytes, ref offset);
         return blockType;
     }
 
     private static ExactValueType[] DecodeSelectTypes(ReadOnlySpan<byte> bytes)
     {
         int offset = 0;
-        uint count = ReadU32(bytes, ref offset);
+        uint count = WasmLeb128.ReadU32(bytes, ref offset);
         var types = new ExactValueType[checked((int)count)];
         for (int i = 0; i < types.Length; i++)
             types[i] = ReadValueType(bytes, ref offset);
@@ -2699,30 +2700,11 @@ internal static class FunctionBodyValidator
         if (valueType is 0x63 or 0x64)
         {
             var nullability = valueType == 0x63 ? Nullability.Nullable : Nullability.NonNullable;
-            return new ExactValueType.Reference(nullability, HeapTypeFromSigned(ReadS33(bytes, ref offset)));
+            return new ExactValueType.Reference(nullability, HeapTypeFromSigned(WasmLeb128.ReadS33(bytes, ref offset)));
         }
 
         long signedValueType = valueType >= 0x40 ? valueType - 0x80 : valueType;
         return ValueTypeFromSignedByte(signedValueType)
                ?? throw new WasmFormatException($"Unknown value type 0x{valueType:X2}");
     }
-
-    private static uint ReadU32(ReadOnlySpan<byte> bytes, ref int offset)
-    {
-        uint result = 0;
-        int shift = 0;
-        for (int i = 0; i < 5; i++)
-        {
-            byte b = bytes[offset++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
-        }
-
-        throw new WasmFormatException("Unsigned LEB128 encoding exceeds 5 bytes for uint32");
-    }
-
-    private static long ReadS33(ReadOnlySpan<byte> bytes, ref int offset)
-        => S33Leb128.Read(bytes, ref offset);
 }

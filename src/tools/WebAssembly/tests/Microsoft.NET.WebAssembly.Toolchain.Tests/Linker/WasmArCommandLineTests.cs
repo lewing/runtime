@@ -32,9 +32,9 @@ public class WasmArCommandLineTests
     }
 
     [Theory]
-    [InlineData("x")]
     [InlineData("rq")]
     [InlineData("c")]
+    [InlineData("rz")]
     public void UnsupportedOperations_AreRejected(string operation)
     {
         string archive = Path.Combine(WasmLdCommandLineTests.CreateTempDirectory(), "out.a");

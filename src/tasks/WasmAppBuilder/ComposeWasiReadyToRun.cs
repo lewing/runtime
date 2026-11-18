@@ -39,8 +39,7 @@ public sealed partial class ComposeWasiReadyToRun : Task
     /// <summary>
     /// Experimental: unbundles the host, compiles the shim, merges and replaces the host module with the managed
     /// toolchain (src/tools/WebAssembly) instead of wasm-tools and wasm-merge. wasm-tools still validates the final
-    /// component, and <see cref="Optimize"/> still runs wasm-opt. The merge drops the host's DWARF, which wasm-merge
-    /// rewrites. Requires MSBuild on .NET.
+    /// component, and <see cref="Optimize"/> still runs wasm-opt. Requires MSBuild on .NET.
     /// </summary>
     public bool UseManagedTools { get; set; }
 
@@ -148,8 +147,7 @@ public sealed partial class ComposeWasiReadyToRun : Task
                 WasiR2RComposition.FoldConstantGlobalReads(mergedPath, finalModulePath);
             }
 
-            // wasm-opt can emit typed function references, which the managed replace doesn't read yet.
-            if (UseManagedTools && !Optimize)
+            if (UseManagedTools)
                 ReplaceHostModuleManaged(ComponentPath!, finalModulePath, OutputPath!);
             else
                 WasiR2RComposition.ReplaceFirstCoreModule(ComponentPath!, finalModulePath, OutputPath!);

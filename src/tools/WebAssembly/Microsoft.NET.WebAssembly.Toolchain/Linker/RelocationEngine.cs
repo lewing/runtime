@@ -5,6 +5,7 @@ namespace Microsoft.NET.WebAssembly.Linker;
 
 using System.Buffers.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
 /// Single-module symbol accessor used during relocation patching.
@@ -124,15 +125,8 @@ public static class RelocationEngine
     /// </summary>
     public static void WritePaddedLeb128U32(Span<byte> buf, int offset, uint value)
     {
-        EnsureWritable(buf, offset, 5);
-
-        for (int i = 0; i < 4; i++)
-        {
-            buf[offset + i] = (byte)((value & 0x7Fu) | 0x80u);
-            value >>= 7;
-        }
-
-        buf[offset + 4] = (byte)(value & 0x7Fu);
+        EnsureWritable(buf, offset, WasmLeb128.PaddedLength32);
+        WasmLeb128.WritePaddedULeb128(buf.Slice(offset, WasmLeb128.PaddedLength32), value);
     }
 
     /// <summary>
@@ -140,15 +134,8 @@ public static class RelocationEngine
     /// </summary>
     public static void WritePaddedLeb128S32(Span<byte> buf, int offset, int value)
     {
-        EnsureWritable(buf, offset, 5);
-
-        for (int i = 0; i < 4; i++)
-        {
-            buf[offset + i] = (byte)((value & 0x7F) | 0x80);
-            value >>= 7;
-        }
-
-        buf[offset + 4] = (byte)(value & 0x7F);
+        EnsureWritable(buf, offset, WasmLeb128.PaddedLength32);
+        WasmLeb128.WritePaddedSLeb128(buf.Slice(offset, WasmLeb128.PaddedLength32), value);
     }
 
     private static ulong ResolveRelocation(

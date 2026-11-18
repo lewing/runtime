@@ -6,6 +6,7 @@ namespace Microsoft.NET.WebAssembly.Linker;
 using System.Collections.Generic;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
@@ -1111,42 +1112,42 @@ public sealed class SectionMerger
         output.Write([0x01, 0x00, 0x00, 0x00]);
 
         if (module.Types.Count > 0)
-            WriteSection(output, 1, s => WriteTypeSection(s, module.Types, module.TypeDefinitions));
+            WriteSection(output, WasmSectionId.Type, s => WriteTypeSection(s, module.Types, module.TypeDefinitions));
         if (module.Imports.Count > 0)
-            WriteSection(output, 2, s => WriteImportSection(s, module.Imports, module.TypeDefinitions));
+            WriteSection(output, WasmSectionId.Import, s => WriteImportSection(s, module.Imports, module.TypeDefinitions));
         if (module.Functions.Count > 0)
-            WriteSection(output, 3, s => WriteFunctionSection(s, module.Functions));
+            WriteSection(output, WasmSectionId.Function, s => WriteFunctionSection(s, module.Functions));
         if (module.Tables.Count > 0)
-            WriteSection(output, 4, s => WriteTableSection(s, module.Tables, module.TypeDefinitions));
+            WriteSection(output, WasmSectionId.Table, s => WriteTableSection(s, module.Tables, module.TypeDefinitions));
         if (module.Memories.Count > 0)
-            WriteSection(output, 5, s => WriteMemorySection(s, module.Memories));
+            WriteSection(output, WasmSectionId.Memory, s => WriteMemorySection(s, module.Memories));
         if (module.Tags.Count > 0)
-            WriteSection(output, 13, s => WriteTagSection(s, module.Tags));
+            WriteSection(output, WasmSectionId.Tag, s => WriteTagSection(s, module.Tags));
         if (module.Globals.Count > 0)
-            WriteSection(output, 6, s => WriteGlobalSection(s, module.Globals, module.TypeDefinitions));
+            WriteSection(output, WasmSectionId.Global, s => WriteGlobalSection(s, module.Globals, module.TypeDefinitions));
         if (module.Exports.Count > 0)
-            WriteSection(output, 7, s => WriteExportSection(s, module.Exports));
+            WriteSection(output, WasmSectionId.Export, s => WriteExportSection(s, module.Exports));
         if (module.StartFunction.HasValue)
-            WriteSection(output, 8, s => WasmEncoder.WriteU32Leb(s, (uint)module.StartFunction.Value));
+            WriteSection(output, WasmSectionId.Start, s => WasmEncoder.WriteU32Leb(s, (uint)module.StartFunction.Value));
         if (module.Elements.Count > 0)
-            WriteSection(output, 9, s => WriteElementSection(s, module.Elements, module.TypeDefinitions));
+            WriteSection(output, WasmSectionId.Element, s => WriteElementSection(s, module.Elements, module.TypeDefinitions));
         if (module.DataSegments.Any(static segment => segment.IsPassive))
-            WriteSection(output, 12, s => WasmEncoder.WriteU32Leb(s, (uint)module.DataSegments.Count));
+            WriteSection(output, WasmSectionId.DataCount, s => WasmEncoder.WriteU32Leb(s, (uint)module.DataSegments.Count));
         if (module.Functions.Count > 0)
         {
             IReadOnlyList<EncodedFunctionBody> encodedFunctions =
                 EncodeFunctionBodies(module.Functions, module.TypeDefinitions);
             if (encodedFunctions.Any(static function => function.BranchHints.Count != 0))
             {
-                WriteSection(output, 0, s => WriteBranchHintSection(
+                WriteSection(output, WasmSectionId.Custom, s => WriteBranchHintSection(
                     s,
                     encodedFunctions,
                     CountFunctionImports(module.Imports)));
             }
-            WriteSection(output, 10, s => WriteCodeSection(s, encodedFunctions));
+            WriteSection(output, WasmSectionId.Code, s => WriteCodeSection(s, encodedFunctions));
         }
         if (module.DataSegments.Count > 0)
-            WriteSection(output, 11, s => WriteDataSection(s, module.DataSegments));
+            WriteSection(output, WasmSectionId.Data, s => WriteDataSection(s, module.DataSegments));
 
         // LLVM tools require producers to precede target_features.
         bool producersWritten = false;
@@ -1156,7 +1157,7 @@ public sealed class SectionMerger
                 continue;
             if (!producersWritten && string.Equals(customSection.Name, "target_features", StringComparison.Ordinal))
                 producersWritten = WriteProducers(output, module);
-            WriteSection(output, 0, s => WriteCustomSection(s, customSection));
+            WriteSection(output, WasmSectionId.Custom, s => WriteCustomSection(s, customSection));
         }
 
         if (!producersWritten)
@@ -1361,7 +1362,7 @@ public sealed class SectionMerger
         }
 
         using var content = new MemoryStream();
-        content.WriteByte(1); // subsection id: function names
+        content.WriteByte((byte)NameSubsectionId.Function);
         WasmEncoder.WriteU32Leb(content, (uint)subsection.Length);
         content.Write(subsection.GetBuffer(), 0, (int)subsection.Length);
 
@@ -1423,7 +1424,7 @@ public sealed class SectionMerger
     private static bool WriteProducers(Stream output, WasmModule module)
     {
         if (module.ProducersSection is { Fields.Count: > 0 } producers)
-            WriteSection(output, 0, s => WriteProducersSection(s, producers));
+            WriteSection(output, WasmSectionId.Custom, s => WriteProducersSection(s, producers));
         return true;
     }
 
@@ -1945,23 +1946,9 @@ public sealed class SectionMerger
         // i32.const(1 byte) + signed LEB128 value(≤5 bytes) + end(1 byte) = max 7 bytes
         Span<byte> buf = stackalloc byte[7];
         buf[0] = 0x41; // i32.const
-        int lebLen = WriteS32LebToSpan(buf[1..], unchecked((int)value));
+        int lebLen = WasmLeb128.WriteSLeb128(buf[1..], unchecked((int)value));
         buf[1 + lebLen] = 0x0B; // end
         return buf[..(2 + lebLen)].ToArray();
-    }
-
-    private static int WriteS32LebToSpan(Span<byte> dest, int value)
-    {
-        int pos = 0;
-        bool more;
-        do
-        {
-            byte b = (byte)(value & 0x7F);
-            value >>= 7;
-            more = !((value == 0 && (b & 0x40) == 0) || (value == -1 && (b & 0x40) != 0));
-            dest[pos++] = more ? (byte)(b | 0x80) : b;
-        } while (more);
-        return pos;
     }
 
     private static uint ComputeDataStart(LinkerOptions? options)
@@ -2494,25 +2481,12 @@ public sealed class SectionMerger
     private static bool TryReadConstI32Expr(ReadOnlySpan<byte> expr, out uint value)
     {
         value = 0;
-        if (expr.Length < 3 || expr[0] != 0x41)
+        if (expr.Length < 3 || expr[0] != WasmOpcode.I32Const)
             return false;
 
         int offset = 1;
-        int shift = 0;
-        int decoded = 0;
-        byte current;
-
-        do
-        {
-            if ((uint)offset >= (uint)expr.Length)
-                return false;
-
-            current = expr[offset++];
-            decoded |= (current & 0x7F) << shift;
-            shift += 7;
-        } while ((current & 0x80) != 0 && shift < 35);
-
-        if (offset != expr.Length - 1 || expr[^1] != 0x0B || decoded < 0)
+        if (!WasmLeb128.TryReadS32(expr, ref offset, out int decoded)
+            || offset != expr.Length - 1 || expr[^1] != WasmOpcode.End || decoded < 0)
             return false;
 
         value = unchecked((uint)decoded);
@@ -2587,12 +2561,12 @@ public sealed class SectionMerger
                 $"Constant-expression operand kind {kind} has no merge-time remapping policy."),
         });
 
-    private static void WriteSection(Stream output, byte sectionId, Action<Stream> writeContent)
+    private static void WriteSection(Stream output, WasmSectionId sectionId, Action<Stream> writeContent)
     {
         using var content = new MemoryStream();
         writeContent(content);
 
-        output.WriteByte(sectionId);
+        output.WriteByte((byte)sectionId);
         WasmEncoder.WriteU32Leb(output, (uint)content.Length);
         // GetBuffer() returns the internal buffer directly; avoids the extra copy that ToArray() would make.
         output.Write(content.GetBuffer(), 0, (int)content.Length);
@@ -3016,7 +2990,7 @@ public sealed class SectionMerger
             WriteLocals(bodyStream, function, typeDefinitions, $"function {i} local");
             uint instructionBase = checked((uint)bodyStream.Position);
             bodyStream.Write(function.Body);
-            if (function.Body.Length == 0 || function.Body[^1] != 0x0B)
+            if (function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End)
                 bodyStream.WriteByte(0x0B);
 
             encoded.Add(new EncodedFunctionBody(
@@ -3024,6 +2998,17 @@ public sealed class SectionMerger
                 ResolveBranchHintOffsets(function, instructionBase, i)));
         }
         return encoded;
+    }
+
+    /// <summary>
+    /// The length <see cref="EncodeFunctionBodies"/> encodes <paramref name="function"/> (function <paramref name="index"/>)
+    /// to, measured without copying its body; <paramref name="scratch"/> receives its locals.
+    /// </summary>
+    internal static int EncodedFunctionBodyLength(WasmFunction function, IReadOnlyList<TypeDefinition>? typeDefinitions, int index, MemoryStream scratch)
+    {
+        scratch.SetLength(0);
+        WriteLocals(scratch, function, typeDefinitions, $"function {index} local");
+        return checked((int)scratch.Length + function.Body.Length + (function.Body.Length == 0 || function.Body[^1] != WasmOpcode.End ? 1 : 0));
     }
 
     private static IReadOnlyList<(uint Offset, BranchHintKind Kind)> ResolveBranchHintOffsets(
@@ -3042,7 +3027,7 @@ public sealed class SectionMerger
             if (function.BranchHints.TryGetValue(ordinal, out BranchHint? hint))
             {
                 byte opcode = instruction.OpcodeId.Opcode;
-                if (opcode is not 0x04 and not 0x0D)
+                if (opcode is not WasmOpcode.If and not WasmOpcode.BrIf)
                 {
                     throw new LinkerException(
                         $"Function {localFunctionIndex} branch hint at instruction {ordinal} " +

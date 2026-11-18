@@ -4,6 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Linker;
 
 using Microsoft.NET.WebAssembly.Binary.Linking;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 
@@ -252,19 +253,8 @@ public static class SingleObjectRelocator
             if (pos >= bytes.Length) break;
             pos++; // consume section id byte
 
-            // Decode u32 LEB128 section size
-            uint sectionSize = 0;
-            int shift = 0;
-            byte b;
-            do
-            {
-                if (pos >= bytes.Length)
-                    throw new InvalidOperationException("Unexpected end of binary while reading section size.");
-                b = bytes[pos++];
-                sectionSize |= (uint)(b & 0x7F) << shift;
-                shift += 7;
-            }
-            while ((b & 0x80) != 0);
+            if (!WasmLeb128.TryReadU32(bytes, ref pos, out uint sectionSize))
+                throw new InvalidOperationException($"Truncated or malformed section size at offset {pos}.");
 
             if (pos + (long)sectionSize > bytes.Length)
                 throw new InvalidOperationException(

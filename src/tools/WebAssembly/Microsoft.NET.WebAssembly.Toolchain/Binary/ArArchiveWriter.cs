@@ -5,6 +5,8 @@ namespace Microsoft.NET.WebAssembly.Binary;
 
 using System.Globalization;
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary.Linking;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 /// <summary>
 /// Writes GNU <c>ar</c> archives as <c>llvm-ar</c> does in its default deterministic mode, including the symbol
@@ -42,6 +44,37 @@ public static class ArArchiveWriter
     /// <summary>Encodes <paramref name="members"/> as an archive, with a symbol index unless <paramref name="symbolTable"/> is false.</summary>
     public static byte[] Write(IReadOnlyList<Member> members, bool symbolTable = true)
     {
+        var (size, write) = Prepare(members, symbolTable);
+        byte[] archive = new byte[checked((int)size)];
+        write(new MemoryStream(archive));
+        return archive;
+    }
+
+    /// <summary>
+    /// Writes <paramref name="members"/> to <paramref name="output"/> as an archive, with a symbol index unless
+    /// <paramref name="symbolTable"/> is false. Every member is checked before anything is written.
+    /// </summary>
+    public static void Write(Stream output, IReadOnlyList<Member> members, bool symbolTable = true)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        Prepare(members, symbolTable).Write(output);
+    }
+
+    /// <summary>
+    /// Writes the archive to <paramref name="path"/>, streaming it; the file is opened (and an existing one
+    /// replaced) only once every member has been checked.
+    /// </summary>
+    internal static void WriteFile(string path, IReadOnlyList<Member> members, bool symbolTable = true)
+    {
+        var (_, write) = Prepare(members, symbolTable);
+        using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        write(output);
+    }
+
+    // Lays the archive out (and checks every member): its exact size, and how to write it.
+    private static (long Size, Action<Stream> Write) Prepare(IReadOnlyList<Member> members, bool symbolTable)
+    {
+        ArgumentNullException.ThrowIfNull(members);
         // Long names, in member order, deduplicated.
         var longNames = new MemoryStream();
         var longNameOffsets = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -71,22 +104,22 @@ public static class ArArchiveWriter
         // Symbols per member.
         var symbolNames = new MemoryStream();
         var memberSymbols = new List<int>(members.Count);
+        var symbolRanges = new List<Range>();
         bool hasObject = false;
         if (symbolTable)
         {
             foreach (Member member in members)
             {
-                IReadOnlyList<string>? symbols = GetArchiveSymbols(member.Data);
-                hasObject |= symbols is not null;
-                int count = 0;
-                foreach (string symbol in symbols ?? [])
+                symbolRanges.Clear();
+                bool isModule = TryCollectArchiveSymbols(member.Data, symbolRanges);
+                hasObject |= isModule;
+                foreach (Range symbol in symbolRanges)
                 {
-                    symbolNames.Write(Encoding.UTF8.GetBytes(symbol));
+                    symbolNames.Write(member.Data.AsSpan(symbol));
                     symbolNames.WriteByte(0);
-                    count++;
                 }
 
-                memberSymbols.Add(count);
+                memberSymbols.Add(symbolRanges.Count);
             }
 
             // LLVM: "If there are no symbols, emit an empty symbol table, to satisfy Solaris tools".
@@ -94,11 +127,10 @@ public static class ArArchiveWriter
                 symbolNames.Write([0, 0, 0]);
         }
 
-        var output = new MemoryStream();
-        output.Write("!<arch>\n"u8);
-
         bool writeSymbolTable = symbolTable && symbolNames.Length != 0;
-        int numSymbols = memberSymbols.Sum();
+        int numSymbols = 0;
+        foreach (int count in memberSymbols)
+            numSymbols += count;
         long symbolTableSize = 4 + 4L * numSymbols + symbolNames.Length;
         int symbolPad = (int)(symbolTableSize & 1);
         symbolTableSize += symbolPad;
@@ -109,45 +141,51 @@ public static class ArArchiveWriter
             membersOffset += 60 + symbolTableSize;
         if (longNames.Length != 0)
             membersOffset += 60 + longNamesSize;
-        if (membersOffset + members.Sum(m => 60L + m.Data.Length + (m.Data.Length & 1)) > uint.MaxValue && writeSymbolTable)
+        long archiveSize = membersOffset;
+        foreach (Member member in members)
+            archiveSize += 60L + member.Data.Length + (member.Data.Length & 1);
+        if (archiveSize > uint.MaxValue && writeSymbolTable)
             throw new NotSupportedException("archives needing a 64-bit symbol table (/SYM64/) are not supported.");
 
-        if (writeSymbolTable)
+        return (archiveSize, output =>
         {
-            output.Write(Header("/", 0, symbolTableSize));
-            WriteBigEndian(output, (uint)numSymbols);
-            long position = membersOffset;
-            for (int i = 0; i < members.Count; i++)
+            output.Write("!<arch>\n"u8);
+
+            if (writeSymbolTable)
             {
-                for (int s = 0; s < memberSymbols[i]; s++)
-                    WriteBigEndian(output, (uint)position);
-                position += headers[i].Length + members[i].Data.Length + (members[i].Data.Length & 1);
+                output.Write(Header("/", 0, symbolTableSize));
+                WriteBigEndian(output, (uint)numSymbols);
+                long position = membersOffset;
+                for (int i = 0; i < members.Count; i++)
+                {
+                    for (int s = 0; s < memberSymbols[i]; s++)
+                        WriteBigEndian(output, (uint)position);
+                    position += headers[i].Length + members[i].Data.Length + (members[i].Data.Length & 1);
+                }
+
+                output.Write(symbolNames.GetBuffer(), 0, (int)symbolNames.Length);
+                for (int p = 0; p < symbolPad; p++)
+                    output.WriteByte(0);
             }
 
-            output.Write(symbolNames.ToArray());
-            for (int p = 0; p < symbolPad; p++)
-                output.WriteByte(0);
-        }
+            if (longNames.Length != 0)
+            {
+                output.Write(Encoding.ASCII.GetBytes("//".PadRight(48)));
+                output.Write(Encoding.ASCII.GetBytes(longNamesSize.ToString(CultureInfo.InvariantCulture).PadRight(10)));
+                output.Write("`\n"u8);
+                output.Write(longNames.GetBuffer(), 0, (int)longNames.Length);
+                if ((longNames.Length & 1) != 0)
+                    output.WriteByte((byte)'\n');
+            }
 
-        if (longNames.Length != 0)
-        {
-            output.Write(Encoding.ASCII.GetBytes("//".PadRight(48)));
-            output.Write(Encoding.ASCII.GetBytes(longNamesSize.ToString(CultureInfo.InvariantCulture).PadRight(10)));
-            output.Write("`\n"u8);
-            output.Write(longNames.ToArray());
-            if ((longNames.Length & 1) != 0)
-                output.WriteByte((byte)'\n');
-        }
-
-        for (int i = 0; i < members.Count; i++)
-        {
-            output.Write(headers[i]);
-            output.Write(members[i].Data);
-            if ((members[i].Data.Length & 1) != 0)
-                output.WriteByte((byte)'\n');
-        }
-
-        return output.ToArray();
+            for (int i = 0; i < members.Count; i++)
+            {
+                output.Write(headers[i]);
+                output.Write(members[i].Data);
+                if ((members[i].Data.Length & 1) != 0)
+                    output.WriteByte((byte)'\n');
+            }
+        });
     }
 
     private static bool UsesLongName(string name) => Encoding.UTF8.GetByteCount(name) >= 16 || name.Contains('/');
@@ -181,13 +219,24 @@ public static class ArArchiveWriter
     /// <c>name</c> section. Returns <see langword="null"/> for a member that is not a WebAssembly module.
     /// </summary>
     /// <remarks>Mirrors LLVM's <c>WasmObjectFile</c>, which builds one symbol list section by section.</remarks>
-    public static IReadOnlyList<string>? GetArchiveSymbols(byte[] data)
+    public static IReadOnlyList<string>? GetArchiveSymbols(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 8 || data[0] != 0 || data[1] != (byte)'a' || data[2] != (byte)'s' || data[3] != (byte)'m'
-            || data[4] != 1 || data[5] != 0 || data[6] != 0 || data[7] != 0)
+        var ranges = new List<Range>();
+        if (!TryCollectArchiveSymbols(data, ranges))
             return null;
 
-        var symbols = new List<string>();
+        var symbols = new List<string>(ranges.Count);
+        foreach (Range range in ranges)
+            symbols.Add(Encoding.UTF8.GetString(data[range]));
+        return symbols;
+    }
+
+    // Collects each symbol name as a range of data: llvm-ar writes the name bytes as they are.
+    private static bool TryCollectArchiveSymbols(ReadOnlySpan<byte> data, List<Range> symbols)
+    {
+        if (data.Length < 8 || !data[..8].SequenceEqual("\0asm\u0001\0\0\0"u8))
+            return false;
+
         bool hasLinking = false, hasDylink = false;
         uint importedFunctions = 0, importedGlobals = 0, definedFunctions = 0, definedGlobals = 0;
         var exportedFunctions = new HashSet<uint>();
@@ -195,256 +244,235 @@ public static class ArArchiveWriter
         while (position < data.Length)
         {
             byte id = data[position++];
-            int size = checked((int)ReadU32(data, ref position));
-            int end = checked(position + size);
-            if (end > data.Length)
+            int size = checked((int)WasmLeb128.ReadU32(data, ref position));
+            if (size > data.Length - position)
                 throw new InvalidDataException("WebAssembly section extends past the end of the member.");
-            int at = position;
-            switch (id)
+            int start = position;
+            ReadOnlySpan<byte> payload = data.Slice(start, size);
+            position = start + size;
+            int at = 0;
+            switch ((WasmSectionId)id)
             {
-                case 2:
-                    CountImports(data, at, ref importedFunctions, ref importedGlobals);
+                case WasmSectionId.Import:
+                    CountImports(payload, ref importedFunctions, ref importedGlobals);
                     break;
-                case 3:
-                    definedFunctions = ReadU32(data, ref at);
+                case WasmSectionId.Function:
+                    definedFunctions = WasmLeb128.ReadU32(payload, ref at);
                     break;
-                case 6:
-                    definedGlobals = ReadU32(data, ref at);
+                case WasmSectionId.Global:
+                    definedGlobals = WasmLeb128.ReadU32(payload, ref at);
                     break;
-                case 7:
+                case WasmSectionId.Export:
                     // Every export but a memory becomes a defined, global symbol.
-                    uint exports = ReadU32(data, ref at);
+                    uint exports = WasmLeb128.ReadU32(payload, ref at);
                     for (uint i = 0; i < exports; i++)
                     {
-                        string name = ReadName(data, ref at);
-                        byte kind = data[at++];
-                        uint index = ReadU32(data, ref at);
-                        if (kind == 0 && index >= importedFunctions)
+                        Range name = ReadName(payload, ref at);
+                        var kind = (CoreSort)payload[at++];
+                        uint index = WasmLeb128.ReadU32(payload, ref at);
+                        if (kind == CoreSort.Func && index >= importedFunctions)
                             exportedFunctions.Add(index);
-                        if (kind != 2)
-                            symbols.Add(name);
+                        if (kind != CoreSort.Memory)
+                            symbols.Add(Offset(name, start));
                     }
 
                     break;
-                case 0:
-                    string section = ReadName(data, ref at);
-                    if (section == "linking")
+                case WasmSectionId.Custom:
+                    ReadOnlySpan<byte> section = payload[ReadName(payload, ref at)];
+                    if (section.SequenceEqual("linking"u8))
                     {
                         hasLinking = true;
-                        ReadLinkingSymbols(data, at, end, symbols);
+                        ReadLinkingSymbols(payload[at..], start + at, symbols);
                     }
-                    else if (section is "dylink" or "dylink.0")
+                    else if (section.SequenceEqual("dylink"u8) || section.SequenceEqual("dylink.0"u8))
                     {
                         hasDylink = true;
                     }
-                    else if (section == "name" && !hasLinking && !hasDylink)
+                    else if (section.SequenceEqual("name"u8) && !hasLinking && !hasDylink)
                     {
                         // The name section supersedes the export symbols.
                         symbols.Clear();
-                        ReadNameSymbols(data, at, end, symbols, importedFunctions, importedFunctions + definedFunctions,
+                        ReadNameSymbols(payload[at..], start + at, symbols, importedFunctions, importedFunctions + definedFunctions,
                             importedGlobals, importedGlobals + definedGlobals, exportedFunctions);
                     }
 
                     break;
             }
-
-            position = end;
         }
 
-        return symbols;
+        return true;
     }
 
-    private static void CountImports(byte[] data, int position, ref uint functions, ref uint globals)
+    private static void CountImports(ReadOnlySpan<byte> payload, ref uint functions, ref uint globals)
     {
-        uint count = ReadU32(data, ref position);
+        int position = 0;
+        uint count = WasmLeb128.ReadU32(payload, ref position);
         for (uint i = 0; i < count; i++)
         {
-            ReadName(data, ref position);
-            ReadName(data, ref position);
-            byte kind = data[position++];
+            ReadName(payload, ref position);
+            ReadName(payload, ref position);
+            var kind = (CoreSort)payload[position++];
             switch (kind)
             {
-                case 0x00:
+                case CoreSort.Func:
                     functions++;
-                    ReadU32(data, ref position);
+                    WasmLeb128.ReadU32(payload, ref position);
                     break;
-                case 0x01:
-                    SkipValueType(data, ref position);
-                    SkipLimits(data, ref position);
+                case CoreSort.Table:
+                    SkipValueType(payload, ref position);
+                    SkipLimits(payload, ref position);
                     break;
-                case 0x02:
-                    SkipLimits(data, ref position);
+                case CoreSort.Memory:
+                    SkipLimits(payload, ref position);
                     break;
-                case 0x03:
+                case CoreSort.Global:
                     globals++;
-                    SkipValueType(data, ref position);
+                    SkipValueType(payload, ref position);
                     position++;
                     break;
-                case 0x04:
+                case CoreSort.Tag:
                     position++;
-                    ReadU32(data, ref position);
+                    WasmLeb128.ReadU32(payload, ref position);
                     break;
                 default:
-                    throw new InvalidDataException($"Unknown WebAssembly import kind 0x{kind:X2}.");
+                    throw new InvalidDataException($"Unknown WebAssembly import kind 0x{(byte)kind:X2}.");
             }
         }
     }
 
-    private static void SkipValueType(byte[] data, ref int position)
+    private static void SkipValueType(ReadOnlySpan<byte> data, ref int position)
     {
         byte type = data[position++];
         if (type is 0x63 or 0x64)
-            ReadU64(data, ref position); // heap type (s33); only its length matters here
+            WasmLeb128.ReadS33(data, ref position);
     }
 
-    private static void SkipLimits(byte[] data, ref int position)
+    private static void SkipLimits(ReadOnlySpan<byte> data, ref int position)
     {
         byte flags = data[position++];
-        ReadU64(data, ref position);
+        WasmLeb128.ReadU64(data, ref position);
         if ((flags & 0x01) != 0)
-            ReadU64(data, ref position);
+            WasmLeb128.ReadU64(data, ref position);
         if ((flags & 0x08) != 0)
-            ReadU32(data, ref position);
+            WasmLeb128.ReadU32(data, ref position);
     }
 
     // LLVM: a named defined function is global only when exported; a named defined global is always global;
     // named data segments are local. Imported (undefined) names are never indexed.
-    private static void ReadNameSymbols(byte[] data, int position, int end, List<string> symbols,
+    private static void ReadNameSymbols(ReadOnlySpan<byte> payload, int payloadOffset, List<Range> symbols,
         uint importedFunctions, uint functionCount, uint importedGlobals, uint globalCount, HashSet<uint> exportedFunctions)
     {
-        while (position < end)
+        int position = 0;
+        while (position < payload.Length)
         {
-            byte type = data[position++];
-            int size = checked((int)ReadU32(data, ref position));
-            int subEnd = checked(position + size);
-            if (type is not (1 or 7 or 9))
-            {
-                position = subEnd;
+            var type = (NameSubsectionId)payload[position++];
+            int size = checked((int)WasmLeb128.ReadU32(payload, ref position));
+            if (size > payload.Length - position)
+                throw new InvalidDataException("WebAssembly name subsection extends past the end of its section.");
+            int subStart = position;
+            position = subStart + size;
+            if (type is not (NameSubsectionId.Function or NameSubsectionId.Global or NameSubsectionId.DataSegment))
                 continue;
-            }
 
+            ReadOnlySpan<byte> sub = payload.Slice(subStart, size);
+            int at = 0;
             var seen = new HashSet<uint>();
-            uint count = ReadU32(data, ref position);
+            uint count = WasmLeb128.ReadU32(sub, ref at);
             for (uint i = 0; i < count; i++)
             {
-                uint index = ReadU32(data, ref position);
-                string name = ReadName(data, ref position);
+                uint index = WasmLeb128.ReadU32(sub, ref at);
+                Range name = ReadName(sub, ref at);
                 if (!seen.Add(index))
-                    throw new InvalidDataException($"WebAssembly name section names {(type == 1 ? "function" : type == 7 ? "global" : "segment")} {index} more than once.");
-                if (type == 1)
+                    throw new InvalidDataException($"WebAssembly name section names {(type == NameSubsectionId.Function ? "function" : type == NameSubsectionId.Global ? "global" : "segment")} {index} more than once.");
+                bool empty = name.End.Value == name.Start.Value;
+                if (type == NameSubsectionId.Function)
                 {
-                    if (index >= functionCount || name.Length == 0)
+                    if (index >= functionCount || empty)
                         throw new InvalidDataException($"Invalid function name entry {index} in the WebAssembly name section.");
                     if (index >= importedFunctions && exportedFunctions.Contains(index))
-                        symbols.Add(name);
+                        symbols.Add(Offset(name, payloadOffset + subStart));
                 }
-                else if (type == 7)
+                else if (type == NameSubsectionId.Global)
                 {
-                    if (index >= globalCount || name.Length == 0)
+                    if (index >= globalCount || empty)
                         throw new InvalidDataException($"Invalid global name entry {index} in the WebAssembly name section.");
                     if (index >= importedGlobals)
-                        symbols.Add(name);
+                        symbols.Add(Offset(name, payloadOffset + subStart));
                 }
             }
-
-            position = subEnd;
         }
     }
 
-    private const uint SymbolBindingLocal = 0x02;
-    private const uint SymbolUndefined = 0x10;
-    private const uint SymbolExplicitName = 0x40;
-
-    private static void ReadLinkingSymbols(byte[] data, int position, int end, List<string> symbols)
+    private static void ReadLinkingSymbols(ReadOnlySpan<byte> payload, int payloadOffset, List<Range> symbols)
     {
-        ReadU32(data, ref position); // version
-        while (position < end)
+        int position = 0;
+        WasmLeb128.ReadU32(payload, ref position); // version
+        while (position < payload.Length)
         {
-            byte type = data[position++];
-            int size = checked((int)ReadU32(data, ref position));
-            int subEnd = checked(position + size);
-            if (type != 8)
-            {
-                position = subEnd;
+            var type = (LinkingSubsectionId)payload[position++];
+            int size = checked((int)WasmLeb128.ReadU32(payload, ref position));
+            if (size > payload.Length - position)
+                throw new InvalidDataException("WebAssembly linking subsection extends past the end of its section.");
+            int subStart = position;
+            position = subStart + size;
+            if (type != LinkingSubsectionId.SymbolTable)
                 continue;
-            }
 
-            uint count = ReadU32(data, ref position);
+            ReadOnlySpan<byte> sub = payload.Slice(subStart, size);
+            int at = 0;
+            uint count = WasmLeb128.ReadU32(sub, ref at);
             symbols.Clear(); // LLVM: the symbol table replaces any symbols derived from the export section
             for (uint i = 0; i < count; i++)
             {
-                byte kind = data[position++];
-                uint flags = ReadU32(data, ref position);
-                bool defined = (flags & SymbolUndefined) == 0;
-                string? name = null;
+                var kind = (SymbolType)sub[at++];
+                var flags = (SymbolFlags)WasmLeb128.ReadU32(sub, ref at);
+                bool defined = (flags & SymbolFlags.Undefined) == 0;
+                Range? name = null;
                 switch (kind)
                 {
-                    case 0: // function
-                    case 2: // global
-                    case 4: // tag
-                    case 5: // table
-                        ReadU32(data, ref position);
-                        if (defined || (flags & SymbolExplicitName) != 0)
-                            name = ReadName(data, ref position);
+                    case SymbolType.Function:
+                    case SymbolType.Global:
+                    case SymbolType.Tag:
+                    case SymbolType.Table:
+                        WasmLeb128.ReadU32(sub, ref at);
+                        if (defined || (flags & SymbolFlags.ExplicitName) != 0)
+                            name = ReadName(sub, ref at);
                         break;
-                    case 1: // data
-                        name = ReadName(data, ref position);
+                    case SymbolType.Data:
+                        name = ReadName(sub, ref at);
                         if (defined)
                         {
-                            ReadU32(data, ref position);
-                            ReadU64(data, ref position);
-                            ReadU64(data, ref position);
+                            WasmLeb128.ReadU32(sub, ref at);
+                            WasmLeb128.ReadU64(sub, ref at);
+                            WasmLeb128.ReadU64(sub, ref at);
                         }
 
                         break;
-                    case 3: // section
-                        ReadU32(data, ref position);
+                    case SymbolType.Section:
+                        WasmLeb128.ReadU32(sub, ref at);
                         break;
                     default:
-                        throw new InvalidDataException($"Unknown WebAssembly symbol kind {kind}.");
+                        throw new InvalidDataException($"Unknown WebAssembly symbol kind {(byte)kind}.");
                 }
 
-                if (name is not null && defined && (flags & SymbolBindingLocal) == 0)
-                    symbols.Add(name);
+                if (name is { } n && defined && (flags & SymbolFlags.BindingLocal) == 0)
+                    symbols.Add(Offset(n, payloadOffset + subStart));
             }
 
             return;
         }
     }
 
-    private static uint ReadU32(byte[] data, ref int position)
+    // A name: its byte range within data, after the length prefix.
+    private static Range ReadName(ReadOnlySpan<byte> data, ref int position)
     {
-        uint result = 0;
-        for (int shift = 0; ; shift += 7)
-        {
-            byte b = data[position++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            if (shift >= 28)
-                throw new InvalidDataException("u32 LEB128 too long.");
-        }
-    }
-
-    private static ulong ReadU64(byte[] data, ref int position)
-    {
-        ulong result = 0;
-        for (int shift = 0; ; shift += 7)
-        {
-            byte b = data[position++];
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            if (shift >= 63)
-                throw new InvalidDataException("u64 LEB128 too long.");
-        }
-    }
-
-    private static string ReadName(byte[] data, ref int position)
-    {
-        int length = checked((int)ReadU32(data, ref position));
-        string name = Encoding.UTF8.GetString(data, position, length);
+        int length = checked((int)WasmLeb128.ReadU32(data, ref position));
+        if (length > data.Length - position)
+            throw new InvalidDataException("WebAssembly name extends past the end of its section.");
+        var name = new Range(position, position + length);
         position += length;
         return name;
     }
+
+    private static Range Offset(Range range, int by) => new(range.Start.Value + by, range.End.Value + by);
 }

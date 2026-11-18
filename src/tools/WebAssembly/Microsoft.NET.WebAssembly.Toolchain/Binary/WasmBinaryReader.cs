@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using System.Text;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace Microsoft.NET.WebAssembly.Binary;
 
@@ -93,110 +94,37 @@ public sealed class WasmBinaryReader
     /// <summary>Read an unsigned 32-bit LEB128 integer (§5.2.2).</summary>
     public uint ReadU32Leb128()
     {
-        uint result = 0;
-        int shift = 0;
+        byte first = ReadByte();
+        if (first < 0x80)
+            return first;
 
-        for (int i = 0; i < 5; i++)
-        {
-            byte b = ReadByte();
-            // For the 5th byte only the lowest 4 bits may be set (bits 28-31).
-            if (i == 4 && (b & 0xF0) != 0)
-                throw new WasmFormatException("Unsigned LEB128 value overflows uint32");
-
-            result |= (uint)(b & 0x7F) << shift;
-
-            if ((b & 0x80) == 0)
-                return result;
-
-            shift += 7;
-        }
-
-        throw new WasmFormatException("Unsigned LEB128 encoding exceeds 5 bytes for uint32");
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength32];
+        Leb128Status status = WasmLeb128.DecodeU32(ReadLeb128Bytes(first, encoded), out uint value, out _);
+        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.U32);
     }
 
     /// <summary>Read a signed 32-bit LEB128 integer (§5.2.2).</summary>
     public int ReadS32Leb128()
     {
-        int result = 0;
-        int shift = 0;
-        byte b;
-
-        for (int i = 0; i < 5; i++)
-        {
-            b = ReadByte();
-
-            // 5th byte: bits 28-31 are value; bits 32-34 (bits 4-6 of byte) must equal
-            // the sign bit (bit 3) — otherwise the value overflows a 32-bit signed integer.
-            if (i == 4 && (b & 0x78) != 0 && (b & 0x78) != 0x78)
-                throw new WasmFormatException("Signed LEB128 value overflows int32");
-
-            result |= (int)(b & 0x7F) << shift;
-            shift += 7;
-
-            if ((b & 0x80) == 0)
-            {
-                // Sign extend if the sign bit of the last byte is set.
-                if (shift < 32 && (b & 0x40) != 0)
-                    result |= ~0 << shift;
-                return result;
-            }
-        }
-
-        throw new WasmFormatException("Signed LEB128 encoding exceeds 5 bytes for int32");
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength32];
+        Leb128Status status = WasmLeb128.DecodeS32(ReadLeb128Bytes(encoded), out int value, out _);
+        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S32);
     }
 
     /// <summary>Read an unsigned 64-bit LEB128 integer (§5.2.2).</summary>
     public ulong ReadU64Leb128()
     {
-        ulong result = 0;
-        int shift = 0;
-
-        for (int i = 0; i < 10; i++)
-        {
-            byte b = ReadByte();
-            if (i == 9 && (b & 0xFE) != 0)
-                throw new WasmFormatException("Unsigned LEB128 value overflows uint64");
-
-            result |= (ulong)(b & 0x7F) << shift;
-
-            if ((b & 0x80) == 0)
-                return result;
-
-            shift += 7;
-        }
-
-        throw new WasmFormatException("Unsigned LEB128 encoding exceeds 10 bytes for uint64");
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength64];
+        Leb128Status status = WasmLeb128.DecodeU64(ReadLeb128Bytes(encoded), out ulong value, out _);
+        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.U64);
     }
 
     /// <summary>Read a signed 64-bit LEB128 integer (§5.2.2).</summary>
     public long ReadS64Leb128()
     {
-        long result = 0;
-        int shift = 0;
-        byte b;
-
-        for (int i = 0; i < 10; i++)
-        {
-            b = ReadByte();
-
-            // 10th byte: bit 63 of the value is bit 0 of this byte; bits 64-69 (bits 1-6)
-            // must all equal bit 0 — otherwise the value overflows a 64-bit signed integer.
-            if (i == 9 && (b & 0x7F) != 0 && (b & 0x7F) != 0x7F)
-                throw new WasmFormatException("Signed LEB128 value overflows int64");
-
-            result |= (long)(b & 0x7F) << shift;
-            shift += 7;
-
-            if ((b & 0x80) == 0)
-            {
-                // Sign extend if the sign bit of the last byte is set.
-                if (shift < 64 && (b & 0x40) != 0)
-                    result |= ~0L << shift;
-                return result;
-            }
-        }
-
-        throw new WasmFormatException("Signed LEB128 encoding exceeds 10 bytes for int64");
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength64];
+        Leb128Status status = WasmLeb128.DecodeS64(ReadLeb128Bytes(encoded), out long value, out _);
+        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S64);
     }
 
     /// <summary>
@@ -205,21 +133,26 @@ public sealed class WasmBinaryReader
     /// </summary>
     public long ReadS33Leb128()
     {
-        Span<byte> encoded = stackalloc byte[S33Leb128.MaxBytes];
-        int length = 0;
-        for (; length < encoded.Length; length++)
-        {
-            byte current = ReadByte();
-            encoded[length] = current;
-            S33Leb128.ValidateTerminalByte(current, length);
-            if ((current & 0x80) == 0)
-            {
-                int offset = 0;
-                return S33Leb128.Read(encoded[..(length + 1)], ref offset);
-            }
-        }
+        Span<byte> encoded = stackalloc byte[WasmLeb128.MaxLength32];
+        Leb128Status status = WasmLeb128.DecodeS33(ReadLeb128Bytes(encoded), out long value, out _);
+        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S33);
+    }
 
-        throw new WasmFormatException("Signed LEB128 encoding exceeds 5 bytes for s33");
+    /// <summary>
+    /// Reads the bytes of one LEB128 into <paramref name="buffer"/>: up to and including the first byte
+    /// without the continuation bit, or until the buffer is full. Decoding the result with a
+    /// <see cref="WasmLeb128"/> <c>Decode*</c> method of the buffer's width then reports overflow or
+    /// over-length exactly as a span reader would; a stream that ends early throws here.
+    /// </summary>
+    internal ReadOnlySpan<byte> ReadLeb128Bytes(Span<byte> buffer) => ReadLeb128Bytes(ReadByte(), buffer);
+
+    private ReadOnlySpan<byte> ReadLeb128Bytes(byte first, Span<byte> buffer)
+    {
+        buffer[0] = first;
+        int length = 1;
+        while ((buffer[length - 1] & 0x80) != 0 && length < buffer.Length)
+            buffer[length++] = ReadByte();
+        return buffer[..length];
     }
 
     /// <summary>Read a Wasm vector (count + items) using a reader function.</summary>
@@ -256,18 +189,11 @@ public sealed class WasmBinaryReader
     public string ReadName()
     {
         uint length = ReadU32Leb128();
-        if (length <= 256)
-        {
-            Span<byte> buf = stackalloc byte[(int)length];
-            ReadBytes(buf);
-            try { return StrictUtf8.GetString(buf); }
-            catch (DecoderFallbackException ex)
-            { throw new WasmFormatException("Invalid UTF-8 encoding in name", ex); }
-        }
-        byte[] bytes = ReadBytes((int)length);
+        Span<byte> buf = length <= 256 ? stackalloc byte[(int)length] : new byte[(int)length];
+        ReadBytes(buf);
         try
         {
-            return StrictUtf8.GetString(bytes);
+            return StrictUtf8.GetString(buf);
         }
         catch (DecoderFallbackException ex)
         {

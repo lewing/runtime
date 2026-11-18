@@ -35,15 +35,6 @@ internal sealed record DwarfSubprogramIndex(
 /// </summary>
 internal static class DwarfSubprogramReader
 {
-    private const ushort DW_TAG_compile_unit = 0x11;
-    private const ushort DW_TAG_partial_unit = 0x3c;
-    private const ushort DW_TAG_subprogram = 0x2e;
-    private const ushort DW_AT_name = 0x03;
-    private const ushort DW_AT_low_pc = 0x11;
-    private const ushort DW_AT_abstract_origin = 0x31;
-    private const ushort DW_AT_specification = 0x47;
-    private const ushort DW_AT_linkage_name = 0x6e;
-    private const ushort DW_AT_MIPS_linkage_name = 0x2007;
     private const int MaxReferenceChain = 8;
 
     public static DwarfSubprogramIndex Read(Microsoft.NET.WebAssembly.Module.WasmModule module)
@@ -93,7 +84,7 @@ internal static class DwarfSubprogramReader
                 byte unitType = infoData[cuStart + 6];
                 // DW_UT_compile (1) and DW_UT_partial (3) share this header layout; type and
                 // skeleton/split units carry extra header fields and no function bodies here.
-                if (unitType != 0x01 && unitType != 0x03) { skipped++; continue; }
+                if (unitType is not (DwUt.Compile or DwUt.Partial)) { skipped++; continue; }
                 addrSize = infoData[cuStart + 7];
                 abbrevOffset = (int)DwarfReaderHelpers.ReadU32LE(infoData, cuStart + 8);
             }
@@ -108,14 +99,14 @@ internal static class DwarfSubprogramReader
             var ctx = new DwarfReaderHelpers.StringContext(strData, lineStrData, strOffsetsData, strOffsetsBase,
                 addrData, addrBase, resolveAddrx: true);
             var dies = DwarfReaderHelpers.ParseDIEs(infoData, headerEnd, cuEnd, abbrevTable, addrSize, ctx, cuStart,
-                keepTag: static tag => tag is DW_TAG_subprogram or DW_TAG_compile_unit or DW_TAG_partial_unit);
+                keepTag: static tag => tag is DwTag.Subprogram or DwTag.CompileUnit or DwTag.PartialUnit);
             units++;
 
             foreach (var die in dies)
             {
                 bySectionOffset[(long)cuStart + die.Offset] = (die, cuStart);
-                if (die.Tag == DW_TAG_subprogram
-                    && die.Attributes.TryGetValue(DW_AT_low_pc, out var lowPcObj) && lowPcObj is long lowPc)
+                if (die.Tag == DwTag.Subprogram
+                    && die.Attributes.TryGetValue(DwAt.LowPc, out var lowPcObj) && lowPcObj is long lowPc)
                     bodies.Add((die, cuStart, lowPc, addrSize));
             }
         }
@@ -149,13 +140,13 @@ internal static class DwarfSubprogramReader
         int currentCu = cuStart;
         for (int hop = 0; hop <= MaxReferenceChain && current is not null; hop++)
         {
-            name ??= StringAttr(current, DW_AT_name);
-            linkage ??= StringAttr(current, DW_AT_linkage_name) ?? StringAttr(current, DW_AT_MIPS_linkage_name);
+            name ??= StringAttr(current, DwAt.Name);
+            linkage ??= StringAttr(current, DwAt.LinkageName) ?? StringAttr(current, DwAt.MipsLinkageName);
             if (name is not null && linkage is not null)
                 break;
 
-            var next = Reference(current, currentCu, DW_AT_abstract_origin, bySectionOffset)
-                ?? Reference(current, currentCu, DW_AT_specification, bySectionOffset);
+            var next = Reference(current, currentCu, DwAt.AbstractOrigin, bySectionOffset)
+                ?? Reference(current, currentCu, DwAt.Specification, bySectionOffset);
             if (next is null)
                 break;
             (current, currentCu) = next.Value;

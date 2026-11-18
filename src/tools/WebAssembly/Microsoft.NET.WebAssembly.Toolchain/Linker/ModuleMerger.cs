@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Wat;
@@ -37,14 +38,14 @@ public sealed class ModuleMergeOptions
     /// </summary>
     public bool RemoveUnused { get; init; } = true;
 
-    /// <summary>
-    /// <c>wasm-merge -g</c>: emit a <c>name</c> section with the inputs' function names, and keep the first
-    /// input's functions and globals even when unused so its DWARF stays exact.
-    /// </summary>
+    /// <summary><c>wasm-merge -g</c>: emit a <c>name</c> section with the inputs' function names.</summary>
     /// <remarks>
-    /// With or without this option, the first input's DWARF is kept only while it is still exact — every one
-    /// of its functions at the same code offset with the same size, and its globals at the same indices — and
-    /// dropped otherwise, never kept stale, with a <see cref="Warning"/>. (wasm-merge without <c>-g</c> copies it through unchanged.)
+    /// With or without this option the first input's DWARF (2–4) is kept, as wasm-merge keeps it: code is
+    /// re-encoded with minimal LEB128s and unused functions are removed, so every code address in it is
+    /// rewritten to follow its instruction, and addresses in removed functions become LLD's tombstones. DWARF
+    /// that cannot be rewritten exactly (DWARF 5, split DWARF, or a global its expressions name, such as a frame
+    /// base's <c>__stack_pointer</c>, that moved) is dropped, never kept stale, with a <see cref="Warning"/>; so is a
+    /// <c>.debug_aranges</c> tuple that is neither a code range nor a variable's address (that section alone).
     /// </remarks>
     public bool DebugInfo { get; init; }
 
@@ -109,6 +110,7 @@ public static class ModuleMerger
         private readonly HashSet<(Kind, ItemRef)> _live = [];
         private readonly Queue<(Kind, ItemRef)> _work = new();
         private List<FuncType> _types = [];
+        private readonly Dictionary<int, List<CodeAddressMap.Resized>> _resized = [];
         private List<TypeDefinition> _typeDefinitions = [];
 
         public State(IReadOnlyList<(WasmModule Module, string Name)> inputs, ModuleMergeOptions options)
@@ -205,24 +207,66 @@ public static class ModuleMerger
             }
 
             module.ProducersSection = _modules[0].ProducersSection;
-            bool hasDwarf = _modules[0].CustomSections.Any(c => IsDebugSection(c.Name));
-            bool keepDwarf = hasDwarf && FirstModuleLayoutPreserved(functions, functionOrder);
-            if (hasDwarf && !keepDwarf)
-            {
-                _options.Warning?.Invoke(
-                    $"the DWARF of input '{_inputs[0].Name}' was dropped: its functions or globals moved in the merged module, " +
-                    "so it no longer describes the code" +
-                    (_options.DebugInfo ? "." : " (pass -g to keep its functions and globals in place)."));
-            }
-
+            var debugSections = new List<CustomSection>();
             foreach (var section in _modules[0].CustomSections)
             {
-                if (IsDebugSection(section.Name) ? keepDwarf : !IsRegeneratedSection(section.Name))
-                    module.CustomSections.Add(section);
+                if (IsDebugSection(section.Name))
+                    debugSections.Add(section);
             }
 
+            List<CustomSection?>? dwarf = null;
+            if (debugSections.Count > 0)
+            {
+                CodeAddressMap? map = BuildCodeAddressMap(functions, functionOrder, out string? reason);
+                var rewritten = map is null ? null : DwarfCodeAddressRewriter.TryRewrite(debugSections, map, out reason);
+                int mergedGlobals = module.Globals.Count;
+                foreach (var import in module.Imports)
+                {
+                    if (import.Descriptor is ImportDescriptor.Global)
+                        mergedGlobals++;
+                }
+
+                if (rewritten is not null && FirstModuleGlobalMoved(rewritten.Globals, mergedGlobals) is { } moved)
+                {
+                    reason = moved;
+                    rewritten = null;
+                }
+
+                if (rewritten is null)
+                {
+                    _options.Warning?.Invoke(
+                        $"the DWARF of input '{_inputs[0].Name}' was dropped: {reason}, so it cannot be made to describe the merged code.");
+                }
+                else
+                {
+                    dwarf = rewritten.Sections;
+                    foreach (string warning in rewritten.Warnings)
+                        _options.Warning?.Invoke($"in the DWARF of input '{_inputs[0].Name}', {warning}.");
+                }
+            }
+
+            int nextDebug = 0;
+            foreach (var section in _modules[0].CustomSections)
+            {
+                if (IsDebugSection(section.Name))
+                {
+                    if (dwarf?[nextDebug] is { } rewrittenSection)
+                        module.CustomSections.Add(rewrittenSection);
+                    nextDebug++;
+                }
+                else if (!IsRegeneratedSection(section.Name))
+                {
+                    module.CustomSections.Add(section);
+                }
+            }
+
+            // LLVM tools require name before producers and target_features (the writer puts producers right
+            // before target_features).
             if (_options.DebugInfo && BuildNameSection() is { } names)
-                module.CustomSections.Add(names);
+            {
+                int features = module.CustomSections.FindIndex(c => c.Name == "target_features");
+                module.CustomSections.Insert(features < 0 ? module.CustomSections.Count : features, names);
+            }
 
             return module;
         }
@@ -237,54 +281,99 @@ public static class ModuleMerger
             name is "name" or "producers" or "linking" or "sourceMappingURL" or BranchHintMetadataReader.SectionName ||
             name.StartsWith("reloc.", StringComparison.Ordinal);
 
-        /// <summary>
-        /// True when the first input's DWARF still describes the output: all of its functions are kept, in
-        /// order, at the start of the code section with byte-identical offsets and sizes, and its globals
-        /// (a frame base can name <c>__stack_pointer</c> by index) keep their indices.
-        /// </summary>
-        private bool FirstModuleLayoutPreserved(List<WasmFunction> functions, List<ItemRef> functionOrder)
+        // DWARF names globals by index (a frame base names __stack_pointer), which the rewriter does not remap:
+        // those it names (every global, when it could not read an expression) must keep their indices. One that was
+        // removed may only leave its index unused (evaluating it fails rather than reading another global).
+        private string? FirstModuleGlobalMoved(IReadOnlySet<uint>? named, int mergedGlobals)
         {
+            if (named is null)
+            {
+                for (int i = 0; i < ImportCount(0, Kind.Global) + _modules[0].Globals.Count; i++)
+                {
+                    if (!_maps[0].Globals.TryGetValue((uint)i, out uint index) ? i < mergedGlobals : index != i)
+                        return $"its global {i} moved or was replaced (an expression it could not read may name it)";
+                }
+
+                return null;
+            }
+
+            // In index order, so the reason names the lowest one.
+            uint[] sorted = new uint[named.Count];
+            int n = 0;
+            foreach (uint i in named)
+                sorted[n++] = i;
+            Array.Sort(sorted);
+            foreach (uint i in sorted)
+            {
+                if (!_maps[0].Globals.TryGetValue(i, out uint index))
+                {
+                    if (i < mergedGlobals)
+                        return $"its global {i}, which it names, was removed and another global took its index";
+                }
+                else if (index != i)
+                    return $"its global {i}, which it names, moved to {index}";
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Maps the first input's code addresses to the merged module's: each kept function to its place in the
+        /// final encoding (instruction offsets through the breakpoints recorded when its body was re-encoded),
+        /// each removed function to nothing.
+        /// </summary>
+        private CodeAddressMap? BuildCodeAddressMap(List<WasmFunction> functions, List<ItemRef> functionOrder, out string? reason)
+        {
+            reason = null;
             var first = _modules[0];
-            int count = first.Functions.Count;
             int imported = ImportCount(0, Kind.Func);
-            if (functionOrder.Count < count)
-                return false;
-            for (int i = 0; i < count; i++)
+            var position = new Dictionary<int, int>();
+            for (int j = 0; j < functionOrder.Count; j++)
             {
-                if (functionOrder[i] != new ItemRef(0, imported + i))
-                    return false;
+                if (functionOrder[j].Module == 0)
+                    position[functionOrder[j].Index - imported] = j;
             }
 
-            for (int i = 0; i < ImportCount(0, Kind.Global) + first.Globals.Count; i++)
+            var newLayout = new (uint Start, uint Body, uint End)[functions.Count];
+            uint offset = (uint)WasmLeb128.GetULeb128Size((uint)functions.Count);
+            var scratch = new MemoryStream();
+            for (int j = 0; j < functions.Count; j++)
             {
-                if (!_maps[0].Globals.TryGetValue((uint)i, out uint index) || index != i)
-                    return false;
+                uint size = (uint)SectionMerger.EncodedFunctionBodyLength(functions[j], _typeDefinitions, j, scratch);
+                uint start = offset + (uint)WasmLeb128.GetULeb128Size(size);
+                uint body = start + size - (uint)functions[j].Body.Length - (EndImplied(functions[j].Body) ? 1u : 0u);
+                newLayout[j] = (start, body, start + size);
+                offset = start + size;
             }
 
-            var encoded = SectionMerger.EncodeFunctionBodies(functions.GetRange(0, count), _typeDefinitions);
-            uint offset = LebLength((uint)functions.Count);
-            for (int i = 0; i < count; i++)
+            var mapped = new List<CodeAddressMap.Function>(first.Functions.Count);
+            for (int i = 0; i < first.Functions.Count; i++)
             {
                 var original = first.Functions[i];
-                uint size = (uint)encoded[i].Bytes.Length;
-                uint localsStart = offset + LebLength(size);
-                uint originalSize = original.BodyCodeSectionOffset - original.LocalsCodeSectionOffset +
-                    (uint)original.Body.Length + (original.Body.Length == 0 || original.Body[^1] != 0x0B ? 1u : 0u);
-                if (original.LocalsCodeSectionOffset == 0 || localsStart != original.LocalsCodeSectionOffset || size != originalSize)
-                    return false;
-                offset = localsStart + size;
+                if (original.LocalsCodeSectionOffset == 0 || original.BodyCodeSectionOffset == 0)
+                {
+                    reason = "its code offsets are unknown (the module was not read from a binary)";
+                    return null;
+                }
+
+                uint oldEnd = original.BodyCodeSectionOffset + (uint)original.Body.Length + (EndImplied(original.Body) ? 1u : 0u);
+                if (position.TryGetValue(i, out int j))
+                {
+                    mapped.Add(new CodeAddressMap.Function(
+                        original.LocalsCodeSectionOffset, original.BodyCodeSectionOffset, oldEnd,
+                        true, newLayout[j].Start, newLayout[j].Body, newLayout[j].End, _resized.TryGetValue(i, out var r) ? r : Array.Empty<CodeAddressMap.Resized>()));
+                }
+                else
+                {
+                    mapped.Add(new CodeAddressMap.Function(
+                        original.LocalsCodeSectionOffset, original.BodyCodeSectionOffset, oldEnd, false, 0, 0, 0, []));
+                }
             }
 
-            return true;
+            return new CodeAddressMap(mapped);
         }
 
-        private static uint LebLength(uint value)
-        {
-            uint length = 1;
-            while ((value >>= 7) != 0)
-                length++;
-            return length;
-        }
+        private static bool EndImplied(byte[] body) => body.Length == 0 || body[^1] != WasmOpcode.End;
 
         // ── Exports and import fusion ─────────────────────────────────────────
 
@@ -485,16 +574,6 @@ public static class ModuleMerger
 
             foreach (var (_, kind, target) in _exports)
                 Mark(kind, target);
-
-            // With -g, removing even one dead function of the first input would move every function after it
-            // and invalidate its DWARF, so its functions and globals are kept (binaryen rewrites DWARF instead).
-            if (_options.DebugInfo && _modules[0].CustomSections.Any(c => IsDebugSection(c.Name)))
-            {
-                for (int i = 0; i < ImportCount(0, Kind.Func) + _modules[0].Functions.Count; i++)
-                    Mark(Kind.Func, new ItemRef(0, i));
-                for (int i = 0; i < ImportCount(0, Kind.Global) + _modules[0].Globals.Count; i++)
-                    Mark(Kind.Global, new ItemRef(0, i));
-            }
 
             for (int m = 0; m < _modules.Length; m++)
             {
@@ -756,6 +835,7 @@ public static class ModuleMerger
             int m = item.Module;
             var function = _modules[m].Functions[item.Index - ImportCount(m, Kind.Func)];
             var map = _maps[m];
+            List<CodeAddressMap.Resized>? resized = m == 0 ? [] : null;
             var remapped = new WasmFunction
             {
                 TypeIndex = (int)MapType(m, function.TypeIndex),
@@ -772,9 +852,11 @@ public static class ModuleMerger
                     IndexSpace.Data => map.DataSegments[index],
                     IndexSpace.Element => map.Elements[index],
                     _ => throw new InvalidOperationException(),
-                }),
+                }, compact: true, resized),
             };
             remapped.CopyBranchHintsFrom(function);
+            if (resized is { Count: > 0 })
+                _resized[item.Index - ImportCount(m, Kind.Func)] = resized;
             return remapped;
         }
 
@@ -996,29 +1078,45 @@ internal enum IndexSpace { Type, Function, Table, Memory, Global, Tag, Data, Ele
 /// indices in memargs and GC type immediates — is rewritten.
 /// </summary>
 /// <remarks>
-/// A rewritten immediate keeps its original LEB128 width whenever the new value fits, so a body
-/// whose indices only move (wasm-ld pads relocated indices to five bytes) keeps its exact length and
-/// every instruction keeps its code offset — which is what lets DWARF for it survive the merge.
+/// By default a rewritten immediate keeps its original LEB128 width whenever the new value fits, so a body
+/// whose indices only move (wasm-ld pads relocated indices to five bytes) keeps its exact length. In compact
+/// mode every LEB128 immediate (indices, labels, locals, constants, memargs) is written at its minimal width,
+/// as binaryen writes code, and the old→new offset breakpoints are reported so DWARF can follow the code.
 /// </remarks>
 internal static class BodyRewriter
 {
-    public static byte[] Rewrite(byte[] body, Func<IndexSpace, uint, uint> map)
+    public static byte[] Rewrite(byte[] body, Func<IndexSpace, uint, uint> map) => Rewrite(body, map, compact: false, resized: null);
+
+    /// <summary>
+    /// Rewrites <paramref name="body"/>. When <paramref name="resized"/> is given, it receives the old and new
+    /// extent of every instruction whose length changed, in order; offsets between them shift by the
+    /// accumulated difference.
+    /// </summary>
+    public static byte[] Rewrite(byte[] body, Func<IndexSpace, uint, uint> map, bool compact, List<CodeAddressMap.Resized>? resized)
     {
         var output = new MemoryStream(body.Length + 16);
         var cursor = new InstructionCursor(body, WasmFeatures.All);
         var encoded = new MemoryStream();
         int copied = 0;
+        int delta = 0;
         while (cursor.MoveNext(out DecodedInstruction instruction))
         {
             encoded.SetLength(0);
             var reader = new ImmediateReader(body, instruction.ImmediateOffset);
-            var writer = new Writer(encoded, body, instruction.ByteOffset, instruction.ImmediateOffset);
-            if (!Encode(instruction, ref reader, ref writer, map))
+            var writer = new Writer(encoded, body, instruction.ByteOffset, instruction.ImmediateOffset, compact);
+            if (!Encode(instruction, ref reader, ref writer, map, compact))
                 continue;
 
             output.Write(body, copied, instruction.ByteOffset - copied);
+            int newStart = (int)output.Length;
             output.Write(encoded.GetBuffer(), 0, (int)encoded.Length);
             copied = cursor.Position;
+            int newDelta = (int)output.Length - copied;
+            if (newDelta != delta)
+            {
+                delta = newDelta;
+                resized?.Add(new CodeAddressMap.Resized(instruction.ByteOffset, copied, newStart, (int)output.Length));
+            }
         }
 
         if (copied == 0)
@@ -1027,13 +1125,37 @@ internal static class BodyRewriter
         return output.ToArray();
     }
 
-    /// <summary>Writes the re-encoded instruction; returns false when it names no index.</summary>
-    private static bool Encode(DecodedInstruction instruction, ref ImmediateReader r, ref Writer w, Func<IndexSpace, uint, uint> map)
+    /// <summary>Writes the re-encoded instruction; returns false when it has nothing to rewrite.</summary>
+    private static bool Encode(DecodedInstruction instruction, ref ImmediateReader r, ref Writer w, Func<IndexSpace, uint, uint> map, bool compact)
     {
         var id = instruction.OpcodeId;
         byte op = id.Opcode;
         if (!id.IsPrefixed)
         {
+            if (compact && op is WasmOpcode.Br or WasmOpcode.BrIf or WasmOpcode.BrTable or WasmOpcode.Rethrow or WasmOpcode.Delegate or WasmOpcode.LocalGet or WasmOpcode.LocalSet or WasmOpcode.LocalTee or WasmOpcode.I32Const or WasmOpcode.I64Const or WasmOpcode.BrOnNull or WasmOpcode.BrOnNonNull)
+            {
+                w.Opcode();
+                switch (op)
+                {
+                    case 0x0E:
+                    {
+                        uint count = Copy(ref r, ref w);
+                        for (uint i = 0; i <= count; i++)
+                            Copy(ref r, ref w);
+                        break;
+                    }
+
+                    case 0x41 or 0x42:
+                        w.Signed(r.S64(out _), 0);
+                        break;
+                    default:
+                        Copy(ref r, ref w);
+                        break;
+                }
+
+                return true;
+            }
+
             w.Opcode();
             switch (op)
             {
@@ -1100,7 +1222,7 @@ internal static class BodyRewriter
         uint sub = id.SubOpcode;
         switch (op)
         {
-            case 0xFC:
+            case WasmOpcode.MiscPrefix:
                 switch (sub)
                 {
                     case 8:
@@ -1123,7 +1245,7 @@ internal static class BodyRewriter
                         return false;
                 }
 
-            case 0xFD:
+            case WasmOpcode.SimdPrefix:
             {
                 bool memarg = sub <= 0x0B || sub is 0x5C or 0x5D;
                 bool laneMemarg = sub is >= 0x54 and <= 0x5B;
@@ -1137,7 +1259,7 @@ internal static class BodyRewriter
                 return true;
             }
 
-            case 0xFB:
+            case WasmOpcode.GcPrefix:
             {
                 w.Opcode();
                 Copy(ref r, ref w);
@@ -1176,7 +1298,7 @@ internal static class BodyRewriter
                 return true;
             }
 
-            case 0xE0:
+            case WasmOpcode.StackSwitchingPrefix:
                 throw new LinkerException(
                     $"Merging stack-switching instruction 0xE0:{sub:X} is not supported.");
 
@@ -1264,16 +1386,15 @@ internal static class BodyRewriter
         public ulong U64(out int width)
         {
             int start = _pc;
-            ulong result = 0;
-            int shift = 0;
-            byte b;
-            do
-            {
-                b = code[_pc++];
-                result |= (ulong)(b & 0x7F) << shift;
-                shift += 7;
-            }
-            while ((b & 0x80) != 0);
+            ulong result = DwarfReaderHelpers.ReadULEB128U64(code, ref _pc);
+            width = _pc - start;
+            return result;
+        }
+
+        public long S64(out int width)
+        {
+            int start = _pc;
+            long result = DwarfReaderHelpers.ReadSLEB128(code, ref _pc);
             width = _pc - start;
             return result;
         }
@@ -1281,14 +1402,14 @@ internal static class BodyRewriter
         public long S33(out int width)
         {
             int start = _pc;
-            long value = S33Leb128.Read(code, ref _pc);
+            long value = WasmLeb128.ReadS33(code, ref _pc);
             width = _pc - start;
             return value;
         }
     }
 
-    /// <summary>Writes an instruction, padding each LEB128 to its original width when the value fits.</summary>
-    private ref struct Writer(MemoryStream output, byte[] code, int opcodeStart, int immediateStart)
+    /// <summary>Writes an instruction, padding each LEB128 to its original width when the value fits (unless compact).</summary>
+    private ref struct Writer(MemoryStream output, byte[] code, int opcodeStart, int immediateStart, bool compact)
     {
         public readonly void Opcode() => output.Write(code, opcodeStart, immediateStart - opcodeStart);
 
@@ -1299,7 +1420,7 @@ internal static class BodyRewriter
             int minimum = 1;
             for (ulong v = value >> 7; v != 0; v >>= 7)
                 minimum++;
-            int bytes = Math.Max(minimum, width);
+            int bytes = compact ? minimum : Math.Max(minimum, width);
             for (int i = 0; i < bytes; i++)
             {
                 byte b = (byte)(value & 0x7F);
@@ -1313,7 +1434,7 @@ internal static class BodyRewriter
             int minimum = 1;
             for (long v = value; v is < -64 or > 63; v >>= 7)
                 minimum++;
-            int bytes = Math.Max(minimum, width);
+            int bytes = compact ? minimum : Math.Max(minimum, width);
             for (int i = 0; i < bytes; i++)
             {
                 byte b = (byte)(value & 0x7F);

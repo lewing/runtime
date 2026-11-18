@@ -117,9 +117,9 @@ public static class DwarfLineReader
         while (pos < headerEnd && data[pos] != 0)
         {
             string name = ReadNullTerminatedString(data, ref pos);
-            uint dirIdx = ReadUleb128(data, ref pos);
-            ReadUleb128(data, ref pos); // last modified time
-            ReadUleb128(data, ref pos); // file length
+            uint dirIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
+            DwarfReaderHelpers.ReadULEB128(data, ref pos); // last modified time
+            DwarfReaderHelpers.ReadULEB128(data, ref pos); // file length
 
             string dir = dirIdx < (uint)dirs.Count ? dirs[(int)dirIdx] : "";
             files.Add(dir.Length > 0 ? dir + "/" + name : name);
@@ -130,9 +130,6 @@ public static class DwarfLineReader
 
     // ── DWARF 5 header parsing ─────────────────────────────────────────────
 
-    private const uint DW_LNCT_path = 1;
-    private const uint DW_LNCT_directory_index = 2;
-
     private static List<string> ParseDwarf5FilePaths(
         ReadOnlySpan<byte> data, ref int pos,
         byte[]? lineStrData, byte[]? strData)
@@ -141,16 +138,16 @@ public static class DwarfLineReader
         byte dirFmtCount = data[pos++];
         var dirFmts = new (uint ContentType, uint Form)[dirFmtCount];
         for (int i = 0; i < dirFmtCount; i++)
-            dirFmts[i] = (ReadUleb128(data, ref pos), ReadUleb128(data, ref pos));
+            dirFmts[i] = (DwarfReaderHelpers.ReadULEB128(data, ref pos), DwarfReaderHelpers.ReadULEB128(data, ref pos));
 
-        uint dirCount = ReadUleb128(data, ref pos);
+        uint dirCount = DwarfReaderHelpers.ReadULEB128(data, ref pos);
         var dirs = new List<string>((int)dirCount);
         for (uint i = 0; i < dirCount; i++)
         {
             string dirPath = "";
             foreach (var (ct, form) in dirFmts)
             {
-                if (ct == DW_LNCT_path)
+                if (ct == DwLnct.Path)
                     dirPath = ReadStringByForm(data, ref pos, form, lineStrData, strData) ?? "";
                 else
                     SkipFormValue(data, ref pos, form, addrSize: 4);
@@ -162,9 +159,9 @@ public static class DwarfLineReader
         byte fileFmtCount = data[pos++];
         var fileFmts = new (uint ContentType, uint Form)[fileFmtCount];
         for (int i = 0; i < fileFmtCount; i++)
-            fileFmts[i] = (ReadUleb128(data, ref pos), ReadUleb128(data, ref pos));
+            fileFmts[i] = (DwarfReaderHelpers.ReadULEB128(data, ref pos), DwarfReaderHelpers.ReadULEB128(data, ref pos));
 
-        uint fileCount = ReadUleb128(data, ref pos);
+        uint fileCount = DwarfReaderHelpers.ReadULEB128(data, ref pos);
         var files = new List<string>((int)fileCount);
         for (uint i = 0; i < fileCount; i++)
         {
@@ -173,9 +170,9 @@ public static class DwarfLineReader
             bool hasDirIdx = false;
             foreach (var (ct, form) in fileFmts)
             {
-                if (ct == DW_LNCT_path)
+                if (ct == DwLnct.Path)
                     filePath = ReadStringByForm(data, ref pos, form, lineStrData, strData) ?? "";
-                else if (ct == DW_LNCT_directory_index)
+                else if (ct == DwLnct.DirectoryIndex)
                 {
                     dirIdx = ReadUnsignedByForm(data, ref pos, form);
                     hasDirIdx = true;
@@ -235,40 +232,40 @@ public static class DwarfLineReader
             else if (op == 0)
             {
                 // Extended opcode
-                int extLen = (int)ReadUleb128(data, ref pos);
+                int extLen = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos);
                 int extEnd = pos + extLen;
                 if (extLen == 0 || extEnd > programEnd) { pos = extEnd; continue; }
 
                 byte extOp = data[pos++];
                 switch (extOp)
                 {
-                    case 1: // DW_LNE_end_sequence
+                    case DwLne.EndSequence:
                         EmitRow(isEnd: true);
                         address = 0; fileIdx = version >= 5 ? 0u : 1u;
                         line = 1; column = 0; isStmt = defaultIsStmt; prologueEnd = false;
                         break;
 
-                    case 2: // DW_LNE_set_address
+                    case DwLne.SetAddress:
                         address = addrSize == 8
                             ? (uint)ReadU64LE(data, pos)
                             : ReadU32LE(data, pos);
                         pos += addrSize;
                         break;
 
-                    case 3: // DW_LNE_define_file (DWARF4 only)
+                    case DwLne.DefineFile: // DWARF4 only
                         if (version < 5)
                         {
                             string name = ReadNullTerminatedString(data, ref pos);
-                            uint dirIdx = ReadUleb128(data, ref pos);
-                            ReadUleb128(data, ref pos); // mtime
-                            ReadUleb128(data, ref pos); // size
+                            uint dirIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
+                            DwarfReaderHelpers.ReadULEB128(data, ref pos); // mtime
+                            DwarfReaderHelpers.ReadULEB128(data, ref pos); // size
                             fileNames.Add(dirIdx < (uint)fileNames.Count
                                 ? fileNames[(int)dirIdx] + "/" + name : name);
                         }
                         break;
 
-                    case 4: // DW_LNE_set_discriminator
-                        ReadUleb128(data, ref pos);
+                    case DwLne.SetDiscriminator:
+                        DwarfReaderHelpers.ReadULEB128(data, ref pos);
                         break;
 
                     default:
@@ -281,50 +278,50 @@ public static class DwarfLineReader
                 // Standard opcode
                 switch (op)
                 {
-                    case 1: // DW_LNS_copy
+                    case DwLns.Copy:
                         EmitRow();
                         break;
 
-                    case 2: // DW_LNS_advance_pc
-                        address += ReadUleb128(data, ref pos) * minInsnLen;
+                    case DwLns.AdvancePc:
+                        address += DwarfReaderHelpers.ReadULEB128(data, ref pos) * minInsnLen;
                         break;
 
-                    case 3: // DW_LNS_advance_line
-                        line += ReadSleb128(data, ref pos);
+                    case DwLns.AdvanceLine:
+                        line += (int)DwarfReaderHelpers.ReadSLEB128(data, ref pos);
                         break;
 
-                    case 4: // DW_LNS_set_file
-                        fileIdx = ReadUleb128(data, ref pos);
+                    case DwLns.SetFile:
+                        fileIdx = DwarfReaderHelpers.ReadULEB128(data, ref pos);
                         break;
 
-                    case 5: // DW_LNS_set_column
-                        column = (int)ReadUleb128(data, ref pos);
+                    case DwLns.SetColumn:
+                        column = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos);
                         break;
 
-                    case 6: // DW_LNS_negate_stmt
+                    case DwLns.NegateStmt:
                         isStmt = !isStmt;
                         break;
 
-                    case 7: // DW_LNS_set_basic_block
+                    case DwLns.SetBasicBlock:
                         break;
 
-                    case 8: // DW_LNS_const_add_pc
+                    case DwLns.ConstAddPc:
                         address += (uint)(((255 - opcodeBase) / lineRange) * minInsnLen);
                         break;
 
-                    case 9: // DW_LNS_fixed_advance_pc
+                    case DwLns.FixedAdvancePc:
                         address += ReadU16LE(data, pos); pos += 2;
                         break;
 
-                    case 10: // DW_LNS_set_prologue_end
+                    case DwLns.SetPrologueEnd:
                         prologueEnd = true;
                         break;
 
-                    case 11: // DW_LNS_set_epilogue_begin
+                    case DwLns.SetEpilogueBegin:
                         break; // no state needed
 
-                    case 12: // DW_LNS_set_isa
-                        ReadUleb128(data, ref pos);
+                    case DwLns.SetIsa:
+                        DwarfReaderHelpers.ReadULEB128(data, ref pos);
                         break;
 
                     default:
@@ -332,7 +329,7 @@ public static class DwarfLineReader
                         int opsIdx = op - 1;
                         int nOps = opsIdx < stdOpcodeLengths.Length ? stdOpcodeLengths[opsIdx] : 0;
                         for (int i = 0; i < nOps; i++)
-                            ReadUleb128(data, ref pos);
+                            DwarfReaderHelpers.ReadULEB128(data, ref pos);
                         break;
                 }
             }
@@ -352,37 +349,6 @@ public static class DwarfLineReader
     private static ulong ReadU64LE(ReadOnlySpan<byte> data, int pos) =>
         (ulong)ReadU32LE(data, pos) | ((ulong)ReadU32LE(data, pos + 4) << 32);
 
-    private static uint ReadUleb128(ReadOnlySpan<byte> data, ref int pos)
-    {
-        uint v = 0; int shift = 0;
-        while (pos < data.Length)
-        {
-            byte b = data[pos++];
-            v |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return v;
-            shift += 7;
-            if (shift >= 35) break;
-        }
-        return v;
-    }
-
-    private static int ReadSleb128(ReadOnlySpan<byte> data, ref int pos)
-    {
-        int v = 0; int shift = 0;
-        while (pos < data.Length)
-        {
-            byte b = data[pos++];
-            v |= (b & 0x7F) << shift;
-            shift += 7;
-            if ((b & 0x80) == 0)
-            {
-                if (shift < 32 && (b & 0x40) != 0) v |= ~0 << shift;
-                return v;
-            }
-        }
-        return v;
-    }
-
     private static string ReadNullTerminatedString(ReadOnlySpan<byte> data, ref int pos)
     {
         int start = pos;
@@ -396,18 +362,18 @@ public static class DwarfLineReader
         ReadOnlySpan<byte> data, ref int pos, uint form,
         byte[]? lineStrData, byte[]? strData)
     {
-        switch (form)
+        switch ((DwForm)form)
         {
-            case 0x08: // DW_FORM_string
+            case DwForm.String:
                 return ReadNullTerminatedString(data, ref pos);
 
-            case 0x0e: // DW_FORM_strp
+            case DwForm.Strp:
             {
                 uint offset = ReadU32LE(data, pos); pos += 4;
                 return ReadStringFromSection(strData, (int)offset);
             }
 
-            case 0x1f: // DW_FORM_line_strp
+            case DwForm.LineStrp:
             {
                 uint offset = ReadU32LE(data, pos); pos += 4;
                 return ReadStringFromSection(lineStrData, (int)offset);
@@ -429,39 +395,39 @@ public static class DwarfLineReader
 
     private static uint ReadUnsignedByForm(ReadOnlySpan<byte> data, ref int pos, uint form)
     {
-        switch (form)
+        switch ((DwForm)form)
         {
-            case 0x0b: return data[pos++];                          // DW_FORM_data1
-            case 0x05: { var v = ReadU16LE(data, pos); pos += 2; return v; } // DW_FORM_data2
-            case 0x06: { var v = ReadU32LE(data, pos); pos += 4; return v; } // DW_FORM_data4
-            case 0x0f: return ReadUleb128(data, ref pos);           // DW_FORM_udata
+            case DwForm.Data1: return data[pos++];
+            case DwForm.Data2: { var v = ReadU16LE(data, pos); pos += 2; return v; }
+            case DwForm.Data4: { var v = ReadU32LE(data, pos); pos += 4; return v; }
+            case DwForm.Udata: return DwarfReaderHelpers.ReadULEB128(data, ref pos);
             default: SkipFormValue(data, ref pos, form, addrSize: 4); return 0;
         }
     }
 
     private static void SkipFormValue(ReadOnlySpan<byte> data, ref int pos, uint form, byte addrSize)
     {
-        switch (form)
+        switch ((DwForm)form)
         {
-            case 0x01: pos += addrSize; break;              // DW_FORM_addr
-            case 0x05: pos += 2; break;                     // DW_FORM_data2
-            case 0x06: pos += 4; break;                     // DW_FORM_data4
-            case 0x07: pos += 8; break;                     // DW_FORM_data8
-            case 0x08: while (pos < data.Length && data[pos] != 0) pos++; if (pos < data.Length) pos++; break; // string
-            case 0x09: pos += (int)ReadUleb128(data, ref pos); break;  // block
-            case 0x0b: pos += 1; break;                     // data1
-            case 0x0e: pos += 4; break;                     // strp
-            case 0x0f: ReadUleb128(data, ref pos); break;   // udata
-            case 0x1a: ReadUleb128(data, ref pos); break;   // strx
-            case 0x1b: ReadUleb128(data, ref pos); break;   // addrx
-            case 0x1e: pos += 16; break;                    // data16
-            case 0x1f: pos += 4; break;                     // line_strp
-            case 0x25: pos += 1; break;                     // strx1
-            case 0x26: pos += 2; break;                     // strx2
-            case 0x28: pos += 4; break;                     // strx4
-            case 0x29: pos += 1; break;                     // addrx1
-            case 0x2a: pos += 2; break;                     // addrx2
-            case 0x2c: pos += 4; break;                     // addrx4
+            case DwForm.Addr: pos += addrSize; break;
+            case DwForm.Data2: pos += 2; break;
+            case DwForm.Data4: pos += 4; break;
+            case DwForm.Data8: pos += 8; break;
+            case DwForm.String: while (pos < data.Length && data[pos] != 0) pos++; if (pos < data.Length) pos++; break;
+            case DwForm.Block: { int length = (int)DwarfReaderHelpers.ReadULEB128(data, ref pos); pos += length; break; }
+            case DwForm.Data1: pos += 1; break;
+            case DwForm.Strp: pos += 4; break;
+            case DwForm.Udata: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
+            case DwForm.Strx: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
+            case DwForm.Addrx: DwarfReaderHelpers.ReadULEB128(data, ref pos); break;
+            case DwForm.Data16: pos += 16; break;
+            case DwForm.LineStrp: pos += 4; break;
+            case DwForm.Strx1: pos += 1; break;
+            case DwForm.Strx2: pos += 2; break;
+            case DwForm.Strx4: pos += 4; break;
+            case DwForm.Addrx1: pos += 1; break;
+            case DwForm.Addrx2: pos += 2; break;
+            case DwForm.Addrx4: pos += 4; break;
             default: break;                                  // unknown: stop
         }
     }

@@ -19,44 +19,63 @@ public static class ArArchiveReader
     private static ReadOnlySpan<byte> ArMagicBytes => "!<arch>\n"u8;
     private static ReadOnlySpan<byte> WasmMagicBytes => "\0asm"u8;
 
+    /// <summary>Where a member's contents lie in an archive stream.</summary>
+    internal readonly record struct MemberLayout(string Name, long Offset, int Length);
+
     /// <summary>
     /// Read all members from an ar archive stream.
     /// </summary>
     public static List<ArchiveMember> ReadMembers(Stream stream, string? sourcePath = null)
     {
-        string context = sourcePath ?? "<archive>";
+        var members = new List<ArchiveMember>();
+        foreach (MemberLayout member in ReadMemberLayouts(stream, sourcePath))
+        {
+            stream.Position = member.Offset;
+            byte[] data = new byte[member.Length];
+            ReadExactly(stream, data, $"Archive '{sourcePath ?? "<archive>"}' ended in the middle of member '{member.Name}'.");
+            members.Add(new ArchiveMember(member.Name, data));
+        }
 
-        Span<byte> magic = stackalloc byte[8];
-        ReadExactly(stream, magic, $"Archive '{context}' ended before the global header.");
-        if (!magic.SequenceEqual(ArMagicBytes))
+        return members;
+    }
+
+    /// <summary>
+    /// Reads a seekable archive stream's member headers (and its long-name table) without reading members'
+    /// contents: each member's name and where its contents lie. Symbol tables are skipped. The stream may be
+    /// repositioned between members.
+    /// </summary>
+    internal static IEnumerable<MemberLayout> ReadMemberLayouts(Stream stream, string? sourcePath = null)
+    {
+        string context = sourcePath ?? "<archive>";
+        byte[] header = new byte[60];
+        ReadExactly(stream, header.AsSpan(0, 8), $"Archive '{context}' ended before the global header.");
+        if (!header.AsSpan(0, 8).SequenceEqual(ArMagicBytes))
             throw new InvalidDataException($"File '{context}' is not a valid ar archive.");
 
-        var members = new List<ArchiveMember>();
         byte[]? longNameTable = null;
-        Span<byte> header = stackalloc byte[60];
-
-        while (stream.Position < stream.Length)
+        long next = stream.Position;
+        while (next < stream.Length)
         {
+            stream.Position = next;
             ReadExactly(stream, header, $"Archive '{context}' ended in the middle of a member header.");
 
             if (header[58] != (byte)'`' || header[59] != (byte)'\n')
                 throw new InvalidDataException($"Archive '{context}' contains an invalid member header terminator.");
 
-            int size = ParseArchiveNumber(header.Slice(48, 10), context, "size");
-            if (size < 0 || stream.Length - stream.Position < size)
+            int size = ParseArchiveNumber(header.AsSpan(48, 10), context, "size");
+            long payload = stream.Position;
+            if (size < 0 || stream.Length - payload < size)
                 throw new InvalidDataException($"Archive '{context}' member payload extends past end of file.");
 
-            string rawName = Encoding.ASCII.GetString(header[..16]).Trim();
-            byte[] payload = new byte[size];
-            ReadExactly(stream, payload, $"Archive '{context}' ended in the middle of member '{rawName}'.");
-
-            if ((stream.Position & 1) != 0 && stream.Position < stream.Length)
-                stream.ReadByte();
+            string rawName = Encoding.ASCII.GetString(header, 0, 16).Trim();
+            long end = payload + size;
+            next = end + (end & 1);
 
             // GNU/SysV long-name table
             if (rawName == "//")
             {
-                longNameTable = payload;
+                longNameTable = new byte[size];
+                ReadExactly(stream, longNameTable, $"Archive '{context}' ended in the middle of member '{rawName}'.");
                 continue;
             }
 
@@ -64,10 +83,25 @@ public static class ArArchiveReader
             if (rawName is "/" or "/SYM64/" or "__.SYMDEF" or "__.SYMDEF SORTED")
                 continue;
 
-            members.Add(ResolveArchiveMember(rawName, payload, longNameTable.AsSpan(), context));
-        }
+            // BSD extended name: "#1/N" — name occupies first N bytes of payload
+            if (rawName.StartsWith("#1/", StringComparison.Ordinal))
+            {
+                if (!int.TryParse(rawName[3..], NumberStyles.None, CultureInfo.InvariantCulture, out int nameLength) ||
+                    nameLength < 0 ||
+                    nameLength > size)
+                {
+                    throw new InvalidDataException(
+                        $"Archive '{context}' contains an invalid BSD member name length '{rawName}'.");
+                }
 
-        return members;
+                byte[] name = new byte[nameLength];
+                ReadExactly(stream, name, $"Archive '{context}' ended in the middle of member '{rawName}'.");
+                yield return new MemberLayout(Encoding.UTF8.GetString(name).TrimEnd('\0'), payload + nameLength, size - nameLength);
+                continue;
+            }
+
+            yield return new MemberLayout(ResolveName(rawName, longNameTable, context), payload, size);
+        }
     }
 
     /// <summary>
@@ -92,40 +126,21 @@ public static class ArArchiveReader
         return result;
     }
 
-    private static ArchiveMember ResolveArchiveMember(
-        string rawName,
-        byte[] payload,
-        ReadOnlySpan<byte> longNameTable,
-        string context)
+    // A GNU/SysV member name: "/N" is at offset N in the long-name table; a short name ends in '/'.
+    private static string ResolveName(string rawName, byte[]? longNameTable, string context)
     {
-        // BSD extended name: "#1/N" — name occupies first N bytes of payload
-        if (rawName.StartsWith("#1/", StringComparison.Ordinal))
-        {
-            if (!int.TryParse(rawName[3..], NumberStyles.None, CultureInfo.InvariantCulture, out int nameLength) ||
-                nameLength < 0 ||
-                nameLength > payload.Length)
-            {
-                throw new InvalidDataException(
-                    $"Archive '{context}' contains an invalid BSD member name length '{rawName}'.");
-            }
-
-            string name = Encoding.UTF8.GetString(payload.AsSpan(0, nameLength)).TrimEnd('\0');
-            return new ArchiveMember(name, payload[nameLength..]);
-        }
-
-        // GNU/SysV long name: "/N" — name at offset N in the long-name table
         if (rawName.Length > 1 && rawName[0] == '/' &&
             int.TryParse(rawName[1..], NumberStyles.None, CultureInfo.InvariantCulture, out int offset))
         {
-            if (offset < 0 || offset >= longNameTable.Length)
+            ReadOnlySpan<byte> table = longNameTable;
+            if (offset < 0 || offset >= table.Length)
                 throw new InvalidDataException(
                     $"Archive '{context}' contains an out-of-range long-name offset '{offset}'.");
 
-            string name = ReadLongName(longNameTable[offset..]);
-            return new ArchiveMember(name, payload);
+            return ReadLongName(table[offset..]);
         }
 
-        return new ArchiveMember(rawName.TrimEnd('/', ' '), payload);
+        return rawName.TrimEnd('/', ' ');
     }
 
     private static string ReadLongName(ReadOnlySpan<byte> longNameBytes)

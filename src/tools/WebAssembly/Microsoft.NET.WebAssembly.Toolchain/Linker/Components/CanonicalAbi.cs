@@ -3,6 +3,8 @@
 
 namespace Microsoft.NET.WebAssembly.Linker.Components;
 
+using Microsoft.NET.WebAssembly.Binary;
+
 /// <summary>Canonical ABI flattening of component function types (component model CanonicalABI.md).</summary>
 internal sealed class CanonicalAbi(WitWorld world)
 {
@@ -26,14 +28,14 @@ internal sealed class CanonicalAbi(WitWorld world)
                     return new ResolvedDef(scope, t.Type);
                 case CtAliasDecl { Target: CtAliasSymbol symbol }:
                     WitInterface target = world.Lookup(symbol);
-                    if (!target.Exports.TryGetValue(symbol.Name, out int e) || target.Decls[e] is not CtExportDecl { Desc.Kind: CtExternDesc.Type } export)
+                    if (!target.Exports.TryGetValue(symbol.Name, out int e) || target.Decls[e] is not CtExportDecl { Desc.Kind: ComponentExternKind.Type } export)
                         throw new LinkerException($"interface `{target.Name}` does not export a type named `{symbol.Name}`.");
                     if (export.Desc.SubResource)
                         return new ResolvedResource();
                     scope = target;
                     index = export.Desc.Index;
                     break;
-                case CtExportDecl { Desc.Kind: CtExternDesc.Type } local:
+                case CtExportDecl { Desc.Kind: ComponentExternKind.Type } local:
                     if (local.Desc.SubResource)
                         return new ResolvedResource();
                     index = local.Desc.Index;
