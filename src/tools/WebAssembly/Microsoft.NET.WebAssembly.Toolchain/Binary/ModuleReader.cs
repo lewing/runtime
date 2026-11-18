@@ -4,7 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Binary;
 
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Binary.Writing;
 using Microsoft.NET.WebAssembly.Module;
@@ -69,9 +69,7 @@ public static partial class ModuleReader
     internal static WasmModule ParseCoreModule(Stream stream, ModuleReaderOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        var reader = new WasmBinaryReader(stream);
-        ValidateHeader(reader);
-        return ReadCoreAfterHeader(reader, streamSections: true, options: options ?? ModuleReaderOptions.Default);
+        return ReadCoreFromStream(stream, includesHeader: true, options ?? ModuleReaderOptions.Default);
     }
 
     /// <summary>Read and validate a core module.</summary>
@@ -82,256 +80,73 @@ public static partial class ModuleReader
 
     /// <summary>Parse a core module from an in-memory buffer. Internal only.</summary>
     internal static WasmModule ParseCoreModule(ReadOnlyMemory<byte> bytes, ModuleReaderOptions? options = null)
-    {
-        using var stream = MemoryMarshal.TryGetArray(bytes, out ArraySegment<byte> segment)
-            ? new MemoryStream(segment.Array!, segment.Offset, segment.Count, writable: false, publiclyVisible: true)
-            : new MemoryStream(bytes.ToArray(), writable: false);
-        return ReadCore(new WasmBinaryReader(stream), options: options);
-    }
+        => ReadCoreInPlace(bytes.Span, baseOffset: 0, includesHeader: true, options);
 
-    private static WasmModule ReadCore(WasmBinaryReader reader, bool streamSections = false, ModuleReaderOptions? options = null)
+    /// <summary>
+    /// Parses a core module from <paramref name="stream"/>, reading each section once. A <see cref="MemoryStream"/>
+    /// whose buffer is exposed is parsed in place, without copying; any other stream is read a section at a time
+    /// into a pooled buffer.
+    /// </summary>
+    /// <param name="stream">The stream, positioned at the module.</param>
+    /// <param name="includesHeader">Whether the stream starts at the 8-byte header, or just after it.</param>
+    /// <param name="options">The reader options; <see langword="null"/> skips the debug sections.</param>
+    private static WasmModule ReadCoreFromStream(Stream stream, bool includesHeader, ModuleReaderOptions? options)
     {
-        ValidateHeader(reader);
-        return ReadCoreAfterHeader(reader, streamSections, options);
-    }
-
-    private static WasmModule ReadCoreAfterHeader(WasmBinaryReader reader, bool streamSections = false, ModuleReaderOptions? options = null)
-    {
-        var types = new List<FuncType>();
-        var typeDefinitions = new List<TypeDefinition>();
-        var imports = new List<Import>();
-        var typeIndices = new List<int>();
-        var tables = new List<TableType>();
-        var memories = new List<MemoryType>();
-        var globals = new List<WasmGlobal>();
-        var exports = new OrderedDictionary<string, Export>();
-        var exportEntries = new List<Export>();
-        int? startFunction = null;
-        var elements = new List<Element>();
-        var functions = new List<WasmFunction>();
-        var dataSegments = new List<Data>();
-        var customSections = new List<CustomSection>();
-        LinkingSection? linkingSection = null;
-        ProducersSection? producersSection = null;
-        TargetFeaturesSection? targetFeaturesSection = null;
-        var relocationSections = new List<RelocationSection>();
-        uint? dataCount = null;
-        var tags = new List<Tag>();
-        // decodeModule shares the section lists by reference so that body decoding (which runs
-        // when the code section is reached, after imports/memories are parsed) can resolve
-        // memory64 memarg offsets via Imports/Memories.
-        var decodeModule = new WasmModule
+        if (stream.GetType() == typeof(MemoryStream) && ((MemoryStream)stream).TryGetBuffer(out ArraySegment<byte> buffer)
+            && stream.Position <= buffer.Count)
         {
-            Types = types,
-            TypeDefinitions = typeDefinitions,
-            Functions = functions,
-            Imports = imports,
-            Memories = memories,
-        };
-        var features = (options ?? ModuleReaderOptions.Default).Features;
+            int start = (int)stream.Position;
+            var parsed = ReadCoreInPlace(buffer.AsSpan(start), start, includesHeader, options);
+            stream.Position = buffer.Count;
+            return parsed;
+        }
 
-        int lastSectionPosition = -1; // tracks ordering of non-custom sections
-        bool codeSectionSeen = false;
+        using var framing = new WasmSectionStream(stream, nonSeekableStart: includesHeader ? 0 : 8);
+        if (includesHeader)
+            ValidateHeader(framing);
+        var module = new CoreModuleSections(options);
+        while (framing.TryReadByte(out byte sectionId))
+        {
+            uint sectionSize = framing.ReadU32();
+            ValidateSectionOrder(sectionId, ref module.LastSectionPosition);
+            var section = framing.ReadPayload(SectionLength(sectionId, sectionSize));
+            ReadSection(module, sectionId, sectionSize, ref section);
+        }
 
-        int sectionIndex = -1;
+        return FinishCore(module, options);
+    }
+
+    /// <summary>Parses a core module whose bytes are all in memory.</summary>
+    private static WasmModule ReadCoreInPlace(ReadOnlySpan<byte> bytes, long baseOffset, bool includesHeader, ModuleReaderOptions? options)
+    {
+        var reader = new WasmSpanReader(bytes, baseOffset);
+        if (includesHeader)
+            ValidateHeader(ref reader);
+        var module = new CoreModuleSections(options);
         while (reader.HasMore)
         {
             byte sectionId = reader.ReadByte();
-            uint sectionSize = reader.ReadU32Leb128();
-            long sectionStart = reader.Position;
-            ValidateSectionOrder(sectionId, ref lastSectionPosition);
-            sectionIndex++;
-            int customSectionCount = customSections.Count;
-
-            if (streamSections)
-            {
-                switch ((WasmSectionId)sectionId)
-                {
-                    case WasmSectionId.Custom:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadCustomSection(
-                            sectionReader,
-                            sectionSize,
-                            customSections,
-                            ref linkingSection,
-                            ref producersSection,
-                            ref targetFeaturesSection,
-                            relocationSections,
-                            codeSectionSeen);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Type:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadTypeSection(sectionReader, types, typeDefinitions);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Import:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadImportSection(sectionReader, imports);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Function:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadFunctionSection(sectionReader, typeIndices);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Table:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadTableSection(sectionReader, tables);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Memory:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadMemorySection(sectionReader, memories);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Global:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadGlobalSection(sectionReader, globals);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Export:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadExportSection(sectionReader, exports, exportEntries);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Start:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        startFunction = (int)sectionReader.ReadU32Leb128();
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Element:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadElementSection(sectionReader, elements);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Code:
-                        ReadCodeSectionStreaming(reader, sectionSize, functions, typeIndices, decodeModule, dataCount.HasValue, features);
-                        codeSectionSeen = true;
-                        break;
-                    case WasmSectionId.Data:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadDataSection(sectionReader, dataSegments);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.DataCount:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        dataCount = sectionReader.ReadU32Leb128();
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                    case WasmSectionId.Tag:
-                    {
-                        var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                        ReadTagSection(sectionReader, tags);
-                        ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
-                        break;
-                    }
-                }
-            }
-            else
-            {
-                switch ((WasmSectionId)sectionId)
-                {
-                    case WasmSectionId.Custom:
-                        ReadCustomSection(
-                            reader,
-                            sectionSize,
-                            customSections,
-                            ref linkingSection,
-                            ref producersSection,
-                            ref targetFeaturesSection,
-                            relocationSections,
-                            codeSectionSeen);
-                        break;
-                    case WasmSectionId.Type:
-                        ReadTypeSection(reader, types, typeDefinitions);
-                        break;
-                    case WasmSectionId.Import:
-                        ReadImportSection(reader, imports);
-                        break;
-                    case WasmSectionId.Function:
-                        ReadFunctionSection(reader, typeIndices);
-                        break;
-                    case WasmSectionId.Table:
-                        ReadTableSection(reader, tables);
-                        break;
-                    case WasmSectionId.Memory:
-                        ReadMemorySection(reader, memories);
-                        break;
-                    case WasmSectionId.Global:
-                        ReadGlobalSection(reader, globals);
-                        break;
-                    case WasmSectionId.Export:
-                        ReadExportSection(reader, exports, exportEntries);
-                        break;
-                    case WasmSectionId.Start:
-                        startFunction = (int)reader.ReadU32Leb128();
-                        break;
-                    case WasmSectionId.Element:
-                        ReadElementSection(reader, elements);
-                        break;
-                    case WasmSectionId.Code:
-                        ReadCodeSection(reader, functions, typeIndices, decodeModule, dataCount.HasValue, features);
-                        codeSectionSeen = true;
-                        break;
-                    case WasmSectionId.Data:
-                        ReadDataSection(reader, dataSegments, payloadBase: reader.Position);
-                        break;
-                    case WasmSectionId.DataCount:
-                        dataCount = reader.ReadU32Leb128();
-                        break;
-                    case WasmSectionId.Tag:
-                        ReadTagSection(reader, tags);
-                        break;
-                }
-
-                long expectedEnd = sectionStart + sectionSize;
-                if (reader.Position != expectedEnd)
-                    throw new WasmFormatException(
-                        $"Section {sectionId} size mismatch: expected to end at {expectedEnd} but reader is at {reader.Position}");
-            }
-
-            if (customSections.Count > customSectionCount)
-                customSections[^1] = customSections[^1] with { SectionIndex = sectionIndex };
+            uint sectionSize = reader.ReadU32();
+            ValidateSectionOrder(sectionId, ref module.LastSectionPosition);
+            var section = reader.Sub(SectionLength(sectionId, sectionSize));
+            ReadSection(module, sectionId, sectionSize, ref section);
         }
 
+        return FinishCore(module, options);
+    }
+
+    private static WasmModule FinishCore(CoreModuleSections sections, ModuleReaderOptions? options)
+    {
         // Validate data count section against actual data segments.
-        ValidateStreamingRead(dataCount, dataSegments.Count, typeIndices.Count, functions.Count);
+        ValidateStreamingRead(sections.DataCount, sections.DataSegments.Count, sections.TypeIndices.Count, sections.Functions.Count);
 
         // Enrich FuncTypes whose results include defined heap types with the correct null tag for
         // each such result slot.  Must run after the full type section is parsed so that every
         // DefinedHeapType reference can be resolved through typeDefinitions.
-        ResolveResultNullTags(types, typeDefinitions);
+        ResolveResultNullTags(sections.Types, sections.TypeDefinitions);
 
-        var module = CreateModule(
-            types, typeDefinitions, imports, functions, tables, memories, globals, tags, exports, exportEntries,
-            startFunction, elements, dataSegments, customSections, linkingSection, producersSection,
-            targetFeaturesSection, relocationSections, dataCount.HasValue);
-        module.EnabledFeatures = (options ?? ModuleReaderOptions.Default).Features;
+        var module = sections.CreateModule();
+        module.EnabledFeatures = sections.Features;
 
         BranchHintMetadataReader.Apply(
             module,
@@ -343,48 +158,85 @@ public static partial class ModuleReader
         return module;
     }
 
-    private static WasmModule CreateModule(
-        List<FuncType> types,
-        List<TypeDefinition> typeDefinitions,
-        List<Import> imports,
-        List<WasmFunction> functions,
-        List<TableType> tables,
-        List<MemoryType> memories,
-        List<WasmGlobal> globals,
-        List<Tag> tags,
-        OrderedDictionary<string, Export> exports,
-        List<Export> exportEntries,
-        int? startFunction,
-        List<Element> elements,
-        List<Data> dataSegments,
-        List<CustomSection> customSections,
-        LinkingSection? linkingSection,
-        ProducersSection? producersSection,
-        TargetFeaturesSection? targetFeaturesSection,
-        List<RelocationSection> relocationSections,
-        bool hasDataCountSection)
+    /// <summary>
+    /// The sections of one core module as they are parsed: the lists the model is built from, and the state the
+    /// ordering and count checks need.
+    /// </summary>
+    private sealed class CoreModuleSections
     {
-        return new WasmModule
+        public readonly List<FuncType> Types = [];
+        public readonly List<TypeDefinition> TypeDefinitions = [];
+        public readonly List<Import> Imports = [];
+        public readonly List<int> TypeIndices = [];
+        public readonly List<TableType> Tables = [];
+        public readonly List<MemoryType> Memories = [];
+        public readonly List<WasmGlobal> Globals = [];
+        public readonly OrderedDictionary<string, Export> Exports = new();
+        public readonly List<Export> ExportEntries = [];
+        public readonly List<Element> Elements = [];
+        public readonly List<WasmFunction> Functions = [];
+        public readonly List<Data> DataSegments = [];
+        public readonly List<CustomSection> CustomSections = [];
+        public readonly List<RelocationSection> RelocationSections = [];
+        public readonly List<Tag> Tags = [];
+        public int? StartFunction;
+        public LinkingSection? LinkingSection;
+        public ProducersSection? ProducersSection;
+        public TargetFeaturesSection? TargetFeaturesSection;
+        public uint? DataCount;
+        public int LastSectionPosition = -1;
+        public int SectionIndex = -1;
+        public bool CodeSectionSeen;
+
+        /// <summary>
+        /// Shares the section lists by reference so that body decoding (which runs when the code section is
+        /// reached, after imports/memories are parsed) can resolve memory64 memarg offsets via Imports/Memories.
+        /// </summary>
+        public readonly WasmModule DecodeModule;
+
+        public readonly WasmFeatures Features;
+
+        /// <summary>
+        /// The asynchronous streaming reader's shape: the function section creates the functions the code section
+        /// fills in as each body arrives, and custom sections do not record their section index.
+        /// </summary>
+        public readonly bool Streaming;
+
+        public CoreModuleSections(ModuleReaderOptions? options, bool streaming = false)
         {
-            Types = types,
-            TypeDefinitions = typeDefinitions,
-            Imports = imports,
-            Functions = functions,
-            Tables = tables,
-            Memories = memories,
-            Globals = globals,
-            Tags = tags,
-            Exports = exports,
-            ExportEntries = exportEntries,
-            StartFunction = startFunction,
-            Elements = elements,
-            DataSegments = dataSegments,
-            CustomSections = customSections,
-            LinkingSection = linkingSection,
-            ProducersSection = producersSection,
-            TargetFeaturesSection = targetFeaturesSection,
-            RelocationSections = relocationSections,
-            HasDataCountSection = hasDataCountSection,
+            Features = (options ?? ModuleReaderOptions.Default).Features;
+            Streaming = streaming;
+            DecodeModule = new WasmModule
+            {
+                Types = Types,
+                TypeDefinitions = TypeDefinitions,
+                Functions = Functions,
+                Imports = Imports,
+                Memories = Memories,
+            };
+        }
+
+        public WasmModule CreateModule() => new()
+        {
+            Types = Types,
+            TypeDefinitions = TypeDefinitions,
+            Imports = Imports,
+            Functions = Functions,
+            Tables = Tables,
+            Memories = Memories,
+            Globals = Globals,
+            Tags = Tags,
+            Exports = Exports,
+            ExportEntries = ExportEntries,
+            StartFunction = StartFunction,
+            Elements = Elements,
+            DataSegments = DataSegments,
+            CustomSections = CustomSections,
+            LinkingSection = LinkingSection,
+            ProducersSection = ProducersSection,
+            TargetFeaturesSection = TargetFeaturesSection,
+            RelocationSections = RelocationSections,
+            HasDataCountSection = DataCount.HasValue,
         };
     }
 
@@ -499,177 +351,114 @@ public static partial class ModuleReader
         }
     }
 
-    private static void ReadNonCodeSection(
-        WasmBinaryReader reader,
-        byte sectionId,
-        uint sectionSize,
-        long sectionStart,
-        List<FuncType> types,
-        List<TypeDefinition> typeDefinitions,
-        List<Import> imports,
-        List<int> typeIndices,
-        List<TableType> tables,
-        List<MemoryType> memories,
-        List<WasmGlobal> globals,
-        OrderedDictionary<string, Export> exports,
-        List<Export> exportEntries,
-        ref int? startFunction,
-        List<Element> elements,
-        List<WasmFunction> functions,
-        List<Data> dataSegments,
-        List<CustomSection> customSections,
-        ref LinkingSection? linkingSection,
-        ref ProducersSection? producersSection,
-        ref TargetFeaturesSection? targetFeaturesSection,
-        List<RelocationSection> relocationSections,
-        ref uint? dataCount,
-        List<Tag> tags,
-        bool createFunctionPlaceholders,
-        bool appearedAfterCode)
+    /// <summary>The length of a section's payload, rejecting a declared size no input could hold.</summary>
+    private static int SectionLength(byte sectionId, uint sectionSize)
+        => sectionSize <= int.MaxValue
+            ? (int)sectionSize
+            : throw new WasmFormatException($"Section {sectionId} payload is too large ({sectionSize} bytes)");
+
+    /// <summary>
+    /// Parses one section's payload into <paramref name="module"/>. This is the only section switch: every entry
+    /// point frames the sections its own way and hands each payload here.
+    /// </summary>
+    private static void ReadSection(CoreModuleSections module, byte sectionId, uint sectionSize, ref WasmSpanReader section)
     {
+        module.SectionIndex++;
+        int customSectionCount = module.CustomSections.Count;
+
         switch ((WasmSectionId)sectionId)
         {
             case WasmSectionId.Custom:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
                 ReadCustomSection(
-                    sectionReader,
-                    sectionSize,
-                    customSections,
-                    ref linkingSection,
-                    ref producersSection,
-                    ref targetFeaturesSection,
-                    relocationSections,
-                    appearedAfterCode);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                    ref section,
+                    module.CustomSections,
+                    ref module.LinkingSection,
+                    ref module.ProducersSection,
+                    ref module.TargetFeaturesSection,
+                    module.RelocationSections,
+                    module.CodeSectionSeen);
                 break;
-            }
             case WasmSectionId.Type:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadTypeSection(sectionReader, types, typeDefinitions);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadTypeSection(ref section, module.Types, module.TypeDefinitions);
                 break;
-            }
             case WasmSectionId.Import:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadImportSection(sectionReader, imports);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadImportSection(ref section, module.Imports);
                 break;
-            }
             case WasmSectionId.Function:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                if (createFunctionPlaceholders)
-                    ReadFunctionSectionWithPlaceholders(sectionReader, typeIndices, functions);
+                if (module.Streaming)
+                    ReadFunctionSectionWithPlaceholders(ref section, module.TypeIndices, module.Functions);
                 else
-                    ReadFunctionSection(sectionReader, typeIndices);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                    ReadFunctionSection(ref section, module.TypeIndices);
                 break;
-            }
             case WasmSectionId.Table:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadTableSection(sectionReader, tables);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadTableSection(ref section, module.Tables);
                 break;
-            }
             case WasmSectionId.Memory:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadMemorySection(sectionReader, memories);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadMemorySection(ref section, module.Memories);
                 break;
-            }
             case WasmSectionId.Global:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadGlobalSection(sectionReader, globals);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadGlobalSection(ref section, module.Globals);
                 break;
-            }
             case WasmSectionId.Export:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadExportSection(sectionReader, exports, exportEntries);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadExportSection(ref section, module.Exports, module.ExportEntries);
                 break;
-            }
             case WasmSectionId.Start:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                startFunction = (int)sectionReader.ReadU32Leb128();
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                module.StartFunction = (int)section.ReadU32();
                 break;
-            }
             case WasmSectionId.Element:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadElementSection(sectionReader, elements);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadElementSection(ref section, module.Elements);
                 break;
-            }
             case WasmSectionId.Code:
-                throw new InvalidOperationException("Code section must be handled by the streaming pipeline");
+                ReadCodeSection(ref section, module.Functions, module.TypeIndices, module.DecodeModule, module.DataCount.HasValue, module.Features);
+                module.CodeSectionSeen = true;
+                break;
             case WasmSectionId.Data:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadDataSection(sectionReader, dataSegments);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadDataSection(ref section, module.DataSegments);
                 break;
-            }
             case WasmSectionId.DataCount:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                dataCount = sectionReader.ReadU32Leb128();
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                module.DataCount = section.ReadU32();
                 break;
-            }
             case WasmSectionId.Tag:
-            {
-                var sectionReader = ReadSectionPayload(reader, sectionId, sectionSize);
-                ReadTagSection(sectionReader, tags);
-                ValidateSectionConsumption(sectionId, sectionSize, sectionReader);
+                ReadTagSection(ref section, module.Tags);
                 break;
-            }
             default:
                 throw new WasmFormatException($"Malformed section id: {sectionId}");
         }
 
-        if (reader.Position != sectionStart + sectionSize)
+        if (section.HasMore)
         {
             throw new WasmFormatException(
-                $"Section {sectionId} size mismatch: expected to end at {sectionStart + sectionSize} but reader is at {reader.Position}");
+                $"Section {sectionId} size mismatch: declared {sectionSize} bytes but consumed {section.Position}",
+                section.AbsolutePosition);
         }
+
+        if (!module.Streaming && module.CustomSections.Count > customSectionCount)
+            module.CustomSections[^1] = module.CustomSections[^1] with { SectionIndex = module.SectionIndex };
     }
 
-    private static WasmBinaryReader ReadSectionPayload(WasmBinaryReader reader, byte sectionId, uint sectionSize)
+    private static void ValidateHeader(ref WasmSpanReader reader)
     {
-        if (sectionSize > int.MaxValue)
-            throw new WasmFormatException($"Section {sectionId} payload is too large ({sectionSize} bytes)");
-
-        return new WasmBinaryReader(new MemoryStream(reader.ReadBytes((int)sectionSize), writable: false));
+        ValidateMagic(reader.ReadBytes(4));
+        ValidateVersion(reader.ReadBytes(4));
     }
 
-    private static void ValidateSectionConsumption(byte sectionId, uint sectionSize, WasmBinaryReader reader)
+    private static void ValidateHeader(WasmSectionStream stream)
     {
-        if (reader.Position != sectionSize)
-        {
-            throw new WasmFormatException(
-                $"Section {sectionId} size mismatch: declared {sectionSize} bytes but consumed {reader.Position}");
-        }
+        Span<byte> field = stackalloc byte[4];
+        stream.ReadExactly(field);
+        ValidateMagic(field);
+        stream.ReadExactly(field);
+        ValidateVersion(field);
     }
 
-    private static void ValidateHeader(WasmBinaryReader reader)
+    private static void ValidateMagic(ReadOnlySpan<byte> magic)
     {
-        Span<byte> magic = stackalloc byte[4];
-        reader.ReadBytes(magic);
         if (!magic.SequenceEqual(Magic))
             throw new WasmFormatException("Invalid WebAssembly magic number");
+    }
 
-        Span<byte> version = stackalloc byte[4];
-        reader.ReadBytes(version);
+    private static void ValidateVersion(ReadOnlySpan<byte> version)
+    {
         // Component Model version: 0x0D 0x00 0x01 0x00
         if (version[0] == 0x0D && version[1] == 0x00 && version[2] == 0x01 && version[3] == 0x00)
             throw new WasmComponentException();
@@ -682,12 +471,12 @@ public static partial class ModuleReader
     private static readonly FuncType NonFuncTypePlaceholder = new([], []);
 
     private static void ReadTypeSection(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         List<FuncType> types,
         List<TypeDefinition> typeDefinitions)
     {
         int recGroupIndex = typeDefinitions.Count == 0 ? 0 : typeDefinitions[^1].RecGroup.Index + 1;
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             byte tag = reader.PeekByte();
             if (tag == 0x4E) // rec group — wraps multiple sub/composite types
@@ -696,12 +485,12 @@ public static partial class ModuleReader
                 uint count = reader.ReadVectorCount();
                 var group = new RecGroupIdentity(recGroupIndex++, types.Count, ToInt32(count, "Rec group size"));
                 for (uint i = 0; i < count; i++)
-                    AddType(types, typeDefinitions, ReadSubtypeOrComposite(reader, types, group));
+                    AddType(types, typeDefinitions, ReadSubtypeOrComposite(ref reader, types, group));
             }
             else
             {
                 var group = new RecGroupIdentity(recGroupIndex++, types.Count, 1);
-                AddType(types, typeDefinitions, ReadSubtypeOrComposite(reader, types, group));
+                AddType(types, typeDefinitions, ReadSubtypeOrComposite(ref reader, types, group));
             }
         }
 
@@ -723,7 +512,7 @@ public static partial class ModuleReader
     /// Returns a FuncType for function types, or a placeholder for struct/array types.
     /// </summary>
     private static TypeParseResult ReadSubtypeOrComposite(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         List<FuncType> existingTypes,
         RecGroupIdentity recGroup)
     {
@@ -739,17 +528,17 @@ public static partial class ModuleReader
             uint supertypeCount = reader.ReadVectorCount();
             supertypes = new int[supertypeCount];
             for (uint i = 0; i < supertypeCount; i++)
-                supertypes[i] = ToInt32(reader.ReadU32Leb128(), "Supertype index");
+                supertypes[i] = ToInt32(reader.ReadU32(), "Supertype index");
             subtypePrefix = $"sub[{(isFinal ? "final" : "open")}:{string.Join(",", supertypes)}]:";
             tag = reader.ReadByte(); // inner composite type tag
         }
 
         var result = (CompositeTypeCode)tag switch
         {
-            CompositeTypeCode.Func => ReadFuncType(reader),
-            CompositeTypeCode.Cont => ReadContType(reader, existingTypes),
-            CompositeTypeCode.Struct => ReadStructType(reader),
-            CompositeTypeCode.Array => ReadArrayType(reader),
+            CompositeTypeCode.Func => ReadFuncType(ref reader),
+            CompositeTypeCode.Cont => ReadContType(ref reader, existingTypes),
+            CompositeTypeCode.Struct => ReadStructType(ref reader),
+            CompositeTypeCode.Array => ReadArrayType(ref reader),
             _ => throw new WasmFormatException($"Expected composite type tag (0x60/0x5D/0x5F/0x5E), got 0x{tag:X2}"),
         };
         var compactType = result.CompactType;
@@ -759,23 +548,48 @@ public static partial class ModuleReader
         return new TypeParseResult(compactType, result.CompositeType, isFinal, supertypes, recGroup);
     }
 
-    private static TypeParseResult ReadFuncType(WasmBinaryReader reader)
+    private static TypeParseResult ReadFuncType(ref WasmSpanReader reader)
     {
-        var parameters = reader.ReadVector(() => ReadValTypeInfo(reader));
-        var results = reader.ReadVector(() => ReadValTypeInfo(reader));
-        var compact = new FuncType(parameters.Select(p => p.Type).ToArray(), results.Select(r => r.Type).ToArray())
+        ReadResultType(ref reader, out ValType[] parameters, out string[] parameterKeys, out Microsoft.NET.WebAssembly.Types.ValueType[] exactParameters);
+        ReadResultType(ref reader, out ValType[] results, out string[] resultKeys, out Microsoft.NET.WebAssembly.Types.ValueType[] exactResults);
+        var compact = new FuncType(parameters, results)
         {
-            LinkKey = $"({string.Join(",", parameters.Select(p => p.Key))})->({string.Join(",", results.Select(r => r.Key))})",
+            LinkKey = $"({string.Join(",", parameterKeys)})->({string.Join(",", resultKeys)})",
         };
-        var composite = new CompositeType.Function(
-            parameters.Select(p => p.ExactType).ToArray(),
-            results.Select(r => r.ExactType).ToArray());
-        return new TypeParseResult(compact, composite);
+        return new TypeParseResult(compact, new CompositeType.Function(exactParameters, exactResults));
     }
 
-    private static TypeParseResult ReadContType(WasmBinaryReader reader, List<FuncType> existingTypes)
+    /// <summary>Reads a vector of value types (a <c>resulttype</c>, §5.3.5).</summary>
+    private static void ReadResultType(
+        ref WasmSpanReader reader,
+        out ValType[] types,
+        out string[] keys,
+        out Microsoft.NET.WebAssembly.Types.ValueType[] exactTypes)
     {
-        uint funcTypeIndex = reader.ReadU32Leb128();
+        uint count = reader.ReadVectorCount();
+        if (count == 0)
+        {
+            types = [];
+            keys = [];
+            exactTypes = [];
+            return;
+        }
+
+        types = new ValType[count];
+        keys = new string[count];
+        exactTypes = new Microsoft.NET.WebAssembly.Types.ValueType[count];
+        for (int i = 0; i < types.Length; i++)
+        {
+            var info = ReadValTypeInfo(ref reader);
+            types[i] = info.Type;
+            keys[i] = info.Key;
+            exactTypes[i] = info.ExactType;
+        }
+    }
+
+    private static TypeParseResult ReadContType(ref WasmSpanReader reader, List<FuncType> existingTypes)
+    {
+        uint funcTypeIndex = reader.ReadU32();
         if (funcTypeIndex >= (uint)existingTypes.Count)
             throw new WasmFormatException($"Continuation type refers to invalid function type index {funcTypeIndex}");
         return new TypeParseResult(
@@ -783,25 +597,25 @@ public static partial class ModuleReader
             new CompositeType.Continuation((int)funcTypeIndex));
     }
 
-    private static TypeParseResult ReadStructType(WasmBinaryReader reader)
+    private static TypeParseResult ReadStructType(ref WasmSpanReader reader)
     {
         uint fieldCount = reader.ReadVectorCount(minElementSize: 2); // storage type + mutability
         var fields = new FieldType[fieldCount];
         for (uint i = 0; i < fieldCount; i++)
-            fields[i] = ReadFieldType(reader);
+            fields[i] = ReadFieldType(ref reader);
         return new TypeParseResult(NonFuncTypePlaceholder, new CompositeType.Struct(fields));
     }
 
-    private static TypeParseResult ReadArrayType(WasmBinaryReader reader)
+    private static TypeParseResult ReadArrayType(ref WasmSpanReader reader)
     {
-        var field = ReadFieldType(reader);
+        var field = ReadFieldType(ref reader);
         return new TypeParseResult(NonFuncTypePlaceholder, new CompositeType.Array(field));
     }
 
     /// <summary>Reads a GC field type: storage type + mutability byte.</summary>
-    private static FieldType ReadFieldType(WasmBinaryReader reader)
+    private static FieldType ReadFieldType(ref WasmSpanReader reader)
     {
-        var storageType = ReadStorageType(reader);
+        var storageType = ReadStorageType(ref reader);
         byte encodedMutability = reader.ReadByte();
         var mutability = encodedMutability switch
         {
@@ -813,7 +627,7 @@ public static partial class ModuleReader
     }
 
     /// <summary>Reads a GC storage type: valtype | i8 (0x78) | i16 (0x77).</summary>
-    private static StorageType ReadStorageType(WasmBinaryReader reader)
+    private static StorageType ReadStorageType(ref WasmSpanReader reader)
     {
         byte b = reader.PeekByte();
         if (b is 0x78 or 0x77) // packed types: i8, i16
@@ -821,22 +635,22 @@ public static partial class ModuleReader
             reader.ReadByte();
             return new StorageType.Packed(b == 0x78 ? PackedStorageType.I8 : PackedStorageType.I16);
         }
-        return new StorageType.Value(ReadValTypeInfo(reader).ExactType);
+        return new StorageType.Value(ReadValTypeInfo(ref reader).ExactType);
     }
 
     /// <summary>
     /// Reads a value type, handling both single-byte types (i32, i64, funcref, etc.)
     /// and multi-byte GC reference types (ref null $type, ref $type, abstract heap types).
     /// </summary>
-    private static ValType ReadValType(WasmBinaryReader reader)
-        => ReadValTypeInfo(reader).Type;
+    private static ValType ReadValType(ref WasmSpanReader reader)
+        => ReadValTypeInfo(ref reader).Type;
 
-    private static Microsoft.NET.WebAssembly.Types.ValueType ReadExactValType(WasmBinaryReader reader)
-        => ReadValTypeInfo(reader).ExactType;
+    private static Microsoft.NET.WebAssembly.Types.ValueType ReadExactValType(ref WasmSpanReader reader)
+        => ReadValTypeInfo(ref reader).ExactType;
 
     private readonly record struct ValTypeInfo(ValType Type, string Key, Microsoft.NET.WebAssembly.Types.ValueType ExactType);
 
-    private static ValTypeInfo ReadValTypeInfo(WasmBinaryReader reader)
+    private static ValTypeInfo ReadValTypeInfo(ref WasmSpanReader reader)
     {
         byte b = reader.ReadByte();
         return b switch
@@ -864,7 +678,7 @@ public static partial class ModuleReader
             0x74 => RefInfo(Nullability.Nullable, HeapTypeKind.NoExn),
             0x75 => RefInfo(Nullability.Nullable, HeapTypeKind.NoCont),
             // Typed references: (ref null ht) / (ref ht) — consume heap type
-            0x63 or 0x64 => ReadRefWithHeapType(reader, b),
+            0x63 or 0x64 => ReadRefWithHeapType(ref reader, b),
             _ => throw new WasmFormatException($"Unknown value type: 0x{b:X2}"),
         };
     }
@@ -873,9 +687,9 @@ public static partial class ModuleReader
     /// Reads the heap type following a 0x63 (ref null) or 0x64 (ref) prefix.
     /// Heap types are encoded as s33 LEB128: positive = type index, negative = abstract heap type.
     /// </summary>
-    private static ValTypeInfo ReadRefWithHeapType(WasmBinaryReader reader, byte refByte)
+    private static ValTypeInfo ReadRefWithHeapType(ref WasmSpanReader reader, byte refByte)
     {
-        long heapType = reader.ReadS33Leb128();
+        long heapType = reader.ReadS33();
         var nullability = refByte == 0x63 ? Nullability.Nullable : Nullability.NonNullable;
         if (heapType >= 0)
         {
@@ -924,40 +738,40 @@ public static partial class ModuleReader
             RecGroup ?? new RecGroupIdentity(index, index, 1));
     }
 
-    private static void ReadImportSection(WasmBinaryReader reader, List<Import> imports)
+    private static void ReadImportSection(ref WasmSpanReader reader, List<Import> imports)
     {
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             string moduleName = reader.ReadName();
             string name = reader.ReadName();
             byte kind = reader.ReadByte();
             ImportDescriptor descriptor = (WasmExternalKind)kind switch
             {
-                WasmExternalKind.Function => new ImportDescriptor.Func((int)reader.ReadU32Leb128()),
-                WasmExternalKind.Table => new ImportDescriptor.Table(ReadTableImportType(reader)),
-                WasmExternalKind.Memory => new ImportDescriptor.Memory(ReadMemoryType(reader)),
-                WasmExternalKind.Global => new ImportDescriptor.Global(ReadGlobalType(reader)),
-                WasmExternalKind.Tag => new ImportDescriptor.Tag(ReadTagType(reader)),
+                WasmExternalKind.Function => new ImportDescriptor.Func((int)reader.ReadU32()),
+                WasmExternalKind.Table => new ImportDescriptor.Table(ReadTableImportType(ref reader)),
+                WasmExternalKind.Memory => new ImportDescriptor.Memory(ReadMemoryType(ref reader)),
+                WasmExternalKind.Global => new ImportDescriptor.Global(ReadGlobalType(ref reader)),
+                WasmExternalKind.Tag => new ImportDescriptor.Tag(ReadTagType(ref reader)),
                 _ => throw new WasmFormatException($"Unknown import descriptor kind: 0x{kind:X2}"),
             };
             imports.Add(new Import(moduleName, name, descriptor));
         }
     }
 
-    private static void ReadFunctionSection(WasmBinaryReader reader, List<int> typeIndices)
+    private static void ReadFunctionSection(ref WasmSpanReader reader, List<int> typeIndices)
     {
-        foreach (var _ in reader.ReadVectorHeader())
-            typeIndices.Add((int)reader.ReadU32Leb128());
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
+            typeIndices.Add((int)reader.ReadU32());
     }
 
     private static void ReadFunctionSectionWithPlaceholders(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         List<int> typeIndices,
         List<WasmFunction> functions)
     {
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
-            int typeIndex = (int)reader.ReadU32Leb128();
+            int typeIndex = (int)reader.ReadU32();
             typeIndices.Add(typeIndex);
             functions.Add(new WasmFunction
             {
@@ -968,58 +782,58 @@ public static partial class ModuleReader
         }
     }
 
-    private static void ReadTableSection(WasmBinaryReader reader, List<TableType> tables)
+    private static void ReadTableSection(ref WasmSpanReader reader, List<TableType> tables)
     {
-        foreach (var _ in reader.ReadVectorHeader())
-            tables.Add(ReadTableDefinition(reader));
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
+            tables.Add(ReadTableDefinition(ref reader));
     }
 
-    private static void ReadMemorySection(WasmBinaryReader reader, List<MemoryType> memories)
+    private static void ReadMemorySection(ref WasmSpanReader reader, List<MemoryType> memories)
     {
-        foreach (var _ in reader.ReadVectorHeader())
-            memories.Add(ReadMemoryType(reader));
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
+            memories.Add(ReadMemoryType(ref reader));
     }
 
-    private static void ReadGlobalSection(WasmBinaryReader reader, List<WasmGlobal> globals)
+    private static void ReadGlobalSection(ref WasmSpanReader reader, List<WasmGlobal> globals)
     {
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
-            var type = ReadGlobalType(reader);
-            byte[] initExpr = ReadInitExpr(reader);
+            var type = ReadGlobalType(ref reader);
+            byte[] initExpr = ReadInitExpr(ref reader);
             globals.Add(new WasmGlobal { Type = type, InitExpr = initExpr });
         }
     }
 
-    private static void ReadTagSection(WasmBinaryReader reader, List<Tag> tags)
+    private static void ReadTagSection(ref WasmSpanReader reader, List<Tag> tags)
     {
-        foreach (var _ in reader.ReadVectorHeader())
-            tags.Add(new Tag(ReadTagType(reader)));
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
+            tags.Add(new Tag(ReadTagType(ref reader)));
     }
 
-    private static int ReadTagType(WasmBinaryReader reader)
+    private static int ReadTagType(ref WasmSpanReader reader)
     {
         byte attribute = reader.ReadByte();
         if (attribute != 0x00)
             throw new WasmFormatException($"Invalid tag attribute: 0x{attribute:X2}");
-        return (int)reader.ReadU32Leb128();
+        return (int)reader.ReadU32();
     }
 
     private static void ReadExportSection(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         OrderedDictionary<string, Export> exports,
         List<Export> exportEntries)
     {
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             string name = reader.ReadName();
             byte kind = reader.ReadByte();
             ExportDescriptor descriptor = (WasmExternalKind)kind switch
             {
-                WasmExternalKind.Function => new ExportDescriptor.Func((int)reader.ReadU32Leb128()),
-                WasmExternalKind.Table => new ExportDescriptor.Table((int)reader.ReadU32Leb128()),
-                WasmExternalKind.Memory => new ExportDescriptor.Memory((int)reader.ReadU32Leb128()),
-                WasmExternalKind.Global => new ExportDescriptor.Global((int)reader.ReadU32Leb128()),
-                WasmExternalKind.Tag => new ExportDescriptor.Tag((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Function => new ExportDescriptor.Func((int)reader.ReadU32()),
+                WasmExternalKind.Table => new ExportDescriptor.Table((int)reader.ReadU32()),
+                WasmExternalKind.Memory => new ExportDescriptor.Memory((int)reader.ReadU32()),
+                WasmExternalKind.Global => new ExportDescriptor.Global((int)reader.ReadU32()),
+                WasmExternalKind.Tag => new ExportDescriptor.Tag((int)reader.ReadU32()),
                 _ => throw new WasmFormatException($"Unknown export descriptor kind: 0x{kind:X2}"),
             };
             var export = new Export(name, descriptor);
@@ -1044,27 +858,27 @@ public static partial class ModuleReader
     /// accepts the former and rejects the latter with
     /// "invalid element type `funcref` for table type `(ref func)`". See #411.
     /// </summary>
-    private static void ReadElementSection(WasmBinaryReader reader, List<Element> elements)
+    private static void ReadElementSection(ref WasmSpanReader reader, List<Element> elements)
     {
         // Flags 0-3: `ref func` (non-nullable). Flag 4: `funcref` (nullable). Not interchangeable.
         var refFuncType = new Microsoft.NET.WebAssembly.Types.ValueType.Reference(Nullability.NonNullable, new AbstractHeapType(HeapTypeKind.Func));
         var funcrefType = new Microsoft.NET.WebAssembly.Types.ValueType.Reference(Nullability.Nullable, new AbstractHeapType(HeapTypeKind.Func));
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
-            uint flags = reader.ReadU32Leb128();
+            uint flags = reader.ReadU32();
             switch (flags)
             {
                 case (uint)ElementSegmentKind.ActiveFunctions:
                 {
                     // Active, implicit tableidx=0, `ref func`, vec<funcidx>
-                    byte[] offsetExpr = ReadInitExpr(reader);
-                    var funcIndices = reader.ReadVector(() => (int)reader.ReadU32Leb128());
+                    byte[] offsetExpr = ReadInitExpr(ref reader);
+                    var funcIndices = ReadFunctionIndices(ref reader);
                     elements.Add(new Element
                     {
                         Mode = ElementMode.Active,
                         TableIndex = 0,
                         OffsetExpr = offsetExpr,
-                        FunctionIndices = new List<int>(funcIndices),
+                        FunctionIndices = funcIndices,
                         ElementType = refFuncType,
                     });
                     break;
@@ -1072,14 +886,14 @@ public static partial class ModuleReader
                 case (uint)ElementSegmentKind.PassiveFunctions:
                 {
                     // Passive, elemkind byte, vec<funcidx> — no table/offset
-                    ReadElemKind(reader);
-                    var funcIndices = reader.ReadVector(() => (int)reader.ReadU32Leb128());
+                    ReadElemKind(ref reader);
+                    var funcIndices = ReadFunctionIndices(ref reader);
                     elements.Add(new Element
                     {
                         Mode = ElementMode.Passive,
                         TableIndex = -1, // passive: no target table
                         OffsetExpr = [],
-                        FunctionIndices = new List<int>(funcIndices),
+                        FunctionIndices = funcIndices,
                         ElementType = refFuncType,
                     });
                     break;
@@ -1087,16 +901,16 @@ public static partial class ModuleReader
                 case (uint)ElementSegmentKind.ActiveTableFunctions:
                 {
                     // Active, explicit tableidx, offset, elemkind byte, vec<funcidx>
-                    int tableIndex = (int)reader.ReadU32Leb128();
-                    byte[] offsetExpr = ReadInitExpr(reader);
-                    ReadElemKind(reader);
-                    var funcIndices = reader.ReadVector(() => (int)reader.ReadU32Leb128());
+                    int tableIndex = (int)reader.ReadU32();
+                    byte[] offsetExpr = ReadInitExpr(ref reader);
+                    ReadElemKind(ref reader);
+                    var funcIndices = ReadFunctionIndices(ref reader);
                     elements.Add(new Element
                     {
                         Mode = ElementMode.Active,
                         TableIndex = tableIndex,
                         OffsetExpr = offsetExpr,
-                        FunctionIndices = new List<int>(funcIndices),
+                        FunctionIndices = funcIndices,
                         HasExplicitTableIndex = true,
                         ElementType = refFuncType,
                     });
@@ -1105,47 +919,47 @@ public static partial class ModuleReader
                 case (uint)ElementSegmentKind.DeclarativeFunctions:
                 {
                     // Declarative, elemkind byte, vec<funcidx>
-                    ReadElemKind(reader);
-                    var funcIndices = reader.ReadVector(() => (int)reader.ReadU32Leb128());
-                    elements.Add(new Element { Mode = ElementMode.Declarative, TableIndex = -1, OffsetExpr = [], FunctionIndices = [], DeclaredFunctionIndices = new List<int>(funcIndices), ElementType = refFuncType });
+                    ReadElemKind(ref reader);
+                    var funcIndices = ReadFunctionIndices(ref reader);
+                    elements.Add(new Element { Mode = ElementMode.Declarative, TableIndex = -1, OffsetExpr = [], FunctionIndices = [], DeclaredFunctionIndices = funcIndices, ElementType = refFuncType });
                     break;
                 }
                 case (uint)ElementSegmentKind.ActiveExpressions:
                 {
                     // Active, implicit tableidx=0, `funcref` (nullable — unlike flag 0), vec<expr>
-                    byte[] offsetExpr = ReadInitExpr(reader);
-                    var expressions = reader.ReadVector(() => ReadInitExpr(reader)).ToList();
-                    var funcIndices = expressions.Select(ReadElemExprFunctionIndex).ToList();
+                    byte[] offsetExpr = ReadInitExpr(ref reader);
+                    var expressions = ReadElementExpressions(ref reader);
+                    var funcIndices = ElementExpressionFunctionIndices(expressions);
                     elements.Add(new Element { Mode = ElementMode.Active, TableIndex = 0, OffsetExpr = offsetExpr, FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, ElementType = funcrefType });
                     break;
                 }
                 case (uint)ElementSegmentKind.PassiveExpressions:
                 {
                     // Passive, reftype, vec<expr>
-                    var elementType = ReadExactRefType(reader);
-                    var expressions = reader.ReadVector(() => ReadInitExpr(reader)).ToList();
-                    var funcIndices = expressions.Select(ReadElemExprFunctionIndex).ToList();
+                    var elementType = ReadExactRefType(ref reader);
+                    var expressions = ReadElementExpressions(ref reader);
+                    var funcIndices = ElementExpressionFunctionIndices(expressions);
                     elements.Add(new Element { Mode = ElementMode.Passive, TableIndex = -1, OffsetExpr = [], FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, ElementType = elementType });
                     break;
                 }
                 case (uint)ElementSegmentKind.ActiveTableExpressions:
                 {
                     // Active, explicit tableidx, offset, reftype, vec<expr>
-                    int tableIndex = (int)reader.ReadU32Leb128();
-                    byte[] offsetExpr = ReadInitExpr(reader);
-                    var elementType = ReadExactRefType(reader);
-                    var expressions = reader.ReadVector(() => ReadInitExpr(reader)).ToList();
-                    var funcIndices = expressions.Select(ReadElemExprFunctionIndex).ToList();
+                    int tableIndex = (int)reader.ReadU32();
+                    byte[] offsetExpr = ReadInitExpr(ref reader);
+                    var elementType = ReadExactRefType(ref reader);
+                    var expressions = ReadElementExpressions(ref reader);
+                    var funcIndices = ElementExpressionFunctionIndices(expressions);
                     elements.Add(new Element { Mode = ElementMode.Active, TableIndex = tableIndex, OffsetExpr = offsetExpr, FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, HasExplicitTableIndex = true, ElementType = elementType });
                     break;
                 }
                 case (uint)ElementSegmentKind.DeclarativeExpressions:
                 {
                     // Declarative, reftype, vec<expr>
-                    var elementType = ReadExactRefType(reader);
-                    var expressions = reader.ReadVector(() => ReadInitExpr(reader)).ToList();
-                    var funcIndices = expressions.Select(ReadElemExprFunctionIndex).ToList();
-                    elements.Add(new Element { Mode = ElementMode.Declarative, TableIndex = -1, OffsetExpr = [], FunctionIndices = [], DeclaredFunctionIndices = funcIndices.Where(index => index >= 0).ToList(), ElementExpressions = expressions, UsesExpressions = true, ElementType = elementType });
+                    var elementType = ReadExactRefType(ref reader);
+                    var expressions = ReadElementExpressions(ref reader);
+                    var funcIndices = ElementExpressionFunctionIndices(expressions);
+                    elements.Add(new Element { Mode = ElementMode.Declarative, TableIndex = -1, OffsetExpr = [], FunctionIndices = [], DeclaredFunctionIndices = DeclaredFunctionIndices(funcIndices), ElementExpressions = expressions, UsesExpressions = true, ElementType = elementType });
                     break;
                 }
                 default:
@@ -1154,8 +968,47 @@ public static partial class ModuleReader
         }
     }
 
+    private static List<int> ReadFunctionIndices(ref WasmSpanReader reader)
+    {
+        uint count = reader.ReadVectorCount();
+        var indices = new List<int>((int)count);
+        for (uint i = 0; i < count; i++)
+            indices.Add((int)reader.ReadU32());
+        return indices;
+    }
+
+    private static List<byte[]> ReadElementExpressions(ref WasmSpanReader reader)
+    {
+        uint count = reader.ReadVectorCount();
+        var expressions = new List<byte[]>((int)count);
+        for (uint i = 0; i < count; i++)
+            expressions.Add(ReadInitExpr(ref reader));
+        return expressions;
+    }
+
+    private static List<int> ElementExpressionFunctionIndices(List<byte[]> expressions)
+    {
+        var indices = new List<int>(expressions.Count);
+        foreach (byte[] expression in expressions)
+            indices.Add(ReadElemExprFunctionIndex(expression));
+        return indices;
+    }
+
+    /// <summary>The function indices a declarative segment declares: those of its <c>ref.func</c> expressions.</summary>
+    private static List<int> DeclaredFunctionIndices(List<int> expressionFunctionIndices)
+    {
+        var declared = new List<int>(expressionFunctionIndices.Count);
+        foreach (int index in expressionFunctionIndices)
+        {
+            if (index >= 0)
+                declared.Add(index);
+        }
+
+        return declared;
+    }
+
     private static void ReadCodeSection(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         List<WasmFunction> functions,
         List<int> typeIndices,
         WasmModule decodeModule,
@@ -1163,16 +1016,22 @@ public static partial class ModuleReader
         WasmFeatures features = WasmFeatures.Default)
     {
         int functionIndex = functions.Count;
-        long sectionContentStart = reader.Position;
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             if ((uint)functionIndex >= (uint)typeIndices.Count)
                 throw new WasmFormatException("Function/code section count mismatch: too many code entries");
 
-            uint funcOffset = checked((uint)(reader.Position - sectionContentStart));
-            uint bodySize = reader.ReadU32Leb128();
-            uint bodyStartOffset = checked((uint)(reader.Position - sectionContentStart));
-            var func = ReadCodeEntry(reader, bodySize, typeIndices[functionIndex], decodeModule, hasDataCountSection, features);
+            uint funcOffset = (uint)reader.Position;
+            uint bodySize = reader.ReadU32();
+            uint bodyStartOffset = (uint)reader.Position;
+            var body = reader.Sub(CodeEntryLength(bodySize));
+            var func = new WasmFunction
+            {
+                TypeIndex = typeIndices[functionIndex],
+                Locals = [],
+                Body = [],
+            };
+            PopulateCodeEntry(ref body, bodySize, func, decodeModule, hasDataCountSection, features);
             func.CodeSectionOffset = funcOffset;
             func.BodyCodeSectionOffset = bodyStartOffset + (bodySize - (uint)func.Body.Length);
             func.LocalsCodeSectionOffset = bodyStartOffset;
@@ -1181,86 +1040,32 @@ public static partial class ModuleReader
         }
     }
 
-    private static void ReadCodeSectionStreaming(
-        WasmBinaryReader reader,
-        uint sectionSize,
-        List<WasmFunction> functions,
-        List<int> typeIndices,
-        WasmModule decodeModule,
-        bool hasDataCountSection,
-        WasmFeatures features = WasmFeatures.Default)
-    {
-        // Streaming path: keep only a single function body buffered at any point.
-        long expectedEnd = reader.Position + sectionSize;
-        int functionIndex = functions.Count;
-        long sectionContentStart = reader.Position;
+    private static int CodeEntryLength(uint bodySize)
+        => bodySize <= int.MaxValue
+            ? (int)bodySize
+            : throw new WasmFormatException($"Function body payload is too large ({bodySize} bytes)");
 
-        foreach (var _ in reader.ReadVectorHeader())
-        {
-            if ((uint)functionIndex >= (uint)typeIndices.Count)
-                throw new WasmFormatException("Function/code section count mismatch: too many code entries");
-
-            uint funcOffset = checked((uint)(reader.Position - sectionContentStart));
-            uint bodySize = reader.ReadU32Leb128();
-            uint bodyStartOffset = checked((uint)(reader.Position - sectionContentStart));
-            if (bodySize > int.MaxValue)
-                throw new WasmFormatException($"Function body payload is too large ({bodySize} bytes)");
-
-            byte[] bodyBytes = reader.ReadBytes((int)bodySize);
-            using var bodyStream = new MemoryStream(bodyBytes, writable: false);
-            var bodyReader = new WasmBinaryReader(bodyStream);
-            var func = ReadCodeEntry(bodyReader, bodySize, typeIndices[functionIndex], decodeModule, hasDataCountSection, features);
-            func.CodeSectionOffset = funcOffset;
-            func.BodyCodeSectionOffset = bodyStartOffset + (bodySize - (uint)func.Body.Length);
-            func.LocalsCodeSectionOffset = bodyStartOffset;
-            functions.Add(func);
-            ValidateSectionConsumption(10, bodySize, bodyReader);
-            functionIndex++;
-        }
-
-        if (reader.Position != expectedEnd)
-        {
-            throw new WasmFormatException(
-                $"Section 10 size mismatch: expected to end at {expectedEnd} but reader is at {reader.Position}");
-        }
-    }
-
-    private static WasmFunction ReadCodeEntry(
-        WasmBinaryReader reader,
-        uint bodySize,
-        int typeIndex,
-        WasmModule decodeModule,
-        bool hasDataCountSection,
-        WasmFeatures features = WasmFeatures.Default)
-    {
-        var function = new WasmFunction
-        {
-            TypeIndex = typeIndex,
-            Locals = [],
-            Body = [],
-        };
-        PopulateCodeEntry(reader, bodySize, function, decodeModule, hasDataCountSection, features);
-        return function;
-    }
-
+    /// <summary>
+    /// Reads one code entry's locals and body from <paramref name="reader"/>, which spans exactly the entry's
+    /// <paramref name="bodySize"/> bytes, into <paramref name="function"/>, and decodes the body.
+    /// </summary>
     private static void PopulateCodeEntry(
-        WasmBinaryReader reader,
+        ref WasmSpanReader reader,
         uint bodySize,
         WasmFunction function,
         WasmModule decodeModule,
         bool hasDataCountSection,
         WasmFeatures features = WasmFeatures.Default)
     {
-        long bodyStart = reader.Position;
-
         // Each declaration is at least a count byte and a type byte.
-        var localDecls = reader.ReadVector(() =>
+        uint declarationCount = reader.ReadVectorCount(minElementSize: 2);
+        var localDecls = new (uint Count, ValType Type, Microsoft.NET.WebAssembly.Types.ValueType ExactType)[declarationCount];
+        for (int i = 0; i < localDecls.Length; i++)
         {
-            uint count = reader.ReadU32Leb128();
-            var exactType = ReadExactValType(reader);
-            var type = exactType.ToStorageValType();
-            return (count, type, exactType);
-        }, minElementSize: 2);
+            uint count = reader.ReadU32();
+            var exactType = ReadExactValType(ref reader);
+            localDecls[i] = (count, exactType.ToStorageValType(), exactType);
+        }
 
         ulong totalLocals = 0;
         foreach (var (count, _, _) in localDecls)
@@ -1291,14 +1096,8 @@ public static partial class ModuleReader
             }
         }
 
-        long remaining = (long)bodySize - (reader.Position - bodyStart);
-        if (remaining < 0)
-            throw new WasmFormatException("Code entry body size underflow");
-
-        if (remaining > int.MaxValue)
-            throw new WasmFormatException($"Function body payload is too large ({bodySize} bytes)");
-
-        byte[] body = reader.ReadBytes((int)remaining);
+        // The model owns its body: the reader may be over a pooled buffer.
+        byte[] body = reader.ReadBytes(reader.Remaining).ToArray();
         function.Locals = locals;
         function.ExactLocals = exactLocals;
         function.Body = body;
@@ -1315,35 +1114,34 @@ public static partial class ModuleReader
             ValidateCodeBody(body, hasDataCountSection, features);
     }
 
-    private static void ReadDataSection(WasmBinaryReader reader, List<Data> dataSegments, long payloadBase = 0)
+    private static void ReadDataSection(ref WasmSpanReader reader, List<Data> dataSegments)
     {
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
-            uint flag = reader.ReadU32Leb128();
+            uint flag = reader.ReadU32();
             bool isPassive = flag switch
             {
                 0 or 2 => false,
                 1 => true,
                 _ => throw new WasmFormatException($"Unsupported data segment flag: {flag}"),
             };
-            int memoryIndex = flag switch { 0 => 0, 1 => -1, _ => (int)reader.ReadU32Leb128() };
-            byte[] offsetExpr = isPassive ? [] : ReadInitExpr(reader);
-            int length = ToInt32(reader.ReadU32Leb128(), "Data segment length");
-            uint payloadOffset = checked((uint)(reader.Position - payloadBase));
+            int memoryIndex = flag switch { 0 => 0, 1 => -1, _ => (int)reader.ReadU32() };
+            byte[] offsetExpr = isPassive ? [] : ReadInitExpr(ref reader);
+            int length = ToInt32(reader.ReadU32(), "Data segment length");
+            uint payloadOffset = (uint)reader.Position;
             dataSegments.Add(new Data
             {
                 IsPassive = isPassive,
                 MemoryIndex = memoryIndex,
                 OffsetExpr = offsetExpr,
-                InitData = reader.ReadBytes(length),
+                InitData = reader.ReadBytes(length).ToArray(),
                 SectionPayloadOffset = payloadOffset,
             });
         }
     }
 
     private static void ReadCustomSection(
-        WasmBinaryReader reader,
-        uint sectionSize,
+        ref WasmSpanReader reader,
         List<CustomSection> customSections,
         ref LinkingSection? linkingSection,
         ref ProducersSection? producersSection,
@@ -1351,56 +1149,49 @@ public static partial class ModuleReader
         List<RelocationSection> relocationSections,
         bool appearedAfterCode)
     {
-        long nameStart = reader.Position;
-        string name = reader.ReadName();
-        long contentLength = sectionSize - (reader.Position - nameStart);
-        if (contentLength < 0)
-            throw new WasmFormatException($"Custom section '{name}' has an invalid payload length.");
-        if (contentLength > int.MaxValue)
-            throw new WasmFormatException($"Custom section '{name}' payload is too large ({contentLength} bytes)");
-
-        byte[] content = contentLength > 0 ? reader.ReadBytes((int)contentLength) : [];
-        customSections.Add(new CustomSection(name, content)
+        ReadOnlySpan<byte> nameBytes = reader.ReadNameBytes();
+        string name = Encoding.UTF8.GetString(nameBytes);
+        long contentOffset = reader.AbsolutePosition;
+        ReadOnlySpan<byte> content = reader.ReadBytes(reader.Remaining);
+        customSections.Add(new CustomSection(name, content.IsEmpty ? [] : content.ToArray())
         {
             AppearedAfterCode = appearedAfterCode,
         });
 
         try
         {
-            if (string.Equals(name, "linking", StringComparison.Ordinal))
+            if (nameBytes.SequenceEqual("linking"u8))
             {
-                linkingSection = ParseLinkingSection(content);
+                linkingSection = ParseLinkingSection(content, contentOffset);
             }
-            else if (string.Equals(name, "producers", StringComparison.Ordinal))
+            else if (nameBytes.SequenceEqual("producers"u8))
             {
-                producersSection = ParseProducersSection(content);
+                producersSection = ParseProducersSection(new WasmSpanReader(content, contentOffset));
             }
-            else if (string.Equals(name, "target_features", StringComparison.Ordinal))
+            else if (nameBytes.SequenceEqual("target_features"u8))
             {
-                targetFeaturesSection = ParseTargetFeaturesSection(content);
+                targetFeaturesSection = ParseTargetFeaturesSection(new WasmSpanReader(content, contentOffset));
             }
-            else if (name.StartsWith("reloc.", StringComparison.Ordinal))
+            else if (nameBytes.StartsWith("reloc."u8))
             {
                 relocationSections.Add(ParseRelocationSection(name, content));
             }
         }
         catch (WasmFormatException ex)
         {
-            throw new WasmFormatException($"Failed to parse custom section '{name}': {ex.Message}", ex);
+            throw new WasmFormatException($"Failed to parse custom section '{name}': {ex.Message}", ex, ex.BinaryOffset);
         }
     }
 
-    private static ProducersSection ParseProducersSection(byte[] content)
+    private static ProducersSection ParseProducersSection(WasmSpanReader reader)
     {
-        using var stream = new MemoryStream(content, writable: false);
-        var reader = new WasmBinaryReader(stream);
-        uint fieldCount = reader.ReadU32Leb128();
+        uint fieldCount = reader.ReadU32();
         var fields = new Dictionary<string, List<(string Name, string Version)>>(StringComparer.Ordinal);
 
         for (uint i = 0; i < fieldCount; i++)
         {
             string fieldName = reader.ReadName();
-            uint valueCount = reader.ReadU32Leb128();
+            uint valueCount = reader.ReadU32();
 
             if (!fields.TryGetValue(fieldName, out var values))
             {
@@ -1412,7 +1203,7 @@ public static partial class ModuleReader
                 values.Add((reader.ReadName(), reader.ReadName()));
         }
 
-        ValidateReaderConsumed(reader, "producers section");
+        reader.ExpectEnd("producers section");
 
         return new ProducersSection
         {
@@ -1420,10 +1211,8 @@ public static partial class ModuleReader
         };
     }
 
-    private static TargetFeaturesSection ParseTargetFeaturesSection(byte[] content)
+    private static TargetFeaturesSection ParseTargetFeaturesSection(WasmSpanReader reader)
     {
-        using var stream = new MemoryStream(content, writable: false);
-        var reader = new WasmBinaryReader(stream);
         // Each entry is at least a prefix byte and a name length.
         uint count = reader.ReadVectorCount(minElementSize: 2);
         var features = new List<(char Prefix, string Name)>((int)count);
@@ -1437,7 +1226,7 @@ public static partial class ModuleReader
             features.Add((prefix, reader.ReadName()));
         }
 
-        ValidateReaderConsumed(reader, "target_features section");
+        reader.ExpectEnd("target_features section");
 
         return new TargetFeaturesSection
         {
@@ -1446,9 +1235,8 @@ public static partial class ModuleReader
     }
 
     // Subsections are read in place: neither the section nor its subsections are copied.
-    private static LinkingSection ParseLinkingSection(ReadOnlyMemory<byte> content)
+    private static LinkingSection ParseLinkingSection(ReadOnlySpan<byte> span, long baseOffset)
     {
-        ReadOnlySpan<byte> span = content.Span;
         int position = 0;
         uint version = WasmLeb128.ReadU32(span, ref position);
         if (version != LinkingSection.CurrentVersion)
@@ -1465,26 +1253,26 @@ public static partial class ModuleReader
             uint payloadLength = WasmLeb128.ReadU32(span, ref position);
             if ((ulong)position + payloadLength > (ulong)span.Length)
                 throw new WasmFormatException($"Linking subsection {subsectionType} extends past the end of the linking section.");
-            WasmBinaryReader payloadReader = ReaderOver(content.Slice(position, (int)payloadLength));
+            var payloadReader = new WasmSpanReader(span.Slice(position, (int)payloadLength), baseOffset + position);
             position += (int)payloadLength;
 
             switch (subsectionType)
             {
                 case (byte)LinkingSubsectionId.SegmentInfo:
-                    segmentInfos.AddRange(ReadSegmentInfoSubsection(payloadReader));
+                    ReadSegmentInfoSubsection(ref payloadReader, segmentInfos);
                     break;
                 case (byte)LinkingSubsectionId.InitFunctions:
-                    initFunctions.AddRange(ReadInitFunctionsSubsection(payloadReader));
+                    ReadInitFunctionsSubsection(ref payloadReader, initFunctions);
                     break;
                 case (byte)LinkingSubsectionId.ComdatInfo:
-                    comdatGroups.AddRange(ReadComdatInfoSubsection(payloadReader));
+                    ReadComdatInfoSubsection(ref payloadReader, comdatGroups);
                     break;
                 case (byte)LinkingSubsectionId.SymbolTable:
-                    symbols.AddRange(ReadSymbolTableSubsection(payloadReader));
+                    ReadSymbolTableSubsection(ref payloadReader, symbols);
                     break;
             }
 
-            ValidateReaderConsumed(payloadReader, $"linking subsection {subsectionType}");
+            payloadReader.ExpectEnd($"linking subsection {subsectionType}");
         }
 
         return new LinkingSection
@@ -1497,51 +1285,44 @@ public static partial class ModuleReader
         };
     }
 
-    private static List<SegmentInfo> ReadSegmentInfoSubsection(WasmBinaryReader reader)
+    private static void ReadSegmentInfoSubsection(ref WasmSpanReader reader, List<SegmentInfo> segmentInfos)
     {
-        var segmentInfos = new List<SegmentInfo>();
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             segmentInfos.Add(new SegmentInfo
             {
                 Name = reader.ReadName(),
-                Alignment = reader.ReadU32Leb128(),
-                Flags = (SegmentFlags)reader.ReadU32Leb128(),
+                Alignment = reader.ReadU32(),
+                Flags = (SegmentFlags)reader.ReadU32(),
             });
         }
-
-        return segmentInfos;
     }
 
-    private static List<InitFunction> ReadInitFunctionsSubsection(WasmBinaryReader reader)
+    private static void ReadInitFunctionsSubsection(ref WasmSpanReader reader, List<InitFunction> initFunctions)
     {
-        var initFunctions = new List<InitFunction>();
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             initFunctions.Add(new InitFunction
             {
-                Priority = reader.ReadU32Leb128(),
-                SymbolIndex = reader.ReadU32Leb128(),
+                Priority = reader.ReadU32(),
+                SymbolIndex = reader.ReadU32(),
             });
         }
-
-        return initFunctions;
     }
 
-    private static List<ComdatGroup> ReadComdatInfoSubsection(WasmBinaryReader reader)
+    private static void ReadComdatInfoSubsection(ref WasmSpanReader reader, List<ComdatGroup> comdatGroups)
     {
-        var comdatGroups = new List<ComdatGroup>();
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             string name = reader.ReadName();
-            uint flags = reader.ReadU32Leb128();
+            uint flags = reader.ReadU32();
             var entries = new List<ComdatEntry>();
-            foreach (var __ in reader.ReadVectorHeader())
+            for (uint remainingEntries = reader.ReadU32(); remainingEntries > 0; remainingEntries--)
             {
                 entries.Add(new ComdatEntry
                 {
                     Kind = (ComdatKind)reader.ReadByte(),
-                    Index = reader.ReadU32Leb128(),
+                    Index = reader.ReadU32(),
                 });
             }
 
@@ -1552,17 +1333,14 @@ public static partial class ModuleReader
                 Entries = entries,
             });
         }
-
-        return comdatGroups;
     }
 
-    private static List<WasmSymbol> ReadSymbolTableSubsection(WasmBinaryReader reader)
+    private static void ReadSymbolTableSubsection(ref WasmSpanReader reader, List<WasmSymbol> symbols)
     {
-        var symbols = new List<WasmSymbol>();
-        foreach (var _ in reader.ReadVectorHeader())
+        for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
         {
             SymbolType type = (SymbolType)reader.ReadByte();
-            SymbolFlags flags = (SymbolFlags)reader.ReadU32Leb128();
+            SymbolFlags flags = (SymbolFlags)reader.ReadU32();
 
             switch (type)
             {
@@ -1571,7 +1349,7 @@ public static partial class ModuleReader
                 case SymbolType.Event:
                 case SymbolType.Table:
                 {
-                    uint index = reader.ReadU32Leb128();
+                    uint index = reader.ReadU32();
                     symbols.Add(new WasmSymbol
                     {
                         Type = type,
@@ -1589,9 +1367,9 @@ public static partial class ModuleReader
                     uint? size = null;
                     if (!flags.HasFlag(SymbolFlags.Undefined))
                     {
-                        segmentIndex = reader.ReadU32Leb128();
-                        offset = reader.ReadU32Leb128();
-                        size = reader.ReadU32Leb128();
+                        segmentIndex = reader.ReadU32();
+                        offset = reader.ReadU32();
+                        size = reader.ReadU32();
                     }
 
                     symbols.Add(new WasmSymbol
@@ -1610,22 +1388,19 @@ public static partial class ModuleReader
                     {
                         Type = type,
                         Flags = flags,
-                        SectionIndex = reader.ReadU32Leb128(),
+                        SectionIndex = reader.ReadU32(),
                     });
                     break;
                 default:
                     throw new WasmFormatException($"Unsupported linking symbol type: {(byte)type}");
             }
         }
-
-        return symbols;
     }
 
-    private static RelocationSection ParseRelocationSection(string name, byte[] content)
+    private static RelocationSection ParseRelocationSection(string name, ReadOnlySpan<byte> span)
     {
         // Decoded from the span: relocation sections hold a large share of an object's entries, and the
         // stream reader's per-byte reads dominated linking.
-        ReadOnlySpan<byte> span = content;
         int position = 0;
         uint targetSectionIndex = WasmLeb128.ReadU32(span, ref position);
         uint count = WasmLeb128.ReadU32(span, ref position);
@@ -1675,12 +1450,6 @@ public static partial class ModuleReader
     private static int ToInt32(ulong value, string what)
         => value <= int.MaxValue ? (int)value : throw new WasmFormatException($"{what} {value} is too large");
 
-    private static void ValidateReaderConsumed(WasmBinaryReader reader, string context)
-    {
-        if (reader.HasMore)
-            throw new WasmFormatException($"Unexpected trailing bytes in {context}.");
-    }
-
     /// <summary>
     /// Reads a bare <c>tabletype</c> (§5.3.9) — element type followed by limits. This is the shape
     /// an <em>import descriptor</em> uses.
@@ -1693,7 +1462,7 @@ public static partial class ModuleReader
     /// <c>wasm-tools 1.253.0</c> rejects as "malformed reference type". nesm accepted it and
     /// instantiated the module (GitHub #383).
     /// </remarks>
-    private static TableType ReadTableImportType(WasmBinaryReader reader)
+    private static TableType ReadTableImportType(ref WasmSpanReader reader)
     {
         if (reader.PeekByte() is 0x40)
         {
@@ -1702,17 +1471,17 @@ public static partial class ModuleReader
                 "definition in the table section, not for an import descriptor.");
         }
 
-        return ReadBareTableType(reader);
+        return ReadBareTableType(ref reader);
     }
 
     /// <summary>
     /// Reads a table-section entry: either a bare <c>tabletype</c> or the extended
     /// <c>0x40 0x00 reftype limits expr</c> form carrying an initializer.
     /// </summary>
-    private static TableType ReadTableDefinition(WasmBinaryReader reader)
+    private static TableType ReadTableDefinition(ref WasmSpanReader reader)
     {
         if (reader.PeekByte() is not 0x40)
-            return ReadBareTableType(reader);
+            return ReadBareTableType(ref reader);
 
         // Table with an initializer expression: 0x40 0x00 reftype limits expr.
         // The second byte is reserved and MUST be zero. Consuming it unchecked accepts
@@ -1724,20 +1493,20 @@ public static partial class ModuleReader
         if (reserved != 0x00)
             throw new WasmFormatException($"Invalid table encoding: reserved byte after 0x40 must be 0x00, got 0x{reserved:X2}");
 
-        var valType = ReadValTypeInfo(reader);
-        var limits = ReadLimits(reader);
+        var valType = ReadValTypeInfo(ref reader);
+        var limits = ReadLimits(ref reader);
         return new TableType(ValTypeToRefType(valType.Type), limits)
         {
             ElementTypeKey = valType.Key,
             ExactElementType = valType.ExactType,
-            InitExpr = ReadInitExpr(reader),
+            InitExpr = ReadInitExpr(ref reader),
         };
     }
 
-    private static TableType ReadBareTableType(WasmBinaryReader reader)
+    private static TableType ReadBareTableType(ref WasmSpanReader reader)
     {
-        var vt = ReadValTypeInfo(reader);
-        var tableLimits = ReadLimits(reader);
+        var vt = ReadValTypeInfo(ref reader);
+        var tableLimits = ReadLimits(ref reader);
         return new TableType(ValTypeToRefType(vt.Type), tableLimits)
         {
             ElementTypeKey = vt.Key,
@@ -1753,7 +1522,7 @@ public static partial class ModuleReader
         _ => RefType.FuncRef, // GC typed references default to funcref for table ops
     };
 
-    private static Limits ReadLimits(WasmBinaryReader reader)
+    private static Limits ReadLimits(ref WasmSpanReader reader)
     {
         var flag = (WasmLimitsFlags)reader.ReadByte();
         // Limits flag bits (memory64 + threads proposals): a max is present, shared (threads), and 64-bit
@@ -1765,25 +1534,25 @@ public static partial class ModuleReader
         bool is64 = (flag & WasmLimitsFlags.Is64) != 0;
 
         // For 64-bit memories/tables the bounds are u64 LEB128; otherwise u32.
-        ulong min = is64 ? reader.ReadU64Leb128() : reader.ReadU32Leb128();
+        ulong min = is64 ? reader.ReadU64() : reader.ReadU32();
         ulong? max = hasMax
-            ? (is64 ? reader.ReadU64Leb128() : reader.ReadU32Leb128())
+            ? (is64 ? reader.ReadU64() : reader.ReadU32())
             : null;
 
         return new Limits(min, max, is64);
     }
 
-    private static MemoryType ReadMemoryType(WasmBinaryReader reader)
+    private static MemoryType ReadMemoryType(ref WasmSpanReader reader)
     {
         var flag = (WasmLimitsFlags)reader.PeekByte();
         bool shared = (flag & WasmLimitsFlags.Shared) != 0;
-        var limits = ReadLimits(reader);
+        var limits = ReadLimits(ref reader);
         return new MemoryType(limits, shared);
     }
 
-    private static GlobalType ReadGlobalType(WasmBinaryReader reader)
+    private static GlobalType ReadGlobalType(ref WasmSpanReader reader)
     {
-        var contentType = ReadValTypeInfo(reader);
+        var contentType = ReadValTypeInfo(ref reader);
         byte encodedMutability = reader.ReadByte();
         var mutability = encodedMutability switch
         {
@@ -1804,47 +1573,46 @@ public static partial class ModuleReader
     /// immediate(s) properly so that LEB128 overflow is detected, then expects 0x0B (end).
     /// Returns the raw bytes consumed (opcode + immediate + end).
     /// </summary>
-    private static byte[] ReadInitExpr(WasmBinaryReader reader)
+    private static byte[] ReadInitExpr(ref WasmSpanReader reader)
     {
         // Read a sequence of constant-expression opcodes until END (0x0B).
         // Supports extended-const proposal: i32/i64 add/sub/mul in init expressions.
-        var bytes = new List<byte>();
+        int start = reader.Position;
 
         while (true)
         {
             byte opcode = reader.ReadByte();
-            bytes.Add(opcode);
 
             switch (opcode)
             {
                 case WasmOpcode.End:
-                    return bytes.ToArray();
+                    return reader.ConsumedSince(start).ToArray();
                 case WasmOpcode.I32Const: // i32.const  — s32 LEB128
-                    ReadAndCollectS32Leb128(reader, bytes);
+                    reader.ReadS32();
                     break;
                 case WasmOpcode.I64Const: // i64.const  — s64 LEB128
-                    ReadAndCollectS64Leb128(reader, bytes);
+                    reader.ReadS64();
                     break;
                 case WasmOpcode.F32Const: // f32.const  — 4 raw bytes
-                    bytes.AddRange(reader.ReadBytes(4));
+                    reader.ReadBytes(4);
                     break;
                 case WasmOpcode.F64Const: // f64.const  — 8 raw bytes
-                    bytes.AddRange(reader.ReadBytes(8));
+                    reader.ReadBytes(8);
                     break;
                 case WasmOpcode.GlobalGet: // global.get — u32 LEB128 index
-                    ReadAndCollectU32Leb128(reader, bytes);
+                    reader.ReadU32();
                     break;
                 case WasmOpcode.RefNull: // ref.null — heap type (s33 LEB128 for GC, single byte for MVP)
-                    ReadAndCollectHeapType(reader, bytes);
+                    reader.ReadS33();
                     break;
                 case WasmOpcode.RefFunc: // ref.func — u32 LEB128 funcidx
-                    ReadAndCollectU32Leb128(reader, bytes);
+                    reader.ReadU32();
                     break;
                 case WasmOpcode.SimdPrefix: // SIMD prefix — v128.const (sub-opcode 12)
-                    uint simdSubOpcode = ReadAndCollectU32Leb128(reader, bytes);
+                    uint simdSubOpcode = reader.ReadU32();
                     if (simdSubOpcode != 0x0C)
                         throw new WasmFormatException($"Invalid SIMD init expression sub-opcode: 0x{simdSubOpcode:X}");
-                    bytes.AddRange(reader.ReadBytes(16));
+                    reader.ReadBytes(16);
                     break;
                 // Extended constant expressions — no immediates
                 case WasmOpcode.I32Add:
@@ -1857,7 +1625,7 @@ public static partial class ModuleReader
                 // GC init expression opcodes
                 case WasmOpcode.GcPrefix: // GC prefix
                 {
-                    uint gcSubOpcode = ReadAndCollectU32Leb128(reader, bytes);
+                    uint gcSubOpcode = reader.ReadU32();
                     switch (gcSubOpcode)
                     {
                         // struct.new, struct.new_default, array.new, array.new_default
@@ -1865,11 +1633,11 @@ public static partial class ModuleReader
                         case 0x01:
                         case 0x06:
                         case 0x07:
-                            ReadAndCollectU32Leb128(reader, bytes);
+                            reader.ReadU32();
                             break;
                         case 0x08: // array.new_fixed
-                            ReadAndCollectU32Leb128(reader, bytes);
-                            ReadAndCollectU32Leb128(reader, bytes);
+                            reader.ReadU32();
+                            reader.ReadU32();
                             break;
                         // any.convert_extern, extern.convert_any, ref.i31
                         case 0x1A:
@@ -1885,12 +1653,7 @@ public static partial class ModuleReader
                     throw new WasmFormatException($"Invalid init expression opcode: 0x{opcode:X2}");
             }
         }
-
-        throw new WasmFormatException("Init expression missing END opcode.");
     }
-
-    // Helpers that read a LEB128 value AND collect the raw bytes into a list.
-    // They mirror the logic in WasmBinaryReader so overflow/length errors propagate correctly.
 
     private static int ReadElemExprFunctionIndex(byte[] expr)
     {
@@ -1924,7 +1687,7 @@ public static partial class ModuleReader
     /// obvious site rather than three bare <c>ReadByte()</c> calls, and so the follow-up has
     /// somewhere to land.
     /// </remarks>
-    private static void ReadElemKind(WasmBinaryReader reader)
+    private static void ReadElemKind(ref WasmSpanReader reader)
     {
         // Deliberately unvalidated — see remarks. Spec-correct behaviour is:
         //   if (elemKind != 0x00) throw new WasmFormatException(...);
@@ -1935,51 +1698,12 @@ public static partial class ModuleReader
     /// Reads and validates a reference type in an element segment.
     /// Handles standard ref types and GC typed references.
     /// </summary>
-    private static Microsoft.NET.WebAssembly.Types.ValueType ReadExactRefType(WasmBinaryReader reader)
+    private static Microsoft.NET.WebAssembly.Types.ValueType ReadExactRefType(ref WasmSpanReader reader)
     {
-        var vt = ReadValTypeInfo(reader);
+        var vt = ReadValTypeInfo(ref reader);
         if (vt.ExactType is not Microsoft.NET.WebAssembly.Types.ValueType.Reference)
             throw new WasmFormatException("malformed reference type");
         return vt.ExactType;
-    }
-
-    private static uint ReadAndCollectU32Leb128(WasmBinaryReader reader, List<byte> bytes)
-    {
-        ReadOnlySpan<byte> encoded = ReadAndCollectLeb128(reader, bytes, stackalloc byte[WasmLeb128.MaxLength32]);
-        Leb128Status status = WasmLeb128.DecodeU32(encoded, out uint value, out _);
-        return status == Leb128Status.Ok ? value : throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.U32);
-    }
-
-    /// <summary>Collects the raw bytes of a heap type (s33 LEB128) into a byte list.</summary>
-    private static void ReadAndCollectHeapType(WasmBinaryReader reader, List<byte> bytes)
-    {
-        ReadOnlySpan<byte> encoded = ReadAndCollectLeb128(reader, bytes, stackalloc byte[WasmLeb128.MaxLength32]);
-        Leb128Status status = WasmLeb128.DecodeS33(encoded, out _, out _);
-        if (status != Leb128Status.Ok)
-            throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S33);
-    }
-
-    private static void ReadAndCollectS32Leb128(WasmBinaryReader reader, List<byte> bytes)
-    {
-        ReadOnlySpan<byte> encoded = ReadAndCollectLeb128(reader, bytes, stackalloc byte[WasmLeb128.MaxLength32]);
-        Leb128Status status = WasmLeb128.DecodeS32(encoded, out _, out _);
-        if (status != Leb128Status.Ok)
-            throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S32);
-    }
-
-    private static void ReadAndCollectS64Leb128(WasmBinaryReader reader, List<byte> bytes)
-    {
-        ReadOnlySpan<byte> encoded = ReadAndCollectLeb128(reader, bytes, stackalloc byte[WasmLeb128.MaxLength64]);
-        Leb128Status status = WasmLeb128.DecodeS64(encoded, out _, out _);
-        if (status != Leb128Status.Ok)
-            throw WasmLeb128.CreateException(status, WasmLeb128.Leb128Kind.S64);
-    }
-
-    private static ReadOnlySpan<byte> ReadAndCollectLeb128(WasmBinaryReader reader, List<byte> bytes, Span<byte> buffer)
-    {
-        ReadOnlySpan<byte> encoded = reader.ReadLeb128Bytes(buffer);
-        bytes.AddRange(encoded);
-        return encoded;
     }
 
     // ── Code body validation ────────────────────────────────────────────────────────────

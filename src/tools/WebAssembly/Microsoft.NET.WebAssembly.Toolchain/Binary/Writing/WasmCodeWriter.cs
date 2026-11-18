@@ -3,6 +3,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.NET.WebAssembly.Types;
 
@@ -47,11 +48,10 @@ public enum WasmImmediateShape : byte
     SelectTyped,
 }
 
-/// <summary>
-/// A run of locals of one type in a function body's local declarations. <see cref="ValueType"/> is a single-byte value type:
-/// a number, <c>v128</c>, or an abstract reference shorthand such as <c>funcref</c>.
-/// </summary>
-public readonly record struct WasmLocalGroup(uint Count, ValType ValueType);
+/// <summary>A run of locals of one type in a function body's local declarations.</summary>
+/// <param name="Count">The number of locals.</param>
+/// <param name="ValueType">Their type; a <see cref="ValType"/> converts implicitly. <c>default</c> is rejected.</param>
+public readonly record struct WasmLocalGroup(uint Count, WasmValType ValueType);
 
 /// <summary>The kind of a <c>try_table</c> catch clause.</summary>
 public enum WasmCatchKind : byte
@@ -70,44 +70,109 @@ public enum WasmCatchKind : byte
 }
 
 /// <summary>
-/// A <c>try_table</c> catch clause. <see cref="Tag"/> is ignored by the <c>catch_all</c> kinds; <see cref="TagWidth"/>
-/// is 0 for a minimal tag index, or the width it is padded to (5 for a relocated one).
+/// A <c>try_table</c> catch clause, made by <see cref="Catch"/>, <see cref="CatchRef"/>, <see cref="CatchAll"/> or
+/// <see cref="CatchAllRef"/>. <c>default</c> is not a clause, and <see cref="WasmCodeWriter.TryTable"/> rejects it.
 /// </summary>
-public readonly record struct WasmCatchClause(WasmCatchKind Kind, uint Tag, uint Label, int TagWidth = 0);
-
-/// <summary>
-/// A block type: empty, one single-byte value type, or a type index. <c>default</c> is <see cref="Empty"/>.
-/// Multi-byte result types (<c>(ref null $t)</c>) are not supported.
-/// </summary>
-public readonly struct WasmBlockType
+public readonly record struct WasmCatchClause
 {
-    // The empty block type is the byte 0x40, read as an s33.
-    private const long EmptyCode = -0x40;
-
-    private readonly long _code;
     private readonly bool _isSet;
 
-    private WasmBlockType(long code)
+    private WasmCatchClause(WasmCatchKind kind, uint tag, uint label, int tagWidth)
     {
-        _code = code;
+        Kind = kind;
+        Tag = tag;
+        Label = label;
+        TagWidth = tagWidth;
         _isSet = true;
     }
 
-    /// <summary>The s33 encoding of the block type.</summary>
-    public long Code => _isSet ? _code : EmptyCode;
+    /// <summary>The clause's kind.</summary>
+    public WasmCatchKind Kind { get; }
+
+    /// <summary>The caught tag's index; 0 for the <c>catch_all</c> kinds, which have none.</summary>
+    public uint Tag { get; }
+
+    /// <summary>The label the clause branches to.</summary>
+    public uint Label { get; }
+
+    /// <summary>0 for a minimal tag index, or the width it is padded to (5 for a relocated one); 0 for the <c>catch_all</c> kinds.</summary>
+    public int TagWidth { get; }
+
+    internal bool IsSet => _isSet;
+
+    internal const string DefaultMessage =
+        "default(WasmCatchClause) is not a catch clause; use Catch, CatchRef, CatchAll or CatchAllRef.";
+
+    /// <summary><c>catch tag label</c>.</summary>
+    /// <param name="tag">The tag index.</param>
+    /// <param name="label">The label.</param>
+    /// <param name="tagWidth">0 for a minimal tag index, or the width it is padded to (1–5).</param>
+    public static WasmCatchClause Catch(uint tag, uint label, int tagWidth = 0) => Tagged(WasmCatchKind.Catch, tag, label, tagWidth);
+
+    /// <summary><c>catch_ref tag label</c>.</summary>
+    /// <param name="tag">The tag index.</param>
+    /// <param name="label">The label.</param>
+    /// <param name="tagWidth">0 for a minimal tag index, or the width it is padded to (1–5).</param>
+    public static WasmCatchClause CatchRef(uint tag, uint label, int tagWidth = 0) => Tagged(WasmCatchKind.CatchRef, tag, label, tagWidth);
+
+    /// <summary><c>catch_all label</c>.</summary>
+    public static WasmCatchClause CatchAll(uint label) => new(WasmCatchKind.CatchAll, 0, label, 0);
+
+    /// <summary><c>catch_all_ref label</c>.</summary>
+    public static WasmCatchClause CatchAllRef(uint label) => new(WasmCatchKind.CatchAllRef, 0, label, 0);
+
+    private static WasmCatchClause Tagged(WasmCatchKind kind, uint tag, uint label, int tagWidth)
+    {
+        WasmCodeWriter.CheckWidth(tag, tagWidth, WasmLeb128.MaxLength32, nameof(tagWidth));
+        return new(kind, tag, label, tagWidth);
+    }
+}
+
+/// <summary>
+/// A block type: empty, one result of any value type, or a type index. <c>default</c> is <see cref="Empty"/>.
+/// </summary>
+public readonly struct WasmBlockType
+{
+    private readonly WasmValType _result;
+    private readonly uint _typeIndex;
+    private readonly bool _isTypeIndex;
+
+    private WasmBlockType(WasmValType result, uint typeIndex, bool isTypeIndex)
+    {
+        _result = result;
+        _typeIndex = typeIndex;
+        _isTypeIndex = isTypeIndex;
+    }
 
     /// <summary>No parameters and no results (<c>0x40</c>).</summary>
     public static WasmBlockType Empty => default;
 
-    /// <summary>One result of the single-byte value type <paramref name="valueType"/>.</summary>
-    public static WasmBlockType Of(ValType valueType)
+    /// <summary>One result of type <paramref name="valueType"/>; a <see cref="ValType"/> converts implicitly.</summary>
+    /// <exception cref="ArgumentException"><paramref name="valueType"/> is <c>default</c>.</exception>
+    public static WasmBlockType Of(WasmValType valueType)
     {
-        WasmCodeWriter.CheckValueType(valueType);
-        return new(WasmCodeWriter.SingleByteTypeCode((byte)valueType));
+        valueType.Check(nameof(valueType));
+        return new(valueType, 0, isTypeIndex: false);
     }
 
     /// <summary>The function type <paramref name="typeIndex"/>.</summary>
-    public static WasmBlockType TypeIndex(uint typeIndex) => new(typeIndex);
+    public static WasmBlockType TypeIndex(uint typeIndex) => new(default, typeIndex, isTypeIndex: true);
+
+    // The empty block type is the byte 0x40; a value type is written as itself; a type index is an s33.
+    internal int Encode(Span<byte> destination)
+    {
+        if (_isTypeIndex)
+            return WasmLeb128.WriteSLeb128(destination, _typeIndex);
+        if (!_result.IsSet)
+        {
+            destination[0] = EmptyCode;
+            return 1;
+        }
+
+        return _result.Encode(destination);
+    }
+
+    private const byte EmptyCode = 0x40;
 }
 
 /// <summary>
@@ -159,12 +224,14 @@ public readonly struct WasmHeapType
 /// Writes WebAssembly function bodies (local declarations and instructions) to an <see cref="IBufferWriter{T}"/>.
 /// Each method writes one instruction, checking that the opcode takes the immediates the method writes
 /// (<see cref="WasmOps.GetImmediateShape"/>). LEB128 immediates are minimal unless a width is given; a relocatable
-/// operand is written padded (5 bytes for 32-bit relocations) and its position is returned, relative to the start
-/// of this writer, so the caller can record a relocation against it.
+/// operand is written padded (5 bytes for 32-bit relocations) and its position is returned so the caller can record
+/// a relocation against it. Positions are writer-relative: bytes since this writer was created, not offsets in the
+/// module or the code section; <see cref="RelocationSectionEncoder.SectionOffset"/> converts them.
 /// </summary>
 /// <remarks>
-/// Value types (locals, block results, typed <c>select</c>) are the single-byte ones: numbers, <c>v128</c> and the
-/// abstract reference shorthands. Instructions are named for what they write, like
+/// Value types (locals, block results, typed <c>select</c>) are <see cref="WasmValType"/>s, so GC and function
+/// references types such as <c>(ref null $t)</c> can be written; the <see cref="ValType"/> overloads write the
+/// single-byte ones. Instructions are named for what they write, like
 /// <c>System.Reflection.Metadata.Ecma335.InstructionEncoder</c>.
 /// </remarks>
 public sealed class WasmCodeWriter
@@ -178,19 +245,50 @@ public sealed class WasmCodeWriter
         _output = output;
     }
 
-    /// <summary>The number of bytes this writer has written: the position of the next instruction.</summary>
+    /// <summary>
+    /// The number of bytes this writer has written: the writer-relative position of the next instruction.
+    /// </summary>
     public long Position { get; private set; }
 
     // ── Locals ───────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Writes the local declarations for locals of the types <paramref name="valueTypes"/>, in order, grouping
+    /// consecutive locals of one type.
+    /// </summary>
+    public void Locals(ReadOnlySpan<WasmValType> valueTypes)
+    {
+        foreach (WasmValType type in valueTypes)
+            type.Check(nameof(valueTypes));
+
+        int groups = 0;
+        for (int i = 0; i < valueTypes.Length; i++)
+        {
+            if (i == 0 || valueTypes[i] != valueTypes[i - 1])
+                groups++;
+        }
+
+        WriteU((ulong)groups);
+        for (int i = 0; i < valueTypes.Length;)
+        {
+            int start = i;
+            while (i < valueTypes.Length && valueTypes[i] == valueTypes[start])
+                i++;
+            WriteU((ulong)(i - start));
+            WriteValueType(valueTypes[start]);
+        }
+    }
+
+    /// <summary>
     /// Writes the local declarations for locals of the single-byte value types <paramref name="valueTypes"/>, in
     /// order, grouping consecutive locals of one type.
     /// </summary>
+    // Preferred where both apply (an empty or all-ValType collection expression), which would otherwise be ambiguous.
+    [OverloadResolutionPriority(1)]
     public void Locals(ReadOnlySpan<ValType> valueTypes)
     {
         foreach (ValType type in valueTypes)
-            CheckValueType(type);
+            CheckValueType(type, nameof(valueTypes));
 
         int groups = 0;
         for (int i = 0; i < valueTypes.Length; i++)
@@ -214,13 +312,13 @@ public sealed class WasmCodeWriter
     public void LocalGroups(ReadOnlySpan<WasmLocalGroup> groups)
     {
         foreach (WasmLocalGroup group in groups)
-            CheckValueType(group.ValueType);
+            group.ValueType.Check(nameof(groups));
 
         WriteU((ulong)groups.Length);
         foreach (WasmLocalGroup group in groups)
         {
             WriteU(group.Count);
-            WriteByte((byte)group.ValueType);
+            WriteValueType(group.ValueType);
         }
     }
 
@@ -378,7 +476,7 @@ public sealed class WasmCodeWriter
     {
         Check(op, WasmImmediateShape.Block);
         WriteOpcode(op);
-        WriteS(type.Code, 0);
+        WriteBlockType(type);
     }
 
     /// <summary>Writes <c>br_table</c>.</summary>
@@ -404,14 +502,12 @@ public sealed class WasmCodeWriter
             throw new ArgumentException("Pass one tag position per clause, or none.", nameof(tagPositions));
         foreach (WasmCatchClause clause in clauses)
         {
-            if (clause.Kind > WasmCatchKind.CatchAllRef)
-                throw new ArgumentOutOfRangeException(nameof(clauses), clause.Kind, "Unknown catch clause kind.");
-            if (clause.Kind is WasmCatchKind.Catch or WasmCatchKind.CatchRef)
-                CheckWidth(clause.Tag, clause.TagWidth, WasmLeb128.MaxLength32);
+            if (!clause.IsSet)
+                throw new ArgumentException(WasmCatchClause.DefaultMessage, nameof(clauses));
         }
 
         WriteOpcode(WasmOp.TryTable);
-        WriteS(type.Code, 0);
+        WriteBlockType(type);
         WriteU((ulong)clauses.Length);
         for (int i = 0; i < clauses.Length; i++)
         {
@@ -433,11 +529,24 @@ public sealed class WasmCodeWriter
         WriteS(heapType.Code, 0);
     }
 
+    /// <summary>Writes a typed <c>select</c> with the value types <paramref name="valueTypes"/>.</summary>
+    public void SelectTyped(ReadOnlySpan<WasmValType> valueTypes)
+    {
+        foreach (WasmValType type in valueTypes)
+            type.Check(nameof(valueTypes));
+        WriteOpcode(WasmOp.SelectTyped);
+        WriteU((ulong)valueTypes.Length);
+        foreach (WasmValType type in valueTypes)
+            WriteValueType(type);
+    }
+
     /// <summary>Writes a typed <c>select</c> with the single-byte value types <paramref name="valueTypes"/>.</summary>
+    // Preferred where both apply (an empty or all-ValType collection expression), which would otherwise be ambiguous.
+    [OverloadResolutionPriority(1)]
     public void SelectTyped(ReadOnlySpan<ValType> valueTypes)
     {
         foreach (ValType type in valueTypes)
-            CheckValueType(type);
+            CheckValueType(type, nameof(valueTypes));
         WriteOpcode(WasmOp.SelectTyped);
         WriteU((ulong)valueTypes.Length);
         WriteBytes(MemoryMarshal.AsBytes(valueTypes));
@@ -482,13 +591,13 @@ public sealed class WasmCodeWriter
     private const uint MemArgMemoryIndexFlag = 0x40;
 
     // Single-byte value types: numeric, vector and the abstract reference shorthands.
-    internal static void CheckValueType(ValType type)
+    internal static void CheckValueType(ValType type, string paramName = "type")
     {
         byte code = (byte)type;
         if (type is not (>= ValType.V128 and <= ValType.I32) &&
             (code == AbstractHeapTypeCodes.ContLegacy || !AbstractHeapTypeCodes.TryFromCode(code, out _)))
         {
-            throw new ArgumentException($"0x{code:X2} is not a single-byte value type.", nameof(type));
+            throw new ArgumentException($"0x{code:X2} is not a single-byte value type.", paramName);
         }
     }
 
@@ -520,12 +629,12 @@ public sealed class WasmCodeWriter
             throw new ArgumentException($"{op} takes {actual} immediates, not {shape}.", nameof(op));
     }
 
-    private static void CheckWidth(ulong value, int width, int maxWidth)
+    internal static void CheckWidth(ulong value, int width, int maxWidth, string paramName = "width")
     {
         if (width < 0 || width > maxWidth)
-            throw new ArgumentOutOfRangeException(nameof(width), width, $"A width is 1 to {maxWidth} bytes (0 for minimal).");
+            throw new ArgumentOutOfRangeException(paramName, width, $"A width is 1 to {maxWidth} bytes (0 for minimal).");
         if (width != 0 && WasmLeb128.GetULeb128Size(value) > width)
-            throw new ArgumentException($"{value} does not fit a {width}-byte LEB128.", nameof(width));
+            throw new ArgumentException($"{value} does not fit a {width}-byte LEB128.", paramName);
     }
 
     private static void CheckSignedWidth(long value, int width, int maxWidth)
@@ -618,6 +727,12 @@ public sealed class WasmCodeWriter
         _output.GetSpan(1)[0] = value;
         Advance(1);
     }
+
+    private void WriteValueType(WasmValType type) =>
+        Advance(type.Encode(_output.GetSpan(1 + WasmLeb128.MaxLength)));
+
+    private void WriteBlockType(WasmBlockType type) =>
+        Advance(type.Encode(_output.GetSpan(1 + WasmLeb128.MaxLength)));
 
     private void WriteBytes(ReadOnlySpan<byte> bytes)
     {

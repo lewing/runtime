@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 
@@ -13,23 +14,36 @@ namespace Microsoft.NET.WebAssembly.Binary.Writing;
 /// <see cref="WasmModuleWriter.WriteCustomSection(ReadOnlySpan{byte}, IWasmSectionPayload, int)"/> under the
 /// name <c>linking</c>, after the sections its symbols and segments refer to.
 /// </summary>
+/// <remarks>
+/// The subsection encoders of this namespace (<see cref="SymbolTableEncoder"/>, <see cref="SegmentInfoEncoder"/>,
+/// <see cref="InitFunctionsEncoder"/> and <see cref="ComdatInfoEncoder"/>) are referenced, not copied: each payload
+/// is written once, straight to the destination of <see cref="WriteTo"/>. Writing one into a linking section
+/// completes it, and adding to it afterwards throws <see cref="InvalidOperationException"/>. Any other
+/// <see cref="IWasmSectionPayload"/> is copied when it is written in.
+/// </remarks>
 public sealed class LinkingSectionEncoder : IWasmSectionPayload
 {
     /// <summary>The linking metadata version this encoder writes.</summary>
     public const uint Version = LinkingSection.CurrentVersion;
 
-    private readonly MemoryStream _buffer = new();
+    private readonly List<Subsection> _subsections = [];
+    private long _length = WasmLeb128.GetULeb128Size(Version);
 
-    public LinkingSectionEncoder()
+    /// <inheritdoc />
+    public long Length => _length;
+
+    /// <inheritdoc />
+    public void WriteTo(Stream destination)
     {
-        WasmLeb128.WriteULeb128(_buffer, Version);
+        ArgumentNullException.ThrowIfNull(destination);
+        Span<byte> header = stackalloc byte[1 + WasmLeb128.MaxLength32];
+        destination.Write(header[..WasmLeb128.WriteULeb128(header, Version)]);
+        foreach (Subsection subsection in _subsections)
+        {
+            destination.Write(header[..EncodeHeader(header, subsection.Id, subsection.Length, subsection.SizeFieldWidth)]);
+            subsection.Payload.WriteTo(destination);
+        }
     }
-
-    /// <inheritdoc />
-    public long Length => _buffer.Length;
-
-    /// <inheritdoc />
-    public void WriteTo(Stream destination) => _buffer.WriteTo(destination);
 
     /// <summary>Appends a <see cref="LinkingSubsectionId.SymbolTable"/> subsection.</summary>
     public void WriteSymbolTable(SymbolTableEncoder symbols, int sizeFieldWidth = 0) => WriteSubsection(LinkingSubsectionId.SymbolTable, symbols, sizeFieldWidth);
@@ -45,41 +59,71 @@ public sealed class LinkingSectionEncoder : IWasmSectionPayload
 
     /// <summary>Appends a subsection with the given ID and payload.</summary>
     /// <param name="id">The subsection ID.</param>
-    /// <param name="payload">The subsection payload.</param>
+    /// <param name="payload">
+    /// The subsection payload. One of this namespace's subsection encoders is referenced and completed; any other
+    /// payload is copied now.
+    /// </param>
     /// <param name="sizeFieldWidth">
     /// 0 for a minimal size field, or the width (1–5) of a padded one; LLVM's object writer pads every
     /// subsection size to 5 bytes.
     /// </param>
+    /// <exception cref="ArgumentException">
+    /// The payload does not fit the size field, or wrote a different number of bytes than its
+    /// <see cref="IWasmSectionPayload.Length"/>. Nothing is appended.
+    /// </exception>
     public void WriteSubsection(LinkingSubsectionId id, IWasmSectionPayload payload, int sizeFieldWidth = 0)
     {
         ArgumentNullException.ThrowIfNull(payload);
-        long start = _buffer.Length;
-        WriteSubsectionHeader(id, payload.Length, sizeFieldWidth);
-        long payloadStart = _buffer.Length;
-        payload.WriteTo(_buffer);
-        if (_buffer.Length - payloadStart != payload.Length)
+        // Checked before the payload is completed or copied, so a rejected subsection leaves both unchanged.
+        Span<byte> header = stackalloc byte[1 + WasmLeb128.MaxLength32];
+        EncodeHeader(header, id, payload.Length, sizeFieldWidth);
+        if (payload is LinkingSubsectionEncoder encoder)
         {
-            _buffer.SetLength(start);
-            throw new ArgumentException("The payload wrote a different number of bytes than its Length.", nameof(payload));
+            Add(id, encoder.Complete(), sizeFieldWidth);
+            return;
         }
+
+        var copy = new SegmentedBuffer();
+        payload.WriteTo(copy);
+        if (copy.Length != payload.Length)
+            throw new ArgumentException("The payload wrote a different number of bytes than its Length.", nameof(payload));
+        Add(id, new BufferedPayload(copy), sizeFieldWidth);
     }
 
-    /// <summary>Appends a subsection with the given ID and payload.</summary>
+    /// <summary>Appends a subsection with the given ID and payload, which is copied.</summary>
     /// <param name="id">The subsection ID.</param>
     /// <param name="payload">The subsection payload.</param>
     /// <param name="sizeFieldWidth">0 for a minimal size field, or the width (1–5) of a padded one.</param>
     public void WriteSubsection(LinkingSubsectionId id, ReadOnlySpan<byte> payload, int sizeFieldWidth = 0)
     {
-        WriteSubsectionHeader(id, payload.Length, sizeFieldWidth);
-        _buffer.Write(payload);
+        // Checked before copying, so a payload that cannot be framed is not buffered for nothing.
+        Span<byte> header = stackalloc byte[1 + WasmLeb128.MaxLength32];
+        EncodeHeader(header, id, payload.Length, sizeFieldWidth);
+        var copy = new SegmentedBuffer();
+        copy.Write(payload);
+        Add(id, new BufferedPayload(copy), sizeFieldWidth);
     }
 
-    private void WriteSubsectionHeader(LinkingSubsectionId id, long payloadLength, int sizeFieldWidth)
+    private void Add(LinkingSubsectionId id, IWasmSectionPayload payload, int sizeFieldWidth)
     {
-        // A subsection header has the same shape as a section header: an ID byte and a size field.
-        Span<byte> header = stackalloc byte[6];
-        int length = WasmModuleWriter.EncodeSectionHeader(header, (WasmSectionId)id, payloadLength, sizeFieldWidth);
-        _buffer.Write(header[..length]);
+        long length = payload.Length;
+        Span<byte> header = stackalloc byte[1 + WasmLeb128.MaxLength32];
+        int headerLength = EncodeHeader(header, id, length, sizeFieldWidth);
+        _subsections.Add(new Subsection(id, payload, length, sizeFieldWidth));
+        _length += headerLength + length;
+    }
+
+    // A subsection header has the same shape as a section header: an ID byte and a size field.
+    private static int EncodeHeader(Span<byte> destination, LinkingSubsectionId id, long payloadLength, int sizeFieldWidth) =>
+        WasmModuleWriter.EncodeSectionHeader(destination, (WasmSectionId)id, payloadLength, sizeFieldWidth);
+
+    private readonly record struct Subsection(LinkingSubsectionId Id, IWasmSectionPayload Payload, long Length, int SizeFieldWidth);
+
+    private sealed class BufferedPayload(SegmentedBuffer buffer) : IWasmSectionPayload
+    {
+        public long Length => buffer.Length;
+
+        public void WriteTo(Stream destination) => buffer.CopyContentTo(destination);
     }
 
     /// <summary>
@@ -131,8 +175,10 @@ public sealed class LinkingSectionEncoder : IWasmSectionPayload
             var comdats = new ComdatInfoEncoder();
             foreach (ComdatGroup group in model.ComdatGroups)
             {
+                if (group.Flags != (uint)ComdatFlags.None)
+                    throw new ArgumentOutOfRangeException(nameof(model), group.Flags, $"COMDAT group '{group.Name}' has flags; LLVM defines none and rejects any set bit.");
                 using var name = new Utf8Scratch(group.Name, scratch);
-                comdats.Add(name.Bytes, group.Flags, group.Entries);
+                comdats.Add(name.Bytes, ComdatFlags.None, CollectionsMarshal.AsSpan(group.Entries));
             }
 
             encoder.WriteComdatInfo(comdats, subsectionSizeFieldWidth);
@@ -142,29 +188,60 @@ public sealed class LinkingSectionEncoder : IWasmSectionPayload
     }
 }
 
-/// <summary>A count-prefixed vector of already encoded entries.</summary>
-internal sealed class VectorPayload
+/// <summary>
+/// A linking subsection encoder: a count-prefixed vector of encoded entries, completed (made read-only) when it is
+/// written into a <see cref="LinkingSectionEncoder"/>, which then refers to it instead of copying it.
+/// </summary>
+public abstract class LinkingSubsectionEncoder : IWasmSectionPayload
 {
-    private readonly MemoryStream _entries = new();
+    private bool _completed;
 
-    public int Count { get; private set; }
-
-    public MemoryStream Entries => _entries;
-
-    public long Length => WasmLeb128.GetULeb128Size((ulong)Count) + _entries.Length;
-
-    public int Complete() => Count++;
-
-    public void WriteTo(Stream destination)
+    private protected LinkingSubsectionEncoder()
     {
-        WasmLeb128.WriteULeb128(destination, (ulong)Count);
-        _entries.WriteTo(destination);
     }
 
-    public void WriteName(ReadOnlySpan<byte> utf8Name)
+    /// <summary>The number of entries added.</summary>
+    public int Count { get; private set; }
+
+    /// <summary>
+    /// Whether the encoder has been written into a <see cref="LinkingSectionEncoder"/>; adding to it then throws
+    /// <see cref="InvalidOperationException"/>.
+    /// </summary>
+    public bool IsCompleted => _completed;
+
+    /// <inheritdoc />
+    public long Length => WasmLeb128.GetULeb128Size((ulong)Count) + Entries.Length;
+
+    private protected SegmentedBuffer Entries { get; } = new();
+
+    /// <inheritdoc />
+    public void WriteTo(Stream destination)
     {
-        WasmLeb128.WriteULeb128(_entries, (ulong)utf8Name.Length);
-        _entries.Write(utf8Name);
+        ArgumentNullException.ThrowIfNull(destination);
+        Span<byte> count = stackalloc byte[WasmLeb128.MaxLength32];
+        destination.Write(count[..WasmLeb128.WriteULeb128(count, (ulong)Count)]);
+        Entries.CopyContentTo(destination);
+    }
+
+    internal LinkingSubsectionEncoder Complete()
+    {
+        _completed = true;
+        return this;
+    }
+
+    // Called before validating an entry, so a completed encoder rejects every addition the same way.
+    private protected void EnsureNotCompleted()
+    {
+        if (_completed)
+            throw new InvalidOperationException($"This {GetType().Name} has been written into a linking section, which refers to it; it can no longer change.");
+    }
+
+    private protected int CompleteEntry() => Count++;
+
+    private protected void WriteName(ReadOnlySpan<byte> utf8Name)
+    {
+        Entries.WriteULeb128((ulong)utf8Name.Length);
+        Entries.Write(utf8Name);
     }
 }
 
@@ -178,19 +255,8 @@ internal sealed class VectorPayload
 /// that would not be written throws. Wherever a name is written it must be non-empty, as LLVM's and
 /// dotnet/runtime's writers always produce, so an omitted name never silently becomes an empty one.
 /// </remarks>
-public sealed class SymbolTableEncoder : IWasmSectionPayload
+public sealed class SymbolTableEncoder : LinkingSubsectionEncoder
 {
-    private readonly VectorPayload _vector = new();
-
-    /// <summary>The number of symbols added.</summary>
-    public int Count => _vector.Count;
-
-    /// <inheritdoc />
-    public long Length => _vector.Length;
-
-    /// <inheritdoc />
-    public void WriteTo(Stream destination) => _vector.WriteTo(destination);
-
     /// <summary>Adds a function symbol for function <paramref name="index"/>.</summary>
     public int AddFunction(SymbolFlags flags, uint index, ReadOnlySpan<byte> utf8Name = default) => AddIndexed(SymbolType.Function, flags, index, utf8Name);
 
@@ -203,48 +269,54 @@ public sealed class SymbolTableEncoder : IWasmSectionPayload
     /// <summary>Adds a tag symbol for tag <paramref name="index"/>.</summary>
     public int AddTag(SymbolFlags flags, uint index, ReadOnlySpan<byte> utf8Name = default) => AddIndexed(SymbolType.Tag, flags, index, utf8Name);
 
-    /// <summary>Adds a defined data symbol: <paramref name="size"/> bytes at <paramref name="offset"/> in a segment.</summary>
+    /// <summary>
+    /// Adds a defined data symbol: <paramref name="size"/> bytes at <paramref name="offset"/>, which is relative to
+    /// the start of data segment <paramref name="segmentIndex"/>'s content.
+    /// </summary>
     public int AddData(SymbolFlags flags, ReadOnlySpan<byte> utf8Name, uint segmentIndex, ulong offset, ulong size)
     {
-        if (flags.HasFlag(SymbolFlags.Undefined))
+        EnsureNotCompleted();
+        if (IsUndefined(flags))
             throw new ArgumentException("A defined data symbol cannot be flagged Undefined; use AddUndefinedData.", nameof(flags));
         RequireName(utf8Name);
 
-        MemoryStream entries = _vector.Entries;
-        entries.WriteByte((byte)SymbolType.Data);
-        WasmLeb128.WriteULeb128(entries, (uint)flags);
-        _vector.WriteName(utf8Name);
-        WasmLeb128.WriteULeb128(entries, segmentIndex);
-        WasmLeb128.WriteULeb128(entries, offset);
-        WasmLeb128.WriteULeb128(entries, size);
-        return _vector.Complete();
+        Entries.WriteByte((byte)SymbolType.Data);
+        Entries.WriteULeb128((uint)flags);
+        WriteName(utf8Name);
+        Entries.WriteULeb128(segmentIndex);
+        Entries.WriteULeb128(offset);
+        Entries.WriteULeb128(size);
+        return CompleteEntry();
     }
 
     /// <summary>Adds an undefined data symbol; <paramref name="flags"/> must include <see cref="SymbolFlags.Undefined"/>.</summary>
     public int AddUndefinedData(SymbolFlags flags, ReadOnlySpan<byte> utf8Name)
     {
-        if (!flags.HasFlag(SymbolFlags.Undefined))
+        EnsureNotCompleted();
+        if (!IsUndefined(flags))
             throw new ArgumentException("An undefined data symbol must be flagged Undefined.", nameof(flags));
         RequireName(utf8Name);
 
-        _vector.Entries.WriteByte((byte)SymbolType.Data);
-        WasmLeb128.WriteULeb128(_vector.Entries, (uint)flags);
-        _vector.WriteName(utf8Name);
-        return _vector.Complete();
+        Entries.WriteByte((byte)SymbolType.Data);
+        Entries.WriteULeb128((uint)flags);
+        WriteName(utf8Name);
+        return CompleteEntry();
     }
 
     /// <summary>Adds a section symbol for the section at file index <paramref name="sectionIndex"/>.</summary>
     public int AddSection(SymbolFlags flags, uint sectionIndex)
     {
-        _vector.Entries.WriteByte((byte)SymbolType.Section);
-        WasmLeb128.WriteULeb128(_vector.Entries, (uint)flags);
-        WasmLeb128.WriteULeb128(_vector.Entries, sectionIndex);
-        return _vector.Complete();
+        EnsureNotCompleted();
+        Entries.WriteByte((byte)SymbolType.Section);
+        Entries.WriteULeb128((uint)flags);
+        Entries.WriteULeb128(sectionIndex);
+        return CompleteEntry();
     }
 
     /// <summary>Adds the symbol <paramref name="symbol"/> as <see cref="ModuleReader"/> models it.</summary>
     public int Add(WasmSymbol symbol)
     {
+        EnsureNotCompleted();
         ArgumentNullException.ThrowIfNull(symbol);
         using var utf8 = new Utf8Scratch(symbol.Name, stackalloc byte[Utf8Scratch.StackSize]);
         ReadOnlySpan<byte> name = utf8.Bytes;
@@ -256,8 +328,11 @@ public sealed class SymbolTableEncoder : IWasmSectionPayload
             case SymbolType.Tag:
                 if (HasName(symbol.Flags) && symbol.Name is null)
                     throw new ArgumentException($"{symbol.Type} symbol {symbol.Index} needs a name.", nameof(symbol));
-                return AddIndexed(symbol.Type, symbol.Flags, checked((uint)Required(symbol.Index, "Index")), name);
-            case SymbolType.Data when symbol.Flags.HasFlag(SymbolFlags.Undefined):
+                int index = Required(symbol.Index, "Index");
+                if (index < 0)
+                    throw new ArgumentException($"The symbol's Index {index} is negative.", nameof(symbol));
+                return AddIndexed(symbol.Type, symbol.Flags, (uint)index, name);
+            case SymbolType.Data when IsUndefined(symbol.Flags):
                 return AddUndefinedData(symbol.Flags, name);
             case SymbolType.Data:
                 return AddData(symbol.Flags, name, Required(symbol.SegmentIndex, "SegmentIndex"), Required(symbol.Offset, "Offset"), Required(symbol.Size, "Size"));
@@ -273,22 +348,26 @@ public sealed class SymbolTableEncoder : IWasmSectionPayload
 
     private int AddIndexed(SymbolType kind, SymbolFlags flags, uint index, ReadOnlySpan<byte> utf8Name)
     {
+        EnsureNotCompleted();
         bool hasName = HasName(flags);
         if (!hasName && !utf8Name.IsEmpty)
             throw new ArgumentException("An undefined symbol without ExplicitName has no name field; pass no name or set ExplicitName.", nameof(utf8Name));
         if (hasName)
             RequireName(utf8Name);
 
-        _vector.Entries.WriteByte((byte)kind);
-        WasmLeb128.WriteULeb128(_vector.Entries, (uint)flags);
-        WasmLeb128.WriteULeb128(_vector.Entries, index);
+        Entries.WriteByte((byte)kind);
+        Entries.WriteULeb128((uint)flags);
+        Entries.WriteULeb128(index);
         if (hasName)
-            _vector.WriteName(utf8Name);
-        return _vector.Complete();
+            WriteName(utf8Name);
+        return CompleteEntry();
     }
 
+    // Bitwise tests, not Enum.HasFlag, which boxes both operands in unoptimized code and so allocates per symbol.
     private static bool HasName(SymbolFlags flags) =>
-        !flags.HasFlag(SymbolFlags.Undefined) || flags.HasFlag(SymbolFlags.ExplicitName);
+        !IsUndefined(flags) || (flags & SymbolFlags.ExplicitName) != 0;
+
+    private static bool IsUndefined(SymbolFlags flags) => (flags & SymbolFlags.Undefined) != 0;
 
     private static void RequireName(ReadOnlySpan<byte> utf8Name)
     {
@@ -298,94 +377,63 @@ public sealed class SymbolTableEncoder : IWasmSectionPayload
 }
 
 /// <summary>Encodes a <see cref="LinkingSubsectionId.SegmentInfo"/> subsection, one entry per data segment in order.</summary>
-public sealed class SegmentInfoEncoder : IWasmSectionPayload
+public sealed class SegmentInfoEncoder : LinkingSubsectionEncoder
 {
-    private readonly VectorPayload _vector = new();
-
-    /// <summary>The number of segments added.</summary>
-    public int Count => _vector.Count;
-
-    /// <inheritdoc />
-    public long Length => _vector.Length;
-
-    /// <inheritdoc />
-    public void WriteTo(Stream destination) => _vector.WriteTo(destination);
-
     /// <summary>Adds the next segment's name, alignment (as a power of two) and flags.</summary>
     public int Add(ReadOnlySpan<byte> utf8Name, uint alignmentLog2, SegmentFlags flags)
     {
-        _vector.WriteName(utf8Name);
-        WasmLeb128.WriteULeb128(_vector.Entries, alignmentLog2);
-        WasmLeb128.WriteULeb128(_vector.Entries, (uint)flags);
-        return _vector.Complete();
+        EnsureNotCompleted();
+        WriteName(utf8Name);
+        Entries.WriteULeb128(alignmentLog2);
+        Entries.WriteULeb128((uint)flags);
+        return CompleteEntry();
     }
 }
 
 /// <summary>Encodes a <see cref="LinkingSubsectionId.InitFunctions"/> subsection (constructors).</summary>
-public sealed class InitFunctionsEncoder : IWasmSectionPayload
+public sealed class InitFunctionsEncoder : LinkingSubsectionEncoder
 {
-    private readonly VectorPayload _vector = new();
-
-    /// <summary>The number of init functions added.</summary>
-    public int Count => _vector.Count;
-
-    /// <inheritdoc />
-    public long Length => _vector.Length;
-
-    /// <inheritdoc />
-    public void WriteTo(Stream destination) => _vector.WriteTo(destination);
-
     /// <summary>Adds the function symbol <paramref name="symbolIndex"/> as a constructor of the given priority.</summary>
     public int Add(uint priority, uint symbolIndex)
     {
-        WasmLeb128.WriteULeb128(_vector.Entries, priority);
-        WasmLeb128.WriteULeb128(_vector.Entries, symbolIndex);
-        return _vector.Complete();
+        EnsureNotCompleted();
+        Entries.WriteULeb128(priority);
+        Entries.WriteULeb128(symbolIndex);
+        return CompleteEntry();
     }
 }
 
 /// <summary>Encodes a <see cref="LinkingSubsectionId.ComdatInfo"/> subsection.</summary>
-public sealed class ComdatInfoEncoder : IWasmSectionPayload
+public sealed class ComdatInfoEncoder : LinkingSubsectionEncoder
 {
-    private readonly VectorPayload _vector = new();
-
-    /// <summary>The number of COMDAT groups added.</summary>
-    public int Count => _vector.Count;
-
-    /// <inheritdoc />
-    public long Length => _vector.Length;
-
-    /// <inheritdoc />
-    public void WriteTo(Stream destination) => _vector.WriteTo(destination);
-
     /// <summary>Adds a COMDAT group and its members (kind and index of each function, data segment or section).</summary>
-    public int Add(ReadOnlySpan<byte> utf8Name, uint flags, ReadOnlySpan<(ComdatKind Kind, uint Index)> entries)
+    /// <param name="utf8Name">The group's name.</param>
+    /// <param name="flags">The group's flags; LLVM defines none, so anything but <see cref="ComdatFlags.None"/> throws.</param>
+    /// <param name="entries">The group's members; a kind <see cref="ComdatKind"/> does not define throws.</param>
+    /// <returns>The group's index.</returns>
+    public int Add(ReadOnlySpan<byte> utf8Name, ComdatFlags flags, ReadOnlySpan<ComdatEntry> entries)
     {
-        WriteGroupHeader(utf8Name, flags, entries.Length);
-        foreach ((ComdatKind kind, uint index) in entries)
-            WriteEntry(kind, index);
-        return _vector.Complete();
-    }
+        EnsureNotCompleted();
+        if (flags != ComdatFlags.None)
+            throw new ArgumentOutOfRangeException(nameof(flags), flags, "LLVM defines no COMDAT flags and rejects any set bit.");
+        foreach (ComdatEntry entry in entries)
+        {
+            if (entry.Kind > ComdatKind.Section)
+                throw new ArgumentOutOfRangeException(nameof(entries), entry.Kind, "Unknown COMDAT entry kind; LLVM's reader rejects it.");
+        }
 
-    internal int Add(ReadOnlySpan<byte> utf8Name, uint flags, List<ComdatEntry> entries)
-    {
-        WriteGroupHeader(utf8Name, flags, entries.Count);
+        WriteName(utf8Name);
+        Entries.WriteULeb128((uint)flags);
+        Entries.WriteULeb128((ulong)entries.Length);
         foreach (ComdatEntry entry in entries)
             WriteEntry(entry.Kind, entry.Index);
-        return _vector.Complete();
-    }
-
-    private void WriteGroupHeader(ReadOnlySpan<byte> utf8Name, uint flags, int entryCount)
-    {
-        _vector.WriteName(utf8Name);
-        WasmLeb128.WriteULeb128(_vector.Entries, flags);
-        WasmLeb128.WriteULeb128(_vector.Entries, (ulong)entryCount);
+        return CompleteEntry();
     }
 
     private void WriteEntry(ComdatKind kind, uint index)
     {
-        _vector.Entries.WriteByte((byte)kind);
-        WasmLeb128.WriteULeb128(_vector.Entries, index);
+        Entries.WriteByte((byte)kind);
+        Entries.WriteULeb128(index);
     }
 }
 

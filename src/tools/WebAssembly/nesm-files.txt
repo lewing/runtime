@@ -33,13 +33,17 @@ Binary/WasmMetadataDiagnostic.cs
 Binary/WasmMetadataException.cs
 Binary/WasmNameSectionReader.cs
 Binary/WasmOpcode.cs
+Binary/WasmSectionStream.cs
+Binary/WasmSpanReader.cs
 Binary/WasmUnimplementedFormatException.cs
 Binary/Writing/ComponentSectionId.cs
 Binary/Writing/DataSegmentEncoder.cs
 Binary/Writing/LinkingSectionEncoder.cs
 Binary/Writing/NameMapWriter.cs
 Binary/Writing/RelocationSectionEncoder.cs
+Binary/Writing/SegmentedBuffer.cs
 Binary/Writing/WasmCodeWriter.cs
+Binary/Writing/WasmExternalKind.cs
 Binary/Writing/WasmLeb128.Buffers.cs
 Binary/Writing/WasmLeb128.Reading.cs
 Binary/Writing/WasmLeb128.cs
@@ -47,6 +51,7 @@ Binary/Writing/WasmModuleEntryWriter.cs
 Binary/Writing/WasmModuleWriter.cs
 Binary/Writing/WasmOp.cs
 Binary/Writing/WasmSectionId.cs
+Binary/Writing/WasmValType.cs
 Debugging/Symbols/DwarfSymbolProvider.cs
 Debugging/Symbols/FunctionBreakpointResolution.cs
 Debugging/Symbols/ManagedSymbolProviders.cs

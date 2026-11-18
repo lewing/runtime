@@ -40,8 +40,11 @@ public static partial class ModuleReader
             switch ((WasmSectionId)id)
             {
                 case WasmSectionId.Import:
-                    ReadImportSection(ReaderOver(content), imports);
+                {
+                    var reader = new WasmSpanReader(content.Span, position - size);
+                    ReadImportSection(ref reader, imports);
                     break;
+                }
                 case WasmSectionId.Memory:
                 {
                     int at = 0;
@@ -61,7 +64,7 @@ public static partial class ModuleReader
                     ReadOnlySpan<byte> name = payload.Slice(at, (int)nameLength);
                     at += (int)nameLength;
                     if (name.SequenceEqual("linking"u8))
-                        linking = ParseLinkingSection(content[at..]);
+                        linking = ParseLinkingSection(payload[at..], position - size + at);
                     else if (name.StartsWith("reloc."u8))
                         relocationSections.Add(new RelocationSection());
                     break;
@@ -77,10 +80,4 @@ public static partial class ModuleReader
             RelocationSections = relocationSections,
         };
     }
-
-    /// <summary>A reader over <paramref name="content"/>, without copying it when it is backed by an array.</summary>
-    private static WasmBinaryReader ReaderOver(ReadOnlyMemory<byte> content) =>
-        new(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(content, out ArraySegment<byte> segment)
-            ? new MemoryStream(segment.Array!, segment.Offset, segment.Count, writable: false)
-            : new MemoryStream(content.ToArray(), writable: false));
 }

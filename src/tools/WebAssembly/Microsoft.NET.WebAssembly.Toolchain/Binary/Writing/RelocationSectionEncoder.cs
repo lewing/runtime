@@ -9,9 +9,38 @@ namespace Microsoft.NET.WebAssembly.Binary.Writing;
 /// Encodes the payload of a <c>reloc.*</c> custom section: the target section's index, the entry count and the
 /// entries. Entries are appended one at a time, so a producer can emit them while it patches the target content.
 /// </summary>
+/// <remarks>
+/// <para>The writing API uses three position bases:</para>
+/// <list type="table">
+/// <listheader><term>Base</term><description>Used by</description></listheader>
+/// <item>
+/// <term>Module offset (<see cref="long"/>): the byte's offset in the file.</term>
+/// <description><see cref="WasmModuleWriter.Position"/>, which counts the writer's <c>startOffset</c>.</description>
+/// </item>
+/// <item>
+/// <term>Writer-relative (<see cref="long"/>): bytes since the writer was created.</term>
+/// <description>
+/// <see cref="WasmCodeWriter.Position"/>, <see cref="WasmModuleEntryWriter.Position"/> and the positions their
+/// methods return.
+/// </description>
+/// </item>
+/// <item>
+/// <term>Section-relative (<see cref="uint"/>): the byte's offset in the target section's content.</term>
+/// <description>
+/// The <c>offset</c> of <see cref="Add"/>. For a known section the content starts after the size field, so it
+/// includes the vector count; for a custom section it starts after the name.
+/// </description>
+/// </item>
+/// </list>
+/// <para>
+/// <see cref="SectionOffset"/> converts a writer-relative position to a section-relative offset. A
+/// <see cref="WasmModuleEntryWriter"/> started at the section's content, with <see cref="WasmModuleEntryWriter.Count"/>
+/// written first, already returns section-relative positions.
+/// </para>
+/// </remarks>
 public sealed class RelocationSectionEncoder : IWasmSectionPayload
 {
-    private readonly MemoryStream _entries = new();
+    private readonly SegmentedBuffer _entries = new();
     private uint _previousOffset;
 
     /// <summary>Creates an encoder for relocations against the section at file index <paramref name="targetSectionIndex"/>.</summary>
@@ -33,14 +62,18 @@ public sealed class RelocationSectionEncoder : IWasmSectionPayload
     /// <inheritdoc />
     public void WriteTo(Stream destination)
     {
-        WasmLeb128.WriteULeb128(destination, TargetSectionIndex);
-        WasmLeb128.WriteULeb128(destination, (ulong)Count);
-        _entries.WriteTo(destination);
+        ArgumentNullException.ThrowIfNull(destination);
+        Span<byte> prefix = stackalloc byte[2 * WasmLeb128.MaxLength32];
+        int length = WasmLeb128.WriteULeb128(prefix, TargetSectionIndex);
+        length += WasmLeb128.WriteULeb128(prefix[length..], (ulong)Count);
+        destination.Write(prefix[..length]);
+        _entries.CopyContentTo(destination);
     }
 
     /// <summary>
-    /// Adds a relocation of the field at <paramref name="offset"/> (relative to the target section's content,
-    /// so a code-section offset includes the function-count prefix) to symbol <paramref name="index"/>, or to a
+    /// Adds a relocation of the field at section-relative <paramref name="offset"/> (relative to the target section's
+    /// content, so a code-section offset includes the function-count prefix, and a custom-section offset starts
+    /// after its name) to symbol <paramref name="index"/>, or to a
     /// type index for <see cref="RelocationType.R_WASM_TYPE_INDEX_LEB"/>. Relocations must be added in
     /// ascending offset order (equal offsets are allowed), which LLVM's reader and wasm-ld require.
     /// </summary>
@@ -64,12 +97,31 @@ public sealed class RelocationSectionEncoder : IWasmSectionPayload
             throw new ArgumentException($"Relocation offset {offset} is below the previous offset {_previousOffset}; relocations must be in offset order.", nameof(offset));
 
         _entries.WriteByte((byte)type);
-        WasmLeb128.WriteULeb128(_entries, offset);
-        WasmLeb128.WriteULeb128(_entries, index);
+        _entries.WriteULeb128(offset);
+        _entries.WriteULeb128(index);
         if (hasAddend)
-            WasmLeb128.WriteSLeb128(_entries, addend);
+            _entries.WriteSLeb128(addend);
         _previousOffset = offset;
         Count++;
+    }
+
+    /// <summary>
+    /// The section-relative offset, for <see cref="Add"/>, of a field at writer-relative <paramref name="position"/>
+    /// of a writer whose first byte is <paramref name="writerStart"/> bytes into the target section's content. For a
+    /// <see cref="WasmCodeWriter"/> writing one function body, that is the code section's body count, the bodies
+    /// before it and its own size field.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Either value is negative, or the offset does not fit in 32 bits, as <c>reloc.*</c> offsets must.
+    /// </exception>
+    public static uint SectionOffset(long writerStart, long position)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(writerStart);
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(writerStart, uint.MaxValue);
+        if (position > uint.MaxValue - writerStart)
+            throw new ArgumentOutOfRangeException(nameof(position), position, $"Offset {writerStart} + {position} does not fit in 32 bits.");
+        return (uint)(writerStart + position);
     }
 
     /// <summary>Encodes <paramref name="model"/> as <see cref="ModuleReader"/> models it.</summary>

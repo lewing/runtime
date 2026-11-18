@@ -186,6 +186,28 @@ public sealed partial class WasmObjectWriterApiTests
     }
 
     [Fact]
+    public void WriterPositionsConvertToRelocationOffsets()
+    {
+        // A code section's content is the body count, then each body's size and the body. A WasmCodeWriter for the
+        // only body starts after the count and the size field, so its positions are 2 bytes short of the offsets
+        // reloc.CODE needs.
+        var body = new System.Buffers.ArrayBufferWriter<byte>();
+        var code = new WasmCodeWriter(body);
+        code.Locals([]);
+        long call = code.Call(0, WasmLeb128.PaddedLength32);
+        code.End();
+        Assert.Equal(2, call);
+        Assert.Equal(4u, RelocationSectionEncoder.SectionOffset(writerStart: 1 + 1, call));
+        Assert.Equal(uint.MaxValue, RelocationSectionEncoder.SectionOffset(uint.MaxValue - 1L, 1));
+
+        // Relocation offsets are u32; a wrong sum must not wrap or go negative.
+        Assert.Throws<ArgumentOutOfRangeException>("position", () => RelocationSectionEncoder.SectionOffset(uint.MaxValue, 1));
+        Assert.Throws<ArgumentOutOfRangeException>("writerStart", () => RelocationSectionEncoder.SectionOffset(-1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>("writerStart", () => RelocationSectionEncoder.SectionOffset(uint.MaxValue + 1L, 0));
+        Assert.Throws<ArgumentOutOfRangeException>("position", () => RelocationSectionEncoder.SectionOffset(0, -1));
+    }
+
+    [Fact]
     public void RelocationEncoderRejectsAnUnknownType()
     {
         var reloc = new RelocationSectionEncoder(0);
@@ -256,7 +278,7 @@ public sealed partial class WasmObjectWriterApiTests
         var init = new InitFunctionsEncoder();
         init.Add(priority: 65535, symbolIndex: 3);
         var comdats = new ComdatInfoEncoder();
-        comdats.Add("c"u8, flags: 0, [(ComdatKind.Function, 2), (ComdatKind.Data, 1)]);
+        comdats.Add("c"u8, ComdatFlags.None, [new(ComdatKind.Function, 2), new(ComdatKind.Data, 1)]);
 
         var linking = new LinkingSectionEncoder();
         linking.WriteInitFunctions(init);
@@ -267,6 +289,176 @@ public sealed partial class WasmObjectWriterApiTests
         var padded = new LinkingSectionEncoder();
         padded.WriteInitFunctions(init, sizeFieldWidth: 5);
         Assert.Equal(Convert.FromHexString("02" + "06" + "8580808000" + "01ffff0303"), Payload(padded));
+    }
+
+    [Fact]
+    public void ComdatFlagsOtherThanNoneAreRejected()
+    {
+        // LLVM's reader fails "Unsupported COMDAT flags" on any set bit, so the encoder must not write one.
+        var comdats = new ComdatInfoEncoder();
+        Assert.Throws<ArgumentOutOfRangeException>(() => comdats.Add("c"u8, (ComdatFlags)1, [new(ComdatKind.Function, 0)]));
+        Assert.Throws<ArgumentOutOfRangeException>("model", () => LinkingSectionEncoder.From(new LinkingSection
+        {
+            Version = 2,
+            ComdatGroups = [new ComdatGroup { Name = "g", Flags = 0x80000000 }],
+        }));
+        Assert.Equal(0, comdats.Count);
+        Assert.Equal(1, comdats.Length);
+    }
+
+    [Fact]
+    public void UnknownComdatKindsAreRejected()
+    {
+        // LLVM's reader fails "invalid COMDAT entry type" on a kind it does not know; nothing of the group is written.
+        var comdats = new ComdatInfoEncoder();
+        Assert.Throws<ArgumentOutOfRangeException>("entries", () => comdats.Add("c"u8, ComdatFlags.None, [new(ComdatKind.Function, 0), new((ComdatKind)6, 0)]));
+        Assert.Equal(0, comdats.Count);
+        Assert.Equal(1, comdats.Length);
+        comdats.Add("c"u8, ComdatFlags.None, [new(ComdatKind.Data, 1), new(ComdatKind.Section, 2)]);
+        Assert.Equal(Convert.FromHexString("01" + "0163" + "00" + "02" + "0001" + "0502"), Payload(comdats));
+    }
+
+    [Fact]
+    public void ModelSymbolsWithANegativeIndexAreRejectedAsArguments()
+    {
+        var symbols = new SymbolTableEncoder();
+        Assert.Throws<ArgumentException>("symbol", () => symbols.Add(new WasmSymbol { Type = SymbolType.Function, Index = -1, Name = "f" }));
+        Assert.Equal(0, symbols.Count);
+    }
+
+    [Fact]
+    public void SubsectionEncodersCannotChangeOnceWritten()
+    {
+        // The linking section refers to its subsections rather than copying them, so an entry added afterwards
+        // would change it; it must throw rather than be silently dropped or silently included.
+        var symbols = new SymbolTableEncoder();
+        symbols.AddFunction(SymbolFlags.None, 0, "f"u8);
+        var segments = new SegmentInfoEncoder();
+        segments.Add(".data.x"u8, 2, SegmentFlags.None);
+        var init = new InitFunctionsEncoder();
+        init.Add(1, 0);
+        var comdats = new ComdatInfoEncoder();
+        comdats.Add("c"u8, ComdatFlags.None, [new(ComdatKind.Function, 0)]);
+        var linking = new LinkingSectionEncoder();
+        linking.WriteSymbolTable(symbols);
+        linking.WriteSegmentInfo(segments);
+        linking.WriteInitFunctions(init);
+        linking.WriteComdatInfo(comdats);
+        byte[] before = Payload(linking);
+        Assert.True(symbols.IsCompleted && segments.IsCompleted && init.IsCompleted && comdats.IsCompleted);
+
+        Assert.Throws<InvalidOperationException>(() => symbols.AddFunction(SymbolFlags.None, 1, "g"u8));
+        Assert.Throws<InvalidOperationException>(() => symbols.AddUndefinedData(SymbolFlags.Undefined, "u"u8));
+        Assert.Throws<InvalidOperationException>(() => symbols.AddSection(SymbolFlags.BindingLocal, 1));
+        Assert.Throws<InvalidOperationException>(() => segments.Add(".data.y"u8, 2, SegmentFlags.None));
+        Assert.Throws<InvalidOperationException>(() => init.Add(1, 0));
+        Assert.Throws<InvalidOperationException>(() => comdats.Add("d"u8, ComdatFlags.None, []));
+        Assert.Equal(before, Payload(linking));
+        Assert.Equal(1, symbols.Count);
+    }
+
+    [Fact]
+    public void OtherSubsectionPayloadsAreCopiedAndCheckedWhenWritten()
+    {
+        var linking = new LinkingSectionEncoder();
+        var foreign = new ArrayPayload([0xAA, 0xBB]);
+        linking.WriteSubsection(LinkingSubsectionId.InitFunctions, foreign);
+        // A payload this namespace does not own is copied now, so changing it afterwards changes nothing.
+        foreign.Bytes[0] = 0xCC;
+        linking.WriteSubsection(LinkingSubsectionId.ComdatInfo, [0x00], sizeFieldWidth: 2);
+        byte[] expected = Convert.FromHexString("02" + "0602aabb" + "07" + "8100" + "00");
+        Assert.Equal(expected, Payload(linking));
+
+        // A payload whose Length is wrong, or that does not fit the size field, appends nothing; a rejected
+        // subsection encoder is not completed.
+        Assert.Throws<ArgumentException>("payload", () => linking.WriteSubsection(LinkingSubsectionId.InitFunctions, new ArrayPayload([1, 2], length: 3)));
+        var symbols = new SymbolTableEncoder();
+        symbols.AddFunction(SymbolFlags.None, 0, Enumerable.Repeat((byte)'s', 200).ToArray());
+        Assert.Throws<ArgumentException>("sizeFieldWidth", () => linking.WriteSymbolTable(symbols, sizeFieldWidth: 1));
+        Assert.Throws<ArgumentException>("sizeFieldWidth", () => linking.WriteSubsection(LinkingSubsectionId.SegmentInfo, new byte[128], sizeFieldWidth: 1));
+        Assert.False(symbols.IsCompleted);
+        symbols.AddFunction(SymbolFlags.None, 1, "t"u8);
+        Assert.Equal(expected, Payload(linking));
+    }
+
+    private sealed class ArrayPayload(byte[] bytes, long? length = null) : IWasmSectionPayload
+    {
+        public byte[] Bytes => bytes;
+
+        public long Length => length ?? bytes.Length;
+
+        public void WriteTo(Stream destination) => destination.Write(bytes);
+    }
+
+    [Fact]
+    public void PayloadsSpanningManyBufferChunksEncodeExactly()
+    {
+        // Enough entries, and a name long enough, to cross the encoders' internal chunk boundaries both inside a
+        // LEB128 and inside a name. Expected bytes are spelled out per entry from the format.
+        var relocations = new RelocationSectionEncoder(7);
+        var expected = new StringBuilder("07" + "ac02"); // target 7, 300 entries
+        for (uint i = 0; i < 300; i++)
+        {
+            relocations.Add(RelocationType.R_WASM_FUNCTION_INDEX_LEB, offset: i, index: 1);
+            expected.Append("00").Append(i < 128 ? $"{i:x2}" : $"{(i & 0x7F) | 0x80:x2}{i >> 7:x2}").Append("01");
+        }
+
+        Assert.Equal(Convert.FromHexString(expected.ToString()), Payload(relocations));
+
+        var symbols = new SymbolTableEncoder();
+        byte[] longName = Enumerable.Repeat((byte)'n', 1000).ToArray();
+        symbols.AddFunction(SymbolFlags.None, 0, "a"u8);
+        symbols.AddFunction(SymbolFlags.None, 1, longName);
+        symbols.AddFunction(SymbolFlags.None, 2, "b"u8);
+        Assert.Equal(Convert.FromHexString(
+            "03" + "000000" + "0161" + "000001" + "e807" + Convert.ToHexString(longName) + "000002" + "0162"), Payload(symbols));
+    }
+
+    [Fact]
+    public void LinkingAndRelocationPayloadsAreBufferedOnce()
+    {
+        // #600 M3: 200k symbols allocated 3.46x their payload (a stream per subsection, copied again into the
+        // linking section's own stream, each grown by doubling); relocations 2.09x.
+        const int Symbols = 40_000;
+        byte[][] names = new byte[Symbols][];
+        for (int i = 0; i < Symbols; i++)
+            names[i] = Encoding.UTF8.GetBytes($"S_P_CoreLib_System_Collections_Generic_List_1<T>__Method_{i}");
+
+        long payload = 0;
+        long allocated = MeasureAllocation(count =>
+        {
+            var symbols = new SymbolTableEncoder();
+            for (int i = 0; i < count; i++)
+                symbols.AddFunction(SymbolFlags.None, (uint)i, names[i]);
+            var linking = new LinkingSectionEncoder();
+            linking.WriteSymbolTable(symbols, 5);
+            new WasmModuleWriter(Stream.Null).WriteCustomSection("linking"u8, linking, 5);
+            payload = linking.Length;
+        }, Symbols);
+        Assert.True(payload > 2_000_000, $"payload {payload}");
+        Assert.True(allocated < payload * 1.1, $"{Symbols} symbols: {payload} B payload, {allocated} B allocated ({(double)allocated / payload:F2}x)");
+
+        const int Relocations = 400_000;
+        allocated = MeasureAllocation(count =>
+        {
+            var relocations = new RelocationSectionEncoder(3);
+            for (int i = 0; i < count; i++)
+                relocations.Add(RelocationType.R_WASM_MEMORY_ADDR_SLEB, (uint)(i * 7), (uint)(i % 5000), i % 100);
+            new WasmModuleWriter(Stream.Null).WriteCustomSection("reloc.CODE"u8, relocations);
+            payload = relocations.Length;
+        }, Relocations);
+        Assert.True(payload > 2_000_000, $"payload {payload}");
+        Assert.True(allocated < payload * 1.1, $"{Relocations} relocations: {payload} B payload, {allocated} B allocated ({(double)allocated / payload:F2}x)");
+
+        // A full-size warm-up run first, so first-call and unoptimized-code costs (type loading, tier-0 and OSR) are
+        // not counted; a short warm-up still left about 12 bytes per symbol from them.
+        static long MeasureAllocation(Action<int> action, int count)
+        {
+            action(count);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            action(count);
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
     }
 
     [Fact]
@@ -352,6 +544,76 @@ public sealed partial class WasmObjectWriterApiTests
         var writer2 = new WasmModuleWriter(new MemoryStream());
         Assert.Throws<ArgumentException>(() => writer2.BeginSection(WasmSectionId.Type, contentSize: 128, sizeFieldWidth: 1));
         Assert.Throws<InvalidOperationException>(writer2.EndSection);
+    }
+
+    [Fact]
+    public void WriterIsFaultedAfterAnyException()
+    {
+        // Even an exception thrown before anything is written faults the writer: one rule, whatever the failure.
+        using var output = new MemoryStream();
+        var writer = new WasmModuleWriter(output, writeHeader: false);
+        writer.BeginSection(WasmSectionId.Custom, contentSize: 3);
+        Assert.False(writer.IsFaulted);
+        Assert.Throws<InvalidOperationException>(() => writer.Write([1, 2, 3, 4]));
+        Assert.True(writer.IsFaulted);
+        Assert.Equal(2, output.Length);
+        Assert.Throws<InvalidOperationException>(() => writer.Write([1, 2, 3]));
+        Assert.Throws<InvalidOperationException>(writer.EndSection);
+        Assert.Throws<InvalidOperationException>(() => writer.ContentStream.WriteByte(0));
+        Assert.Throws<InvalidOperationException>(() => writer.WritePaddingSection(16));
+        Assert.Equal(2, output.Length);
+
+        // A payload that fails part-way leaves a partial section behind; the writer must not carry on after it.
+        using var partial = new MemoryStream();
+        var writer2 = new WasmModuleWriter(partial, writeHeader: false);
+        Assert.Throws<IOException>(() => writer2.WriteSection(WasmSectionId.Custom, new FailingPayload()));
+        Assert.True(writer2.IsFaulted);
+        long written = partial.Length;
+        Assert.Throws<InvalidOperationException>(() => writer2.WriteSection(WasmSectionId.Custom, [0x00]));
+        Assert.Equal(written, partial.Length);
+    }
+
+    [Fact]
+    public void WriterIsFaultedByACallRejectedBeforeItWrites()
+    {
+        // Each call throws from its own checks, before it writes anything or calls another writer method.
+        AssertFaults<InvalidOperationException>(w => w.BeginSection(WasmSectionId.Custom, 1), w => w.WritePaddingSection(16));
+        AssertFaults<ArgumentOutOfRangeException>(null, w => w.WritePaddingSection(-1));
+        AssertFaults<ArgumentOutOfRangeException>(null, w => w.BeginCustomSection("x"u8, payloadSize: -1));
+        AssertFaults<ArgumentException>(null, w => w.WriteSection(WasmSectionId.Custom, new UnseekableStream()));
+        AssertFaults<ArgumentException>(null, w => w.WriteCustomSection("x"u8, new UnseekableStream()));
+        AssertFaults<ArgumentException>(null, w => w.WriteVectorSection(WasmSectionId.Type, 0, new UnseekableStream()));
+        AssertFaults<ArgumentNullException>(null, w => w.WriteSection(WasmSectionId.Custom, (IWasmSectionPayload)null!));
+        AssertFaults<ArgumentNullException>(null, w => w.WriteCustomSection("x"u8, (IWasmSectionPayload)null!));
+        AssertFaults<ArgumentNullException>(w => w.BeginSection(WasmSectionId.Custom, 1), w => w.Write((Stream)null!));
+
+        static void AssertFaults<T>(Action<WasmModuleWriter>? setup, Action<WasmModuleWriter> call) where T : Exception
+        {
+            using var output = new MemoryStream();
+            var writer = new WasmModuleWriter(output, writeHeader: false);
+            setup?.Invoke(writer);
+            long length = output.Length;
+            Assert.IsType<T>(Record.Exception(() => call(writer)));
+            Assert.True(writer.IsFaulted);
+            Assert.Equal(length, output.Length);
+            Assert.Throws<InvalidOperationException>(() => writer.WriteSection(WasmSectionId.Custom, [0x00]));
+        }
+    }
+
+    private sealed class UnseekableStream : MemoryStream
+    {
+        public override bool CanSeek => false;
+    }
+
+    private sealed class FailingPayload : IWasmSectionPayload
+    {
+        public long Length => 4;
+
+        public void WriteTo(Stream destination)
+        {
+            destination.Write([1, 2]);
+            throw new IOException("disk full");
+        }
     }
 
     [Fact]
@@ -482,51 +744,6 @@ public sealed partial class WasmObjectWriterApiTests
         write(new WasmModuleWriter(output));
         return output.ToArray();
     }
-
-    /// <summary>
-    /// <c>int answer = 42; int get() { return answer; }</c>, laid out the way the runtime writer lays out an
-    /// object: memory import, data count, code with a padded relocated operand, data, then linking and reloc.CODE.
-    /// </summary>
-    private static byte[] BuildAnswerObject() => BuildObject(writer =>
-    {
-        writer.WriteVectorSection(WasmSectionId.Type, 1, new MemoryStream(Convert.FromHexString("6000017f")));
-        writer.WriteVectorSection(WasmSectionId.Import, 1, new MemoryStream(
-            Convert.FromHexString("03" + Convert.ToHexString("env"u8) + "0f" + Convert.ToHexString("__linear_memory"u8) + "020000")));
-        writer.WriteVectorSection(WasmSectionId.Function, 1, new MemoryStream([0x00]));
-        writer.WriteSection(WasmSectionId.DataCount, [0x01]);
-
-        // body: no locals; i32.const <padded MEMORY_ADDR_LEB>; i32.load; end — passed through as-is.
-        byte[] body = new byte[12];
-        body[0] = 0x00;
-        body[1] = 0x41;
-        WasmLeb128.WritePaddedULeb128(body.AsSpan(2, RelocationTypes.GetPatchSize(RelocationType.R_WASM_MEMORY_ADDR_LEB)), 0);
-        body[7] = 0x28;
-        body[8] = 0x02;
-        body[9] = 0x00;
-        body[10] = 0x0b;
-        using var bodies = new MemoryStream();
-        WasmLeb128.WriteULeb128(bodies, 11);
-        bodies.Write(body, 0, 11);
-        bodies.Position = 0;
-        int codeIndex = writer.WriteVectorSection(WasmSectionId.Code, 1, bodies);
-
-        writer.WriteVectorSection(WasmSectionId.Data, 1, new MemoryStream(Convert.FromHexString("00" + "41000b" + "04" + "2a000000")));
-
-        var symbols = new SymbolTableEncoder();
-        symbols.AddFunction(SymbolFlags.None, 0, "get"u8);
-        int answer = symbols.AddData(SymbolFlags.None, "answer"u8, segmentIndex: 0, offset: 0, size: 4);
-        var segments = new SegmentInfoEncoder();
-        segments.Add(".data.answer"u8, alignmentLog2: 2, SegmentFlags.None);
-        var linking = new LinkingSectionEncoder();
-        linking.WriteSymbolTable(symbols);
-        linking.WriteSegmentInfo(segments);
-        writer.WriteCustomSection("linking"u8, linking);
-
-        // The relocated operand starts after the vector count, the body size and the opcode bytes.
-        var reloc = new RelocationSectionEncoder((uint)codeIndex);
-        reloc.Add(RelocationType.R_WASM_MEMORY_ADDR_LEB, offset: 1 + 1 + 2, index: (uint)answer, addend: 0);
-        writer.WriteCustomSection("reloc.CODE"u8, reloc);
-    });
 
     private sealed class ForwardOnlyStream(Stream inner) : Stream
     {

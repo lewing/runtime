@@ -1,15 +1,16 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+namespace Microsoft.NET.WebAssembly.Toolchain.Tests;
+
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 
-namespace Microsoft.NET.WebAssembly.Toolchain.Tests;
-
 /// <summary>
 /// Structural assertions used in place of execution: the toolchain has no interpreter, so
-/// tests verify that produced modules validate and expose the expected shape.
+/// tests verify that produced modules validate and expose the expected shape. dotnet/runtime imports this file
+/// with the toolchain tests; <see cref="TestAssetPath"/> files are copied to the output's <c>TestAssets</c>.
 /// </summary>
 internal static class WasmAssert
 {

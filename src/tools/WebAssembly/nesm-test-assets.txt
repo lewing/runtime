@@ -1,0 +1,14 @@
+c/add.c
+c/add.wasm
+c/math.c
+c/math.wasm
+calculator.wasm
+dwarf/add_probe_O0.wasm
+dwarf/add_probe_O1.wasm
+dwarf/sq_O0.wasm
+dwarf/sq_O0_dwarf5_noname.wasm
+dwarf/sq_O1_wasmopt.wasm
+factorial.wat
+hello.wasm
+memory.wat
+sorting.wasm

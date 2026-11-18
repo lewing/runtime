@@ -151,12 +151,69 @@ public sealed class WasmModuleEntryWriterTests
     }
 
     [Fact]
+    public void EntriesTakeAnyValueType()
+    {
+        WasmValType refNull0 = WasmValType.Ref(WasmHeapType.Concrete(0), nullable: true);
+        WasmValType ref0 = WasmValType.Ref(WasmHeapType.Concrete(0), nullable: false);
+        var (w, output) = NewWriter();
+        w.FuncType([refNull0, ValType.I32], [WasmValType.Ref(WasmHeapType.Abstract(HeapTypeKind.Any), nullable: false)]);
+        w.FuncType([ValType.I32, ValType.I64], []);
+        w.GlobalImport("m"u8, "g"u8, ref0, Mutability.Const);
+        w.TableImport("m"u8, "t"u8, ref0, 1);
+        w.Table(refNull0, 2);
+        // ref.func 1 as the initializer of a (ref $0) global.
+        w.Global(ref0, Mutability.Var, [0xD2, 0x01, 0x0B]);
+        Assert.Equal(Convert.FromHexString(
+            "60" + "02" + "6300" + "7f" + "01" + "646e" +
+            "60" + "02" + "7f7e" + "00" +
+            Name("m") + Name("g") + "03" + "6400" + "00" +
+            Name("m") + Name("t") + "01" + "6400" + "0001" +
+            "6300" + "0002" +
+            "6400" + "01" + "d2010b"), output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void GcTypesWrittenThroughTheEntryAndCodeWritersValidate()
+    {
+        // (type $s (struct)) (type (func (param (ref null $s)) (result (ref null $s))))
+        // (func (type 1) (local (ref null $s)) local.get 0 local.tee 1)
+        WasmValType refNullS = WasmValType.Ref(WasmHeapType.Concrete(0), nullable: true);
+        var types = new ArrayBufferWriter<byte>();
+        var typeEntries = new WasmModuleEntryWriter(types);
+        typeEntries.Count(2);
+        types.Write<byte>([0x5F, 0x00]);
+        typeEntries.FuncType([refNullS], [refNullS]);
+        var body = new ArrayBufferWriter<byte>();
+        var code = new WasmCodeWriter(body);
+        code.Locals([refNullS]);
+        code.LocalGet(0);
+        code.LocalTee(1);
+        code.End();
+
+        using var stream = new MemoryStream();
+        var module = new WasmModuleWriter(stream);
+        module.WriteSection(WasmSectionId.Type, types.WrittenSpan);
+        module.WriteSection(WasmSectionId.Function, [0x01, 0x01]);
+        module.WriteSection(WasmSectionId.Code, [0x01, (byte)body.WrittenCount, .. body.WrittenSpan]);
+        Assert.Equal(Convert.FromHexString("01" + "016300" + "2000" + "2201" + "0b"), body.WrittenSpan.ToArray());
+        ModuleReader.ReadModuleAndValidate(new MemoryStream(stream.ToArray()), new ModuleReaderOptions { Features = WasmFeatures.All });
+    }
+
+    [Fact]
     public void EntriesRejectWhatTheyCannotEncode()
     {
         var (w, output) = NewWriter();
         Assert.Throws<ArgumentException>(() => w.FuncType([(ValType)0x63], []));
         Assert.Throws<ArgumentException>(() => w.Global(ValType.I32, Mutability.Const, [0x41, 0x00]));
         Assert.Throws<ArgumentException>(() => w.Table(ValType.I32, 1));
+        // A table of non-nullable references needs an initializer, which the plain table entry cannot carry.
+        Assert.Throws<ArgumentException>("elementType", () => w.Table(WasmValType.Ref(WasmHeapType.Func, nullable: false), 1));
+        Assert.Throws<ArgumentException>("elementType", () => w.TableImport("m"u8, "t"u8, default, 1));
+        Assert.Throws<ArgumentException>("elementType", () => w.TableImport("m"u8, "t"u8, ValType.I32, 1));
+        Assert.Throws<ArgumentException>("valueType", () => w.Global(default, Mutability.Const, [0x41, 0x00, 0x0B]));
+        Assert.Throws<ArgumentException>("valueType", () => w.GlobalImport("m"u8, "g"u8, default, Mutability.Const));
+        Assert.Throws<ArgumentException>("parameters", () => w.FuncType([WasmValType.I32, default], []));
+        Assert.Throws<ArgumentException>("results", () => w.FuncType([], [default(WasmValType)]));
         Assert.Throws<ArgumentException>(() => w.Memory(1UL << 32));
         Assert.Throws<ArgumentException>(() => w.Memory(2, 1));
         Assert.Throws<ArgumentException>(() => w.FunctionImport("env"u8, "f"u8, 1u << 20, 2));

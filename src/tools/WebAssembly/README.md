@@ -103,8 +103,9 @@ compare the managed linker's output with wasm-ld's. They are skipped when the wa
   section.
 * `Linker/WasmComponentLdCommandLine.cs` (wasm-component-ld options) exists only here. `sync-nesm.sh` leaves files
   that aren't in `nesm-files.txt` alone.
-* The tests in `nesm-test-files.txt` come from nesm's `tests/Nesm.Tests`, including the generic helpers they use
-  (`Linker/ExternalTool.cs`, `Linker/ModuleFacets.cs`, `WasmToolsTestHelper.cs`). Runtime's own
+* The tests in `nesm-test-files.txt` come from nesm's `tests/Nesm.Tests`, including the helpers they use
+  (`Common/WasmAssert.cs`, `Linker/ExternalTool.cs`, `Linker/ModuleFacets.cs`, `WasmToolsTestHelper.cs`). Their inputs,
+  listed in `nesm-test-assets.txt`, are copied unchanged from nesm's `tests/samples` to `TestAssets`. Runtime's own
   `Linker/WasmLdParityTests.cs` replaces nesm's file of the same name, which is never synced. `nesm-sync`, a
   syntax-only Roslyn rewriter (`nesm-sync/TestAdapter.cs`), applies nesm's import rule (see "Toolchain tests and
   `Requires` traits" in nesm's `tests/Nesm.Tests/README.md`, enforced there by `ToolchainTestRequirementsTests`):
@@ -113,9 +114,10 @@ compare the managed linker's output with wasm-ld's. They are skipped when the wa
   * It maps xunit v3 to v2: `Assert.Skip` becomes `throw new SkipTestException(...)`, tests that can reach it in any
     synced file become `ConditionalFact` or `ConditionalTheory`, and `TestContext.Current.CancellationToken` becomes
     `CancellationToken.None`.
-* Runtime-only structural versions of tests that nesm runs in its interpreter live in `<File>.RuntimeLocal.cs` partial
-  files next to the synced file, which becomes `partial`. A member defined there replaces nesm's member of the same name
-  on every sync. To move a hand-edited member out of a synced file, run
+* A runtime-only member can live in a `<File>.RuntimeLocal.cs` partial file next to the synced file, which becomes
+  `partial`; a member defined there replaces nesm's member of the same name on every sync. The only one left is
+  `Binary/WasmObjectWriterApiTests.RuntimeLocal.cs`, whose `ClangWasm64ObjectsReencodeByteIdentically` uses this repo's
+  wasi-sdk harness (`WasmLdParityTests`) in place of nesm's. To move a hand-edited member out of a synced file, run
   `dotnet run --project src/tools/WebAssembly/nesm-sync -- extract <synced file> <member>...`, then re-sync.
 
 ## Re-syncing from nesm
@@ -125,12 +127,12 @@ src/tools/WebAssembly/sync-nesm.sh <nesm-checkout> [<commit>]       # import, re
 src/tools/WebAssembly/sync-nesm.sh --update-patch <nesm-checkout>   # after editing imported files here
 ```
 
-The import replaces the library files listed in `nesm-files.txt` and the tests listed in `nesm-test-files.txt`. It runs
-`nesm-sync` to rename namespaces and add license headers, applies `runtime-local.patch` to the library, and then adapts
-the tests against the patched library and the `*.RuntimeLocal.cs` overlays. Files that exist only in this repo are left
-alone, and importing the same commit twice leaves the tree unchanged. Resolve any rejected hunks, then run
-`--update-patch`. Upstream local edits to nesm when you can so the patch shrinks. After a sync that fixes a gap, remove
-its entry from `s_knownGaps` in `WasmLdParityTests`.
+The import replaces the library files listed in `nesm-files.txt`, the tests listed in `nesm-test-files.txt` and the test
+inputs listed in `nesm-test-assets.txt`. It runs `nesm-sync` to rename namespaces and add license headers, applies
+`runtime-local.patch` to the library, and then adapts the tests against the patched library and the `*.RuntimeLocal.cs`
+overlays. Files that exist only in this repo are left alone, and importing the same commit twice leaves the tree
+unchanged. Resolve any rejected hunks, then run `--update-patch`. Upstream local edits to nesm when you can so the patch
+shrinks. After a sync that fixes a gap, remove its entry from `s_knownGaps` in `WasmLdParityTests`.
 
 ## Known gaps before the linker can replace wasm-ld
 

@@ -18,7 +18,7 @@ namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
 /// Expected bytes are written out from the format and from runtime's <c>WasmInstructions.cs</c>; opcode encodings
 /// are checked against <see cref="OpcodeTable"/>; real code is re-emitted byte for byte by <see cref="CodeReemitter"/>.
 /// </summary>
-public sealed partial class WasmCodeWriterTests
+public sealed class WasmCodeWriterTests
 {
     private static (WasmCodeWriter Writer, ArrayBufferWriter<byte> Output) NewWriter()
     {
@@ -42,7 +42,7 @@ public sealed partial class WasmCodeWriterTests
         Assert.Equal(33, w.GlobalGet(3, WasmLeb128.PaddedLength32));
         // try_table tags are relocated too (R_WASM_TAG_INDEX_LEB), as the JIT writes them.
         Span<long> tags = stackalloc long[2];
-        w.TryTable(WasmBlockType.Empty, [new(WasmCatchKind.Catch, 0, 1, WasmLeb128.PaddedLength32), new(WasmCatchKind.CatchAll, 0, 2)], tags);
+        w.TryTable(WasmBlockType.Empty, [WasmCatchClause.Catch(0, 1, WasmLeb128.PaddedLength32), WasmCatchClause.CatchAll(2)], tags);
         Assert.Equal([42L, -1L], tags.ToArray());
         Assert.Equal(50, w.Position);
         // A relocated call_indirect table (R_WASM_TABLE_NUMBER_LEB), as clang writes it with reference types.
@@ -109,7 +109,7 @@ public sealed partial class WasmCodeWriterTests
         w.Block(WasmOp.Block, WasmBlockType.Empty);
         w.Block(WasmOp.Loop, WasmBlockType.TypeIndex(200));
         w.BrTable([0, 1, 300], 2);
-        w.TryTable(WasmBlockType.Of(ValType.ExnRef), [new(WasmCatchKind.Catch, 1, 0), new(WasmCatchKind.CatchAllRef, 0, 2)]);
+        w.TryTable(WasmBlockType.Of(ValType.ExnRef), [WasmCatchClause.Catch(1, 0), WasmCatchClause.CatchAllRef(2)]);
         w.MemoryAccess(WasmOp.I32Load, 2, 8, memoryIndex: 1);
         w.MemoryAccessLane(WasmOp.V128Load32Lane, 2, 4, 3);
         w.Lane(WasmOp.I32x4ExtractLane, 1);
@@ -143,8 +143,9 @@ public sealed partial class WasmCodeWriterTests
         Assert.Throws<ArgumentException>(() => WasmBlockType.Of((ValType)0x40));
         Assert.Throws<ArgumentOutOfRangeException>(() => WasmHeapType.Abstract((HeapTypeKind)99));
         Assert.Throws<ArgumentOutOfRangeException>(() => w.MemoryAccess(WasmOp.I32Load, 64, 0));
-        Assert.Throws<ArgumentException>(() => w.TryTable(WasmBlockType.Empty, [new(WasmCatchKind.Catch, 1u << 20, 0, TagWidth: 2)]));
-        Assert.Throws<ArgumentException>(() => w.TryTable(WasmBlockType.Empty, [new(WasmCatchKind.CatchAll, 0, 0)], new long[2]));
+        Assert.Throws<ArgumentException>("tagWidth", () => WasmCatchClause.Catch(1u << 20, 0, tagWidth: 2));
+        Assert.Throws<ArgumentOutOfRangeException>("tagWidth", () => WasmCatchClause.CatchRef(1, 0, tagWidth: 6));
+        Assert.Throws<ArgumentException>(() => w.TryTable(WasmBlockType.Empty, [WasmCatchClause.CatchAll(0)], new long[2]));
         Assert.Equal(0, output.WrittenCount);
     }
 
@@ -169,6 +170,109 @@ public sealed partial class WasmCodeWriterTests
         var (rejected, rejectedOutput) = NewWriter();
         Assert.Throws<ArgumentException>(() => rejected.RefNull(default));
         Assert.Equal(0, rejectedOutput.WrittenCount);
+    }
+
+    [Fact]
+    public void DefaultCatchClauseIsRejected()
+    {
+        // default(WasmCatchClause) would otherwise be a meaningful "catch 0 -> label 0".
+        var (w, output) = NewWriter();
+        Assert.Throws<ArgumentException>(() => w.TryTable(WasmBlockType.Empty, [default]));
+        Assert.Throws<ArgumentException>(() => w.TryTable(WasmBlockType.Empty, new WasmCatchClause[2]));
+        Assert.Equal(0, output.WrittenCount);
+    }
+
+    [Fact]
+    public void ValueTypesCanBeAnyReferenceType()
+    {
+        // GC and function references value types: (ref null $t) is 0x63 and (ref $t) 0x64, then the s33 heap type.
+        WasmValType refNull3 = WasmValType.Ref(WasmHeapType.Concrete(3), nullable: true);
+        WasmValType ref300 = WasmValType.Ref(WasmHeapType.Concrete(300), nullable: false);
+        WasmValType refEq = WasmValType.Ref(WasmHeapType.Abstract(HeapTypeKind.Eq), nullable: false);
+        var (w, output) = NewWriter();
+        w.Locals([refNull3, refNull3, WasmValType.I32, ref300]);
+        w.LocalGroups([new(2, refEq), new(1, ValType.F64)]);
+        w.Block(WasmOp.Block, WasmBlockType.Of(refNull3));
+        w.TryTable(WasmBlockType.Of(ref300), []);
+        w.SelectTyped([refEq]);
+        w.Locals([ValType.I32, WasmValType.FuncRef, WasmValType.Ref(WasmHeapType.Func, nullable: true)]);
+        Assert.Equal(Convert.FromHexString(
+            "03" + "026303" + "017f" + "0164ac02" +
+            "02" + "02646d" + "017c" +
+            "02" + "6303" + "1f" + "64ac02" + "00" + "1c" + "01" + "646d" +
+            "03" + "017f" + "0170" + "016370"), output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void ValueTypesKnowTheirShape()
+    {
+        Assert.False(WasmValType.I32.IsReference);
+        Assert.False(WasmValType.V128.IsReference);
+        Assert.True(WasmValType.ExternRef.IsReference && WasmValType.ExternRef.IsNullable);
+        Assert.True(WasmValType.Ref(WasmHeapType.Concrete(0), nullable: true).IsNullable);
+        Assert.False(WasmValType.Ref(WasmHeapType.Concrete(0), nullable: false).IsNullable);
+        Assert.True(WasmValType.Ref(WasmHeapType.Concrete(0), nullable: false).IsReference);
+        // Equality is by encoding: the shorthand and the prefixed form denote one type but are written differently.
+        Assert.NotEqual(WasmValType.FuncRef, WasmValType.Ref(WasmHeapType.Func, nullable: true));
+        Assert.Equal(WasmValType.FuncRef, (WasmValType)ValType.FuncRef);
+        Assert.Equal("(ref null 3)", WasmValType.Ref(WasmHeapType.Concrete(3), nullable: true).ToString());
+        Assert.Equal("(ref eq)", WasmValType.Ref(WasmHeapType.Abstract(HeapTypeKind.Eq), nullable: false).ToString());
+        // Text-format names, which exception messages show, including the shorthands ValType has no names for.
+        Assert.Equal("i32 v128 funcref exnref anyref i31ref nullref nullfuncref nullexternref nullexnref (ref null func) (ref null nocont)",
+            string.Join(' ', new WasmValType[]
+            {
+                ValType.I32, ValType.V128, WasmValType.FuncRef, WasmValType.ExnRef, (ValType)0x6E, (ValType)0x6C, (ValType)0x71,
+                (ValType)0x73, (ValType)0x72, (ValType)0x74, WasmValType.Ref(WasmHeapType.Func, nullable: true),
+                WasmValType.Ref(WasmHeapType.Abstract(HeapTypeKind.NoCont), nullable: true),
+            }));
+    }
+
+    [Fact]
+    public void LocalsGroupReferencesByHeapType()
+    {
+        // Refs with one prefix but different heap types are different types: grouping them would retype locals.
+        WasmValType refNull1 = WasmValType.Ref(WasmHeapType.Concrete(1), nullable: true);
+        WasmValType refNull2 = WasmValType.Ref(WasmHeapType.Concrete(2), nullable: true);
+        Assert.NotEqual(refNull1, refNull2);
+        var (w, output) = NewWriter();
+        w.Locals([refNull1, refNull2, refNull2, WasmValType.Ref(WasmHeapType.Concrete(2), nullable: false)]);
+        Assert.Equal(Convert.FromHexString("03" + "016301" + "026302" + "016402"), output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void BlockTypeIndicesAreS33()
+    {
+        // A type index is a signed LEB128: 64-127 take two bytes, and 64 as one unsigned byte (0x40) would read as
+        // the empty block type.
+        var (w, output) = NewWriter();
+        w.Block(WasmOp.Block, WasmBlockType.TypeIndex(64));
+        w.Block(WasmOp.Loop, WasmBlockType.TypeIndex(127));
+        w.Block(WasmOp.If, WasmBlockType.TypeIndex(63));
+        w.Block(WasmOp.Block, WasmBlockType.TypeIndex(uint.MaxValue));
+        Assert.Equal(Convert.FromHexString("02c000" + "03ff00" + "043f" + "02ffffffff0f"), output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void CatchRefClausesWriteTheirKind()
+    {
+        var (w, output) = NewWriter();
+        Span<long> tags = stackalloc long[2];
+        w.TryTable(WasmBlockType.Empty, [WasmCatchClause.CatchRef(3, 1), WasmCatchClause.CatchRef(5, 0, WasmLeb128.PaddedLength32)], tags);
+        Assert.Equal(Convert.FromHexString("1f40" + "02" + "010301" + "01858080800000"), output.WrittenSpan.ToArray());
+        Assert.Equal([4L, 7L], tags.ToArray());
+    }
+
+    [Fact]
+    public void DefaultValueTypeIsRejected()
+    {
+        var (w, output) = NewWriter();
+        Assert.Throws<ArgumentException>("valueTypes", () => w.Locals([WasmValType.I32, default]));
+        Assert.Throws<ArgumentException>("groups", () => w.LocalGroups([default(WasmLocalGroup)]));
+        Assert.Throws<ArgumentException>("valueTypes", () => w.SelectTyped([default(WasmValType)]));
+        Assert.Throws<ArgumentException>("valueType", () => WasmBlockType.Of(default(WasmValType)));
+        Assert.Throws<ArgumentException>("heapType", () => WasmValType.Ref(default, nullable: true));
+        Assert.Throws<ArgumentException>("type", () => (WasmValType)(ValType)0x63);
+        Assert.Equal(0, output.WrittenCount);
     }
 
     [Fact]
@@ -220,95 +324,6 @@ public sealed partial class WasmCodeWriterTests
         Assert.True(compared > 470, $"only {compared} opcodes compared");
     }
 
-    /// <summary>The source of <c>WasmOp.cs</c>: every <see cref="OpcodeTable"/> opcode except stack switching, plus typed <c>select</c>.</summary>
-    private static string GenerateWasmOpSource()
-    {
-        var ops = new List<(uint Value, string Name, string Mnemonic, WasmImmediateShape Shape)>
-        {
-            // Typed select shares the select mnemonic, so it is not in the WAT table.
-            (0x1C, "SelectTyped", "select (typed)", WasmImmediateShape.SelectTyped),
-        };
-        foreach (string mnemonic in OpcodeTable.AllMnemonics)
-        {
-            OpcodeEntry entry = OpcodeTable.Get(mnemonic);
-            if (entry.Opcodes[0] == WasmOpcode.StackSwitchingPrefix)
-                continue;
-            uint value = entry.Opcodes[0];
-            if (entry.Opcodes.Length > 1)
-            {
-                int at = 1;
-                value = value << 24 | WasmLeb128.ReadU32(entry.Opcodes, ref at);
-                Assert.Equal(entry.Opcodes.Length, at);
-            }
-
-            ops.Add((value, PascalCase(mnemonic), mnemonic, ExpectedShape(entry.Immediate)));
-        }
-
-        ops.Sort((a, b) => a.Value.CompareTo(b.Value));
-        var s = new StringBuilder();
-        s.Append("""
-            // Generated from Microsoft.NET.WebAssembly.Wat.OpcodeTable (stack switching, 0xE0, excluded) by
-            // WasmCodeWriterTests.GenerateWasmOpSource. Do not edit; regenerate with
-            // NESM_REGENERATE_WASMOP=1 dotnet test tests/Microsoft.NET.WebAssembly.Toolchain.Tests --filter WasmOpSourceIsGeneratedFromTheOpcodeTable
-
-            namespace Microsoft.NET.WebAssembly.Binary.Writing;
-
-            /// <summary>
-            /// WebAssembly instruction opcodes for <see cref="WasmCodeWriter"/>. A single-byte opcode is its value; a prefixed
-            /// one is <c>prefix &lt;&lt; 24 | sub-opcode</c> (the sub-opcode is written as a u32 LEB128), as dotnet/runtime's
-            /// <c>WasmExprKind</c> encodes them.
-            /// </summary>
-            public enum WasmOp : uint
-            {
-
-            """);
-        foreach (var op in ops)
-            s.Append(CultureInfo.InvariantCulture, $"    /// <summary><c>{op.Mnemonic}</c></summary>\n    {op.Name} = 0x{op.Value:X},\n");
-        s.Append("""
-            }
-
-            /// <summary>Opcode properties.</summary>
-            public static class WasmOps
-            {
-                /// <summary>The immediates <paramref name="op"/> takes.</summary>
-                /// <exception cref="ArgumentOutOfRangeException"><paramref name="op"/> is not a defined opcode.</exception>
-                public static WasmImmediateShape GetImmediateShape(WasmOp op) => op switch
-                {
-
-            """);
-        foreach (WasmImmediateShape shape in Enum.GetValues<WasmImmediateShape>())
-        {
-            var line = new StringBuilder("        ");
-            bool first = true;
-            foreach (var op in ops)
-            {
-                if (op.Shape != shape)
-                    continue;
-                string item = (first ? "" : " or ") + "WasmOp." + op.Name;
-                if (!first && line.Length + item.Length + 3 > 120)
-                {
-                    s.Append(line).Append(" or\n");
-                    line.Clear().Append("            ");
-                    item = item[4..];
-                }
-
-                line.Append(item);
-                first = false;
-            }
-
-            Assert.False(first, $"no opcode has shape {shape}");
-            s.Append(line).Append(CultureInfo.InvariantCulture, $" => WasmImmediateShape.{shape},\n");
-        }
-
-        s.Append("""
-                    _ => throw new ArgumentOutOfRangeException(nameof(op), op, "Not a defined opcode."),
-                };
-            }
-
-            """);
-        return s.ToString();
-    }
-
     private static string PascalCase(string mnemonic) =>
         string.Concat(mnemonic.Split('.', '_').Select(part => char.ToUpperInvariant(part[0]) + part[1..]));
 
@@ -358,6 +373,58 @@ public sealed partial class WasmCodeWriterTests
         }
     }
 
+    // ── Validation and execution ────────────────────────────────────────────
+
+    /// <summary>f(x): a br_table switch over x (0 → 10, 1 → 20, else → x * 3 computed in a v128 lane), as a module.</summary>
+    private static (byte[] Module, byte[] Body) WriteSwitchModule()
+    {
+        var (w, body) = NewWriter();
+        w.Locals([ValType.V128]);
+        w.Block(WasmOp.Block, WasmBlockType.Empty);
+        w.Block(WasmOp.Block, WasmBlockType.Empty);
+        w.Block(WasmOp.Block, WasmBlockType.Empty);
+        w.LocalGet(0);
+        w.BrTable([0, 1], 2);
+        w.End();
+        w.I32Const(10);
+        w.Emit(WasmOp.Return);
+        w.End();
+        w.I32Const(20);
+        w.Emit(WasmOp.Return);
+        w.End();
+        w.LocalGet(0);
+        w.Emit(WasmOp.I32x4Splat);
+        w.LocalTee(1);
+        w.LocalGet(1);
+        w.Emit(WasmOp.I32x4Add);
+        w.LocalGet(1);
+        w.Emit(WasmOp.I32x4Add);
+        w.Lane(WasmOp.I32x4ExtractLane, 3);
+        w.End();
+
+        using var stream = new MemoryStream();
+        var module = new WasmModuleWriter(stream);
+        module.WriteSection(WasmSectionId.Type, Convert.FromHexString("0160017f017f"));
+        module.WriteSection(WasmSectionId.Function, Convert.FromHexString("0100"));
+        module.WriteSection(WasmSectionId.Export, Convert.FromHexString("01" + "0166" + "0000"));
+        using var code = new MemoryStream();
+        WasmLeb128.WriteULeb128(code, (ulong)body.WrittenCount);
+        code.Write(body.WrittenSpan);
+        code.Position = 0;
+        module.WriteVectorSection(WasmSectionId.Code, 1, code);
+        byte[] bytes = stream.ToArray();
+        return (bytes, body.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void WrittenCodeValidates()
+    {
+        var (bytes, body) = WriteSwitchModule();
+
+        ModuleReader.ReadModuleAndValidate(new MemoryStream(bytes), new ModuleReaderOptions { Features = WasmFeatures.All });
+        Assert.Equal(body, CodeReemitter.Reemit(body));
+    }
+
     /// <summary>
     /// Every code body of dotnet/runtime's ILCompiler objects and crossgen2 Webcil images (set <c>NESM_OBJCMP_DIR</c> to an
     /// <c>artifacts/objcmp/&lt;tag&gt;/out</c> directory) re-emits byte for byte.
@@ -379,26 +446,5 @@ public sealed partial class WasmCodeWriterTests
             if (!bodies[i].AsSpan().SequenceEqual(reemitted))
                 ObjectReencoder.AssertBytesEqual(bodies[i], reemitted, $"{relativePath} body {i}");
         }
-    }
-
-    private static HashSet<WasmImmediateShape> Shapes(byte[] body)
-    {
-        int at = 0;
-        uint groups = WasmLeb128.ReadU32(body, ref at);
-        for (int i = 0; i < groups; i++)
-        {
-            WasmLeb128.ReadU32(body, ref at);
-            at++;
-        }
-
-        var shapes = new HashSet<WasmImmediateShape>();
-        var cursor = new InstructionCursor(body[at..], WasmFeatures.All);
-        while (cursor.MoveNext(out DecodedInstruction instruction))
-        {
-            OpcodeId id = instruction.OpcodeId;
-            shapes.Add(WasmOps.GetImmediateShape((WasmOp)(id.IsPrefixed ? ((uint)id.Opcode << 24) | id.SubOpcode : id.Opcode)));
-        }
-
-        return shapes;
     }
 }
