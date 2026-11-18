@@ -10,38 +10,42 @@
 #                                             Regenerate runtime-local.patch: the difference between the mechanical
 #                                             import of the commit in nesm-commit.txt and the current sources.
 #
-# runtime-local.patch holds edits made in this repo. Upstream them to nesm when possible so the patch shrinks.
-# Files that exist only here are never touched.
+# runtime-local.patch holds edits made in this repo to the library. Upstream them to nesm when possible so the
+# patch shrinks. Files that exist only here are never touched.
 #
-# Tests listed in nesm-test-files.txt (paths under nesm's tests/Nesm.Tests) are synchronized the same way, with
-# runtime-local-tests.patch holding the edits that let them run without nesm's interpreter.
+# Tests listed in nesm-test-files.txt (paths under nesm's tests/Nesm.Tests) are adapted by nesm-sync, a syntax-only
+# Roslyn rewriter (see nesm-sync/TestAdapter.cs), so they run without nesm's interpreter, wasi-sdk or repository.
+# Members that need hand adaptation live in runtime-only <File>.RuntimeLocal.cs partial files, which replace nesm's
+# members of the same name on every sync. Create one with:
+#   dotnet run --project nesm-sync -- extract <synced test file> <member>...
 
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$here/../../.." && pwd)"
 lib="$here/Microsoft.NET.WebAssembly.Toolchain"
 commit_file="$here/nesm-commit.txt"
 files_list="$here/nesm-files.txt"
 patch_file="$here/runtime-local.patch"
 tests="$here/tests/Microsoft.NET.WebAssembly.Toolchain.Tests"
 test_files_list="$here/nesm-test-files.txt"
-tests_patch_file="$here/runtime-local-tests.patch"
 subset_dirs=(Types Module Validation Binary Linker Wat Debugging/Symbols)
 
-convert() {
-    perl -pi -e 's/\bNesm\.Tests\b/Microsoft.NET.WebAssembly.Toolchain.Tests/g; s/\bNesm\.(Binary|Debugging|Linker|Module|Types|Validation|Wat)\b/Microsoft.NET.WebAssembly.$1/g; s/^namespace Nesm;/namespace Microsoft.NET.WebAssembly;/; s/^using Nesm;/using Microsoft.NET.WebAssembly;/' "$1"
-    { printf '%s\n%s\n\n' '// Licensed to the .NET Foundation under one or more agreements.' '// The .NET Foundation licenses this file to you under the MIT license.'; cat "$1"; } > "$1.tmp"
-    mv "$1.tmp" "$1"
+nesm_sync() {
+    "$repo_root/dotnet.sh" run --project "$here/nesm-sync/nesm-sync.csproj" -c Release -v q --no-launch-profile -- "$@"
 }
 
-# Writes the mechanically converted tests listed in nesm-test-files.txt at <commit> into <out>.
+# Writes nesm's tests listed in nesm-test-files.txt at <commit>, adapted against the library in <library>, into <out>.
 stage_tests() {
-    local checkout="$1" commit="$2" out="$3" f
+    local checkout="$1" commit="$2" library="$3" out="$4" nesm f
+    nesm="$(mktemp -d)"
+    git -C "$checkout" archive "$commit" src tests | tar -x -C "$nesm"
     while read -r f; do
         mkdir -p "$out/$(dirname "$f")"
-        git -C "$checkout" show "$commit:tests/Nesm.Tests/$f" > "$out/$f"
-        convert "$out/$f"
+        cp "$nesm/tests/Nesm.Tests/$f" "$out/$f"
     done < "$test_files_list"
+    nesm_sync tests "$out" --nesm "$nesm" --library "$library" --runtime-tests "$tests" --synced "$test_files_list"
+    rm -rf "$nesm"
 }
 
 # Writes a patch from the files under <a> to the matching files under <b>.
@@ -80,9 +84,7 @@ stage() {
     find "$out" -type f ! -name '*.cs' -delete
     rm -rf "$raw"
 
-    find "$out" -name '*.cs' -print0 | while IFS= read -r -d '' f; do
-        convert "$f"
-    done
+    nesm_sync library "$out"
 }
 
 if [[ "${1:-}" == "--update-patch" ]]; then
@@ -90,10 +92,8 @@ if [[ "${1:-}" == "--update-patch" ]]; then
     work="$(mktemp -d)"
     stage "$checkout" "$(cat "$commit_file")" "$work/lib"
     write_patch "$work/lib" "$lib" "$patch_file"
-    stage_tests "$checkout" "$(cat "$commit_file")" "$work/tests"
-    write_patch "$work/tests" "$tests" "$tests_patch_file"
     rm -rf "$work"
-    echo "Wrote $patch_file and $tests_patch_file"
+    echo "Wrote $patch_file"
     exit 0
 fi
 
@@ -108,15 +108,13 @@ fi
 cp -R "$work/staged/." "$lib/"
 (cd "$work/staged" && find . -name '*.cs' | sed 's|^\./||' | LC_ALL=C sort) > "$files_list"
 
-stage_tests "$checkout" "$commit" "$work/tests"
-cp -R "$work/tests/." "$tests/"
-rm -rf "$work"
-
 echo "$commit" > "$commit_file"
 if [[ -s "$patch_file" ]]; then
     patch -p1 -d "$lib" --no-backup-if-mismatch < "$patch_file" || true
 fi
-if [[ -s "$tests_patch_file" ]]; then
-    patch -p1 -d "$tests" --no-backup-if-mismatch < "$tests_patch_file" || true
-fi
+
+# The tests are adapted against the patched library, so a member runtime's copy lacks drops the tests that use it.
+stage_tests "$checkout" "$commit" "$lib" "$work/tests"
+cp -R "$work/tests/." "$tests/"
+rm -rf "$work"
 echo "Imported nesm $commit. Resolve any rejected hunks, then run '$0 --update-patch $checkout'."

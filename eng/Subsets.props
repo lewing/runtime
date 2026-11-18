@@ -563,6 +563,10 @@
     <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\wasm-link\wasm-link_publish.csproj"
                     Condition="'$(UseNativeAotForComponents)' == 'true' and '$(DotNetBuildSourceOnly)' != 'true'"
                     Category="tools" />
+    <!-- The Roslyn rewriter sync-nesm.sh runs; built here so it keeps compiling. -->
+    <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\nesm-sync\nesm-sync.csproj"
+                    Condition="'$(DotNetBuildSourceOnly)' != 'true'"
+                    Category="tools" />
     <ProjectToBuild Include="$(ToolsProjectRoot)WebAssembly\tests\Microsoft.NET.WebAssembly.Toolchain.Tests\Microsoft.NET.WebAssembly.Toolchain.Tests.csproj"
                     Condition="'$(DotNetBuildSourceOnly)' != 'true'"
                     Category="tools"

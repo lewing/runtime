@@ -15,7 +15,7 @@ using Microsoft.NET.WebAssembly.Validation;
 /// Tests for <see cref="SingleObjectRelocator"/> — single-object self-resolution of
 /// relocatable wasm object files (.wasm.o) without cross-module merging.
 /// </summary>
-public class SingleObjectRelocatorTests
+public partial class SingleObjectRelocatorTests
 {
     // ── Wasm binary builder helpers ──────────────────────────────────────────────
 
@@ -243,41 +243,6 @@ public class SingleObjectRelocatorTests
     {
         byte[] sizeLeb = U32Leb(checked((uint)payload.Length));
         return [kind, .. sizeLeb, .. payload];
-    }
-
-    // ── Tests ────────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void ParseModuleForAnalysis_AllowsTransformAndEmitButRuntimeLoadStillRejectsIt()
-    {
-        byte[] objBytes = BuildRelocatableObject();
-        using var objectStream = new MemoryStream(objBytes, writable: false);
-
-        Assert.NotNull(typeof(ModuleReader).GetMethod(
-            nameof(ModuleReader.ParseModuleForAnalysis),
-            BindingFlags.Public | BindingFlags.Static));
-        var module = ModuleReader.ParseModuleForAnalysis(objectStream);
-
-        Assert.NotNull(module.LinkingSection);
-
-        var data = module.DataSegments[0];
-        module.DataSegments[0] = new Data
-        {
-            IsPassive = data.IsPassive,
-            MemoryIndex = data.MemoryIndex,
-            OffsetExpr = data.OffsetExpr,
-            InitData = [.. data.InitData, 0xFF],
-            IsReadOnly = data.IsReadOnly,
-        };
-        byte[] transformedBytes = new SectionMerger().EmitBinary(module);
-        Assert.NotEmpty(transformedBytes);
-
-        using var loadStream = new MemoryStream(transformedBytes, writable: false);
-        var loadException = Assert.Throws<WasmValidationException>(
-            () => ModuleReader.ReadModule(loadStream));
-        Assert.Contains(
-            loadException.Diagnostics,
-            static diagnostic => diagnostic.Code == WasmValidationCode.FunctionBodyTypeMismatch);
     }
 
     [Fact]

@@ -10,7 +10,7 @@ using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
 using Microsoft.NET.WebAssembly.Validation;
 
-public class ModuleReaderTests
+public partial class ModuleReaderTests
 {
     private static readonly byte[] Header = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
 
@@ -385,25 +385,6 @@ public class ModuleReaderTests
         List<(char Prefix, string Name)> expectedFeatures =
             [('+', "mutable-globals"), ('+', "sign-ext"), ('=', "bulk-memory"), ('-', "simd128")];
         Assert.Equal(expectedFeatures, targetFeatures.Features);
-    }
-
-    [Fact]
-    public void RealWasmFiles_ExposeParsedProducerMetadataAndTargetFeatures()
-    {
-        string[] sampleNames = ["add.wasm", "math.wasm"];
-        Assert.NotEmpty(sampleNames);
-        foreach (string sampleName in sampleNames)
-        {
-            var module = ModuleReader.ReadModule(new MemoryStream(File.ReadAllBytes(WasmAssert.TestAssetPath(Path.Combine("c", sampleName)))));
-            var producers = Assert.IsType<ProducersSection>(module.ProducersSection);
-            var processedBy = Assert.Single(producers.Fields["processed-by"]);
-            Assert.Equal("clang", processedBy.Name);
-            Assert.Contains("19.1.0", processedBy.Version, StringComparison.Ordinal);
-
-            var targetFeatures = Assert.IsType<TargetFeaturesSection>(module.TargetFeaturesSection);
-            Assert.Contains(targetFeatures.Features, feature => feature is ('+', "mutable-globals"));
-            Assert.Contains(targetFeatures.Features, feature => feature is ('+', "multivalue"));
-        }
     }
 
     [Fact]
