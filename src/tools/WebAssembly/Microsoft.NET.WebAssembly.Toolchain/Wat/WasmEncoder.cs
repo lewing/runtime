@@ -216,7 +216,7 @@ public sealed class WasmEncoder
         WriteU32Leb(s, (uint)_module.Types.Count);
         foreach (var ft in _module.Types)
         {
-            s.WriteByte(0x60); // functype tag
+            s.WriteByte((byte)CompositeTypeCode.Func);
             WriteU32Leb(s, (uint)ft.Parameters.Length);
             foreach (var p in ft.Parameters)
                 s.WriteByte((byte)p);

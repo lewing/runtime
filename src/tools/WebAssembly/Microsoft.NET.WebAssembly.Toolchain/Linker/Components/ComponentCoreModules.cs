@@ -607,7 +607,7 @@ public static class ComponentCoreModules
                         for (uint i = 0; i < typeCount; i++)
                         {
                             int typeStart = r.Position;
-                            if (r.ReadByte() != 0x60)
+                            if (r.ReadByte() != (byte)CompositeTypeCode.Func)
                                 throw new NotSupportedException("core modules with GC or recursive types are not supported (unbundle, replace-module).");
                             SkipValTypes(r);
                             SkipValTypes(r);

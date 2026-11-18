@@ -270,7 +270,7 @@ public static class ComponentEncoder
             for (uint i = 0; i < count; i++)
             {
                 byte form = r.ReadByte();
-                if (form != 0x60)
+                if (form != (byte)CompositeTypeCode.Func)
                     throw new NotSupportedException($"Core type form 0x{form:X2} is not supported in a component's main module.");
                 Types.Add(new FuncType(ReadValTypes(r), ReadValTypes(r)));
             }
@@ -982,7 +982,7 @@ public static class ComponentEncoder
             s.U32((uint)types.Count);
             foreach (CoreModule.FuncType t in types)
             {
-                s.Byte(0x60);
+                s.Byte((byte)CompositeTypeCode.Func);
                 s.U32((uint)t.Params.Length);
                 s.Bytes(t.Params);
                 s.U32((uint)t.Results.Length);

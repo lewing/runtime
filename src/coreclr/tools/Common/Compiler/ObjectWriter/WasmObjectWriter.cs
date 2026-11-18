@@ -411,7 +411,7 @@ namespace ILCompiler.ObjectWriter
             _ => throw new ArgumentOutOfRangeException(nameof(kind)),
         };
 
-        private void WriteExport(string name, WasmExportKind kind, int index)
+        private void WriteExport(string name, WasmExternalKind kind, int index)
         {
             WasmExportSection section = GetOrCreateSection<WasmExportSection>(
                 WasmObjectNodeSection.ExportSection,
@@ -420,16 +420,16 @@ namespace ILCompiler.ObjectWriter
         }
 
         private protected void WriteFunctionExport(string name, int functionIndex) =>
-            WriteExport(name, WasmExportKind.Function, functionIndex);
+            WriteExport(name, WasmExternalKind.Function, functionIndex);
 
         private protected void WriteTableExport(string name, int tableIndex) =>
-            WriteExport(name, WasmExportKind.Table, tableIndex);
+            WriteExport(name, WasmExternalKind.Table, tableIndex);
 
         private protected void WriteMemoryExport(string name, int memoryIndex) =>
-            WriteExport(name, WasmExportKind.Memory, memoryIndex);
+            WriteExport(name, WasmExternalKind.Memory, memoryIndex);
 
         private protected void WriteGlobalExport(string name, int globalIndex) =>
-            WriteExport(name, WasmExportKind.Global, globalIndex);
+            WriteExport(name, WasmExternalKind.Global, globalIndex);
 
         private protected void WriteElementSegment(ReadOnlyMemory<int> functionIndices, WasmInstructionGroup offsetExpr)
         {
@@ -553,8 +553,7 @@ namespace ILCompiler.ObjectWriter
             }
 
             SectionWriter typeSectionWriter = GetOrCreateSection(ObjectNodeSection.WasmTypeSection);
-            byte[] encodedSignature = new byte[signature.EncodeSize()];
-            signature.Encode(encodedSignature);
+            byte[] encodedSignature = signature.Encode();
             _wasmSymbolManager.AddDefinition(signatureKey, WasmIndexSpace.Type);
             typeSectionWriter.EmitSymbolDefinition(signatureKey);
             typeSectionWriter.EmitData(encodedSignature);

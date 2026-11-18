@@ -5,6 +5,7 @@ using System.Text;
 using Microsoft.NET.WebAssembly.Binary;
 using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Binary.Writing;
+using Microsoft.NET.WebAssembly.Types;
 
 namespace Microsoft.NET.WebAssembly.Toolchain.Tests.Binary;
 
@@ -73,6 +74,12 @@ internal static class ObjectReencoder
                     using var bodies = new MemoryStream(original, section.ContentStart + countWidth, section.ContentLength - countWidth, writable: false);
                     index = writer.WriteVectorSection(WasmSectionId.Code, checked((uint)count), bodies, width);
                 }
+                else if (EntrySections.Contains((WasmSectionId)section.Id))
+                {
+                    var entries = new System.Buffers.ArrayBufferWriter<byte>(section.ContentLength);
+                    ReencodeEntries((WasmSectionId)section.Id, original, section, entries);
+                    index = writer.WriteSection((WasmSectionId)section.Id, entries.WrittenSpan, width);
+                }
                 else
                 {
                     index = writer.WriteSection((WasmSectionId)section.Id, content, width);
@@ -110,6 +117,219 @@ internal static class ObjectReencoder
         Assert.Equal(sections.Count, writer.NextSectionIndex);
         Assert.Equal(output.Length, writer.Position);
         return output.ToArray();
+    }
+
+    private static readonly HashSet<WasmSectionId> EntrySections =
+    [
+        WasmSectionId.Type, WasmSectionId.Import, WasmSectionId.Function, WasmSectionId.Table, WasmSectionId.Memory,
+        WasmSectionId.Global, WasmSectionId.Export, WasmSectionId.Element, WasmSectionId.Tag,
+    ];
+
+    /// <summary>
+    /// Rebuilds the entries of a type, import, function, table, memory, global, export, element or tag section through
+    /// <see cref="WasmModuleEntryWriter"/>, keeping padded index widths; every entry shape a producer writes must be one
+    /// the writer can reproduce.
+    /// </summary>
+    private static void ReencodeEntries(WasmSectionId id, byte[] original, RawSection section, System.Buffers.ArrayBufferWriter<byte> output)
+    {
+        var w = new WasmModuleEntryWriter(output);
+        int at = section.ContentStart;
+        uint count = Minimal(original, ref at, "entry count");
+        w.Count(count);
+        for (uint i = 0; i < count; i++)
+        {
+            switch (id)
+            {
+                case WasmSectionId.Type:
+                {
+                    Assert.True(original[at++] == 0x60, $"type {i} is not a function type");
+                    ValType[] parameters = ValueTypes(original, ref at);
+                    w.FuncType(parameters, ValueTypes(original, ref at));
+                    break;
+                }
+
+                case WasmSectionId.Import:
+                {
+                    byte[] module = Name(original, ref at), name = Name(original, ref at);
+                    var kind = (WasmExternalKind)original[at++];
+                    switch (kind)
+                    {
+                        case WasmExternalKind.Function:
+                        {
+                            uint type = Index(original, ref at, out int typeWidth);
+                            w.FunctionImport(module, name, type, typeWidth);
+                            break;
+                        }
+
+                        case WasmExternalKind.Table:
+                        {
+                            var refType = (ValType)original[at++];
+                            var (min, max, is64, shared) = Limits(original, ref at);
+                            Assert.False(shared);
+                            w.TableImport(module, name, refType, min, max, is64);
+                            break;
+                        }
+
+                        case WasmExternalKind.Memory:
+                        {
+                            var (min, max, is64, shared) = Limits(original, ref at);
+                            w.MemoryImport(module, name, min, max, is64, shared);
+                            break;
+                        }
+
+                        case WasmExternalKind.Global:
+                            w.GlobalImport(module, name, (ValType)original[at], (Mutability)original[at + 1]);
+                            at += 2;
+                            break;
+                        case WasmExternalKind.Tag:
+                        {
+                            Assert.Equal(0, original[at++]);
+                            uint type = Index(original, ref at, out int typeWidth);
+                            w.TagImport(module, name, type, typeWidth);
+                            break;
+                        }
+
+                        default:
+                            Assert.Fail($"import {i}: kind {kind}");
+                            break;
+                    }
+
+                    break;
+                }
+
+                case WasmSectionId.Function:
+                {
+                    uint type = Index(original, ref at, out int typeWidth);
+                    w.Function(type, typeWidth);
+                    break;
+                }
+
+                case WasmSectionId.Table:
+                {
+                    var refType = (ValType)original[at++];
+                    var (min, max, is64, _) = Limits(original, ref at);
+                    w.Table(refType, min, max, is64);
+                    break;
+                }
+
+                case WasmSectionId.Memory:
+                {
+                    var (min, max, is64, shared) = Limits(original, ref at);
+                    w.Memory(min, max, is64, shared);
+                    break;
+                }
+
+                case WasmSectionId.Global:
+                {
+                    var type = (ValType)original[at];
+                    var mutability = (Mutability)original[at + 1];
+                    at += 2;
+                    w.Global(type, mutability, ConstExpression(original, ref at));
+                    break;
+                }
+
+                case WasmSectionId.Export:
+                {
+                    byte[] name = Name(original, ref at);
+                    var kind = (WasmExternalKind)original[at++];
+                    uint target = Index(original, ref at, out int targetWidth);
+                    w.Export(name, kind, target, targetWidth);
+                    break;
+                }
+
+                case WasmSectionId.Element:
+                {
+                    Assert.True(original[at++] == 0, $"element segment {i}: only active funcref segments (flag 0) are expected");
+                    byte[] offset = ConstExpression(original, ref at);
+                    uint functions = Minimal(original, ref at, "element count");
+                    var indices = new uint[functions];
+                    for (int f = 0; f < functions; f++)
+                        indices[f] = Minimal(original, ref at, "function index");
+                    w.ActiveElementSegment(offset, indices);
+                    break;
+                }
+
+                case WasmSectionId.Tag:
+                {
+                    Assert.Equal(0, original[at++]);
+                    uint type = Index(original, ref at, out int typeWidth);
+                    w.Tag(type, typeWidth);
+                    break;
+                }
+            }
+        }
+
+        Assert.Equal(section.End, at);
+    }
+
+    private static uint Minimal(byte[] bytes, ref int at, string what)
+    {
+        uint value = Index(bytes, ref at, out int width);
+        Assert.True(width == 0, $"padded {what} at {at:#x}");
+        return value;
+    }
+
+    // An index and its padded width (0 when minimal).
+    private static uint Index(byte[] bytes, ref int at, out int width)
+    {
+        uint value = checked((uint)ReadULeb(bytes, at, out int length));
+        at += length;
+        width = length == WasmLeb128.GetULeb128Size(value) ? 0 : length;
+        return value;
+    }
+
+    private static byte[] Name(byte[] bytes, ref int at)
+    {
+        int length = (int)Minimal(bytes, ref at, "name length");
+        byte[] name = bytes[at..(at + length)];
+        at += length;
+        return name;
+    }
+
+    private static ValType[] ValueTypes(byte[] bytes, ref int at)
+    {
+        int count = (int)Minimal(bytes, ref at, "value type count");
+        var types = new ValType[count];
+        for (int i = 0; i < count; i++)
+            types[i] = (ValType)bytes[at + i];
+        at += count;
+        return types;
+    }
+
+    private static (ulong Min, ulong? Max, bool Is64, bool Shared) Limits(byte[] bytes, ref int at)
+    {
+        byte flags = bytes[at++];
+        Assert.True(flags <= 0x07, $"limits flags {flags:#x}");
+        ulong min = ReadULeb(bytes, at, out int minWidth);
+        Assert.Equal(WasmLeb128.GetULeb128Size(min), minWidth);
+        at += minWidth;
+        ulong? max = null;
+        if ((flags & 1) != 0)
+        {
+            max = ReadULeb(bytes, at, out int maxWidth);
+            Assert.Equal(WasmLeb128.GetULeb128Size(max.Value), maxWidth);
+            at += maxWidth;
+        }
+
+        return (min, max, (flags & 4) != 0, (flags & 2) != 0);
+    }
+
+    // A constant expression up to and including its end (no nested blocks).
+    private static byte[] ConstExpression(byte[] bytes, ref int at)
+    {
+        int start = at;
+        var cursor = new InstructionCursor(bytes.AsSpan(at).ToArray(), WasmFeatures.All);
+        while (cursor.MoveNext(out DecodedInstruction instruction))
+        {
+            if (instruction.OpcodeId.Opcode == WasmOpcode.End && !instruction.OpcodeId.IsPrefixed)
+            {
+                at = start + cursor.Position;
+                return bytes[start..at];
+            }
+        }
+
+        Assert.Fail($"unterminated constant expression at {start:#x}");
+        return [];
     }
 
     /// <summary>

@@ -719,12 +719,12 @@ public static partial class ModuleReader
             tag = reader.ReadByte(); // inner composite type tag
         }
 
-        var result = tag switch
+        var result = (CompositeTypeCode)tag switch
         {
-            0x60 => ReadFuncType(reader),
-            0x5D => ReadContType(reader, existingTypes),
-            0x5F => ReadStructType(reader),
-            0x5E => ReadArrayType(reader),
+            CompositeTypeCode.Func => ReadFuncType(reader),
+            CompositeTypeCode.Cont => ReadContType(reader, existingTypes),
+            CompositeTypeCode.Struct => ReadStructType(reader),
+            CompositeTypeCode.Array => ReadArrayType(reader),
             _ => throw new WasmFormatException($"Expected composite type tag (0x60/0x5D/0x5F/0x5E), got 0x{tag:X2}"),
         };
         var compactType = result.CompactType;
@@ -906,13 +906,13 @@ public static partial class ModuleReader
             string moduleName = reader.ReadName();
             string name = reader.ReadName();
             byte kind = reader.ReadByte();
-            ImportDescriptor descriptor = kind switch
+            ImportDescriptor descriptor = (WasmExternalKind)kind switch
             {
-                0x00 => new ImportDescriptor.Func((int)reader.ReadU32Leb128()),
-                0x01 => new ImportDescriptor.Table(ReadTableImportType(reader)),
-                0x02 => new ImportDescriptor.Memory(ReadMemoryType(reader)),
-                0x03 => new ImportDescriptor.Global(ReadGlobalType(reader)),
-                0x04 => new ImportDescriptor.Tag(ReadTagType(reader)),
+                WasmExternalKind.Function => new ImportDescriptor.Func((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Table => new ImportDescriptor.Table(ReadTableImportType(reader)),
+                WasmExternalKind.Memory => new ImportDescriptor.Memory(ReadMemoryType(reader)),
+                WasmExternalKind.Global => new ImportDescriptor.Global(ReadGlobalType(reader)),
+                WasmExternalKind.Tag => new ImportDescriptor.Tag(ReadTagType(reader)),
                 _ => throw new WasmFormatException($"Unknown import descriptor kind: 0x{kind:X2}"),
             };
             imports.Add(new Import(moduleName, name, descriptor));
@@ -988,13 +988,13 @@ public static partial class ModuleReader
         {
             string name = reader.ReadName();
             byte kind = reader.ReadByte();
-            ExportDescriptor descriptor = kind switch
+            ExportDescriptor descriptor = (WasmExternalKind)kind switch
             {
-                0x00 => new ExportDescriptor.Func((int)reader.ReadU32Leb128()),
-                0x01 => new ExportDescriptor.Table((int)reader.ReadU32Leb128()),
-                0x02 => new ExportDescriptor.Memory((int)reader.ReadU32Leb128()),
-                0x03 => new ExportDescriptor.Global((int)reader.ReadU32Leb128()),
-                0x04 => new ExportDescriptor.Tag((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Function => new ExportDescriptor.Func((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Table => new ExportDescriptor.Table((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Memory => new ExportDescriptor.Memory((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Global => new ExportDescriptor.Global((int)reader.ReadU32Leb128()),
+                WasmExternalKind.Tag => new ExportDescriptor.Tag((int)reader.ReadU32Leb128()),
                 _ => throw new WasmFormatException($"Unknown export descriptor kind: 0x{kind:X2}"),
             };
             var export = new Export(name, descriptor);
@@ -1029,7 +1029,7 @@ public static partial class ModuleReader
             uint flags = reader.ReadU32Leb128();
             switch (flags)
             {
-                case 0:
+                case (uint)ElementSegmentKind.ActiveFunctions:
                 {
                     // Active, implicit tableidx=0, `ref func`, vec<funcidx>
                     byte[] offsetExpr = ReadInitExpr(reader);
@@ -1044,7 +1044,7 @@ public static partial class ModuleReader
                     });
                     break;
                 }
-                case 1:
+                case (uint)ElementSegmentKind.PassiveFunctions:
                 {
                     // Passive, elemkind byte, vec<funcidx> — no table/offset
                     ReadElemKind(reader);
@@ -1059,7 +1059,7 @@ public static partial class ModuleReader
                     });
                     break;
                 }
-                case 2:
+                case (uint)ElementSegmentKind.ActiveTableFunctions:
                 {
                     // Active, explicit tableidx, offset, elemkind byte, vec<funcidx>
                     int tableIndex = (int)reader.ReadU32Leb128();
@@ -1077,7 +1077,7 @@ public static partial class ModuleReader
                     });
                     break;
                 }
-                case 3:
+                case (uint)ElementSegmentKind.DeclarativeFunctions:
                 {
                     // Declarative, elemkind byte, vec<funcidx>
                     ReadElemKind(reader);
@@ -1085,7 +1085,7 @@ public static partial class ModuleReader
                     elements.Add(new Element { Mode = ElementMode.Declarative, TableIndex = -1, OffsetExpr = [], FunctionIndices = [], DeclaredFunctionIndices = new List<int>(funcIndices), ElementType = refFuncType });
                     break;
                 }
-                case 4:
+                case (uint)ElementSegmentKind.ActiveExpressions:
                 {
                     // Active, implicit tableidx=0, `funcref` (nullable — unlike flag 0), vec<expr>
                     byte[] offsetExpr = ReadInitExpr(reader);
@@ -1094,7 +1094,7 @@ public static partial class ModuleReader
                     elements.Add(new Element { Mode = ElementMode.Active, TableIndex = 0, OffsetExpr = offsetExpr, FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, ElementType = funcrefType });
                     break;
                 }
-                case 5:
+                case (uint)ElementSegmentKind.PassiveExpressions:
                 {
                     // Passive, reftype, vec<expr>
                     var elementType = ReadExactRefType(reader);
@@ -1103,7 +1103,7 @@ public static partial class ModuleReader
                     elements.Add(new Element { Mode = ElementMode.Passive, TableIndex = -1, OffsetExpr = [], FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, ElementType = elementType });
                     break;
                 }
-                case 6:
+                case (uint)ElementSegmentKind.ActiveTableExpressions:
                 {
                     // Active, explicit tableidx, offset, reftype, vec<expr>
                     int tableIndex = (int)reader.ReadU32Leb128();
@@ -1114,7 +1114,7 @@ public static partial class ModuleReader
                     elements.Add(new Element { Mode = ElementMode.Active, TableIndex = tableIndex, OffsetExpr = offsetExpr, FunctionIndices = funcIndices, ElementExpressions = expressions, UsesExpressions = true, HasExplicitTableIndex = true, ElementType = elementType });
                     break;
                 }
-                case 7:
+                case (uint)ElementSegmentKind.DeclarativeExpressions:
                 {
                     // Declarative, reftype, vec<expr>
                     var elementType = ReadExactRefType(reader);
@@ -1699,17 +1699,14 @@ public static partial class ModuleReader
 
     private static Limits ReadLimits(WasmBinaryReader reader)
     {
-        byte flag = reader.ReadByte();
-        // Limits flag bits (memory64 + threads proposals):
-        //   bit0 (0x01) = a max is present
-        //   bit1 (0x02) = shared (threads proposal)
-        //   bit2 (0x04) = 64-bit (memory64/table64) — min/max are u64 LEB128
-        // Valid combinations are 0x00–0x07; anything else is malformed.
-        if ((flag & ~0x07) != 0)
-            throw new WasmFormatException($"Invalid limits flag: 0x{flag:X2}");
+        var flag = (WasmLimitsFlags)reader.ReadByte();
+        // Limits flag bits (memory64 + threads proposals): a max is present, shared (threads), and 64-bit
+        // (memory64/table64, whose min/max are u64 LEB128). Valid combinations are 0x00–0x07; anything else is malformed.
+        if ((flag & ~WasmLimitsFlags.All) != 0)
+            throw new WasmFormatException($"Invalid limits flag: 0x{(byte)flag:X2}");
 
-        bool hasMax = (flag & 0x01) != 0;
-        bool is64 = (flag & 0x04) != 0;
+        bool hasMax = (flag & WasmLimitsFlags.HasMaximum) != 0;
+        bool is64 = (flag & WasmLimitsFlags.Is64) != 0;
 
         // For 64-bit memories/tables the bounds are u64 LEB128; otherwise u32.
         ulong min = is64 ? reader.ReadU64Leb128() : reader.ReadU32Leb128();
@@ -1722,8 +1719,8 @@ public static partial class ModuleReader
 
     private static MemoryType ReadMemoryType(WasmBinaryReader reader)
     {
-        byte flag = reader.PeekByte();
-        bool shared = (flag & 0x02) != 0;
+        var flag = (WasmLimitsFlags)reader.PeekByte();
+        bool shared = (flag & WasmLimitsFlags.Shared) != 0;
         var limits = ReadLimits(reader);
         return new MemoryType(limits, shared);
     }

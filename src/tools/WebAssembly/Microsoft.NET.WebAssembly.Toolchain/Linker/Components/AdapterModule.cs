@@ -51,7 +51,7 @@ internal static class AdapterModule
             uint count = tr.ReadU32();
             for (uint i = 0; i < count; i++)
             {
-                if (tr.ReadByte() != 0x60)
+                if (tr.ReadByte() != (byte)CompositeTypeCode.Func)
                     throw new NotSupportedException("adapter modules may only define function types.");
                 types.Add((ReadValTypes(tr), ReadValTypes(tr)));
             }
@@ -235,7 +235,7 @@ internal static class AdapterModule
             s.U32((uint)types.Count);
             foreach (var (p, res) in types)
             {
-                s.Byte(0x60);
+                s.Byte((byte)CompositeTypeCode.Func);
                 s.U32((uint)p.Length);
                 s.Bytes(p);
                 s.U32((uint)res.Length);

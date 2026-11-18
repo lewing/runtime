@@ -4,6 +4,68 @@ Experimental import of the [nesm](https://github.com/Blazor-Playground/nesm) too
 goal is to evaluate replacing native wasm tools (wasm-ld, and eventually duplicated ObjectWriter code) with a
 tested managed implementation.
 
+## Summary
+
+The experiment imports nesm's toolchain as `Microsoft.NET.WebAssembly.Toolchain`. It then uses that library to replace
+native wasm tools in CoreCLR and NativeAOT builds, and the hand-written wasm encoding in ILCompiler and crossgen2. Mono
+is out of scope. Everything below is local and opt-in; defaults are unchanged.
+
+**What replaced what**
+
+| Replaced | By | How to opt in |
+|----------|----|---------------|
+| `wasm-component-ld` (wasm-ld and component wrapping) for NativeAOT WASI apps | `wasm-link --component`, via clang `-fuse-ld` | `IlcUseManagedWasmLinker=true`, `IlcManagedWasmLinkerPath=<wasm-link.dll>` |
+| `llvm-ar` for NativeAOT WASI `NativeLib=Static` | `wasm-link ar` | `IlcUseManagedWasmArchiver=true` (defaults to `IlcUseManagedWasmLinker`) |
+| `wasm-component-ld` for the WASI CoreCLR per-app host relink | `wasm-link --component`, with WIT text passed directly | `WasiUseManagedWasmLinker=true`, `WasiManagedWasmLinkerPath=<wasm-link.dll>` |
+| `wasm-tools component unbundle`, `wasm-tools parse`/`validate` (shim), `wasm-merge` and the host replace step in WASI ReadyToRun composition | `ComponentCoreModules`, `WatCompiler`, `ModuleMerger`, in-process in `ComposeWasiReadyToRun` | `WasiR2RUseManagedTools=true` (needs MSBuild on .NET) |
+| wasm-ld for places that already run MSBuild tasks | the in-process `WasmLink` task (`src/tasks/WasmBuildTasks`) | use the task |
+| Hand-written wasm encoding in ILCompiler's and crossgen2's ObjectWriter | `Binary.Writing`: `WasmModuleWriter`, linking and relocation encoders, `DataSegmentEncoder`, `NameMapWriter`, `WasmCodeWriter`, `WasmModuleEntryWriter`, `WasmLeb128` | always on (not opt-in): −1,695/+571 lines in `src/coreclr/tools` |
+
+**Results**
+
+- `wasm-link` output is byte-identical to wasm-ld's on the captured NativeAOT UnitTests link (3,895,291 bytes).
+- All 14 NativeAOT WASI smoke tests pass with `IlcUseManagedWasmLinker` and with the default tools.
+- The WASI CoreCLR console sample runs under wasmtime with `WasiUseManagedWasmLinker`, and with
+  `WasiR2RUseManagedTools`, with or without wasm-opt.
+- ILCompiler and crossgen2 output is byte-identical before and after the ObjectWriter move, in both Release and Debug
+  builds: 23 of 24 outputs, and the 24th, `TrimmingBehaviors.o`, differs between two runs of the same ilc.
+  `ILCompiler.ReadyToRun.Tests` on wasi: 421 tests, 378 passed, 43 skipped, 0 failed.
+- `./build.sh tools.wasmtoolchain -test`: 668 tests, 664 passed, 4 skipped, 0 failed.
+
+**Size and performance** (measured on an Apple M5 Max)
+
+- ilc grew 99.5 KB (36,562,356 to 36,661,876 bytes) and crossgen2 68.7 KB (32,984,282 to 33,053,018 bytes). Both are
+  NativeAOT-published with no trim or AOT warnings.
+- ilc and crossgen2 wall time over the 24 objcmp compilations (single-threaded) went from 36.4 s to 37.3 s (+2.5%),
+  averaged over two runs. Not profiled.
+- Linking NativeAOT UnitTests: wasm-ld (multi-threaded) takes 0.07 s and 131 MB RSS; `wasm-link` takes about 1.0 s
+  and 296 MB RSS, including about 0.02 s of process startup. `wasm-link` is not tuned for speed yet.
+- The WASI CoreCLR host from `WasiUseManagedWasmLinker` is 214 KB (0.6%) smaller. That was measured before nesm#583
+  demangled the `name` section and hasn't been re-measured.
+- With `WasiR2RUseManagedTools` the console sample keeps the host's DWARF (39.2 MB, against 36.2 MB by default), and
+  its DWARF passes `llvm-dwarfdump --verify`; wasm-merge's output does not.
+
+**Native tools that remain, and why**
+
+- `clang`/`emcc` compiling C and C++: C compilers aren't replacement targets. clang also still drives the NativeAOT
+  link (crt, sysroot, compiler-rt) and calls `wasm-link` through `-fuse-ld`.
+- The browser `emcc` link: it also generates the JavaScript glue.
+- `wasm-opt`: an optimizer, not a replacement target. This includes `--simplify-globals` in WASI ReadyToRun
+  composition with `WasiR2ROptimizeComposite=true`.
+- `wasm-tools validate` on the final WASI ReadyToRun component: the toolchain has no component-level validator yet.
+
+**nesm gaps** (Blazor-Playground/nesm)
+
+- No TLS (#569), shared memory or atomics (#572, #567), so threaded builds can't be linked.
+- No component-level validation (#582).
+- No built-in WASI preview1 adapters. NativeAOT and CoreCLR `wasm32-wasip2` builds don't need them.
+- nesm still doesn't enforce two analyzer rules (CA1859, SA1136), so the project suppresses them (#571).
+- `wasm-link` is slower and uses more memory than wasm-ld (see above).
+
+**Re-syncing:** run `sync-nesm.sh <fresh nesm clone> <commit>`, add any new tests to `nesm-test-files.txt`, run
+`sync-nesm.sh --update-patch <clone>`, then `./build.sh tools.wasmtoolchain -test`. For changes that affect
+ObjectWriter output, rerun the objcmp comparison. Details are in [Re-syncing from nesm](#re-syncing-from-nesm).
+
 ## Layout
 
 | Path | Contents |
@@ -97,22 +159,24 @@ Mono is out of scope. It is being removed.
 - `DataSegmentEncoder` writes data-segment headers, and `NameMapWriter` writes the `name` section.
 - `WasmCodeWriter` and `WasmOp` encode the instructions of writer-generated stubs and constant expressions
   (`WasmInstructions.cs` only maps symbol operands to relocations).
+- `WasmModuleEntryWriter` and `WasmExternalKind` encode the entries of the type, import, function, global, export
+  and element sections, and the data count.
 - `WasmLeb128` is used for LEB128 encoding and decoding, and `WasmSectionId` for section IDs.
 
-Runtime's own section framing, padding section, linking, relocation, data-segment-header and name-section encoding,
-its instruction encoder and `WasmExprKind`/`WasmSectionType` were deleted. The node-to-symbol front end, relocation
+Runtime's own section framing, padding section, linking, relocation, data-segment-header, name-section and section-entry
+encoding, its instruction encoder, `IWasmEncodable` and its duplicate enums (`WasmExprKind`, `WasmSectionType`,
+`WasmExportKind`, `WasmExternalKind`, `WasmLimitType`) were deleted. No hand-written wasm encoding is left outside
+Webcil's own format. Runtime still calls `WasmLeb128` directly for size prefixes and when it rewrites already-encoded
+bodies. The node-to-symbol front end, relocation
 resolution, data-segment layout and Webcil layout stay in runtime.
 
 - `ILCompiler.Compiler` and `ILCompiler.ReadyToRun` have a `ProjectReference` to this library, not linked source. The
   library's types are public, so linking its source would collide in tests that reference both. ilc and crossgen2
   are NativeAOT-published with no trim or AOT warnings. Compared with builds before either referenced the library,
-  ilc grew 86.7 KB (36,562,356 to 36,649,044 bytes) and crossgen2 56.9 KB (32,984,282 to 33,041,210 bytes).
+  ilc grew 99.5 KB (36,562,356 to 36,661,876 bytes) and crossgen2 68.7 KB (32,984,282 to 33,053,018 bytes).
 - Output is byte-identical before and after. `artifacts/objcmp/run.sh` (a local script, not committed) runs ilc on
   the 14 NativeAOT WASI smoke-test response files, and crossgen2 on CoreLib, five framework libraries and a
   composite. `TrimmingBehaviors.o` also differs between two runs of the same ilc, so it's excluded.
 - `ILCompiler.ReadyToRun.Tests` validates every crossgen2 wasm output with `ModuleReader.ReadModuleAndValidate`.
 - Nesm's `ObjectWriterReferenceTests` and `WasmCodeWriterTests.RuntimeCodeReemitsByteIdentically` re-encode
   runtime outputs and re-emit every code body when `NESM_OBJCMP_DIR` points at an objcmp `out` directory.
-- Still runtime-only: the entries of the type, import, global, export and element sections (function types, import
-  descriptors, global and export entries, element segments), tracked in
-  [nesm#597](https://github.com/Blazor-Playground/nesm/issues/597).
