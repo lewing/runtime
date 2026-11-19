@@ -127,7 +127,7 @@
     <ItemGroup>
       <SkipTestDirsPaths Include="$([System.IO.Path]::GetFullPath('$(XunitTestBinBase)%(DisabledTestDir.Identity)'))" />
       <AllRunnableTestPaths Include="$(XunitTestBinBase)\**\*.$(TestScriptExtension)"/>
-      <AllRunnableTestPaths Remove="$(XunitTestBinBase)\**\run-v8.sh" Condition="'$(TargetArchitecture)' == 'wasm'" />
+      <AllRunnableTestPaths Remove="$(XunitTestBinBase)\**\run-v8.sh" Condition="'$(TestTargetsWasm)' == 'true'" />
       <AllRunnableTestPaths Remove="%(SkipTestDirsPaths.Identity)\**\*.$(TestScriptExtension)" />
       <MergedAssemblyMarkerPaths Include="$(XunitTestBinBase)\**\*.MergedTestAssembly"/>
       <MergedAssemblyMarkerPaths Include="$(XunitTestBinBase)\**\*.MergedTestAssemblyForStress"/>
@@ -283,7 +283,7 @@
 
   <Target Name="CrossgenFramework"
       DependsOnTargets="GenerateLayout"
-      Condition="'$(__CopyNativeTestBinaries)' != '1' and '$(__TestBuildMode)' == 'crossgen2' and '$(TargetArchitecture)' != 'wasm' and !$(MonoAot) and !$(MonoFullAot)" >
+      Condition="'$(__CopyNativeTestBinaries)' != '1' and '$(__TestBuildMode)' == 'crossgen2' and '$(TestTargetsWasm)' != 'true' and !$(MonoAot) and !$(MonoFullAot)" >
 
     <PropertyGroup>
       <CrossgenOutputDir>$(__TestIntermediatesDir)\crossgen.out</CrossgenOutputDir>
