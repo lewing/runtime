@@ -165,6 +165,9 @@
     <TargetBits Condition="'$(TargetArchitecture)'=='arm64'">64</TargetBits>
     <TargetBits Condition="'$(TargetArchitecture)'=='loongarch64'">64</TargetBits>
     <TargetBits Condition="'$(TargetArchitecture)'=='riscv64'">64</TargetBits>
+    <!-- True for every WebAssembly pointer width. Conditions about Wasm itself should use this
+         rather than comparing TargetArchitecture, so that wasm64 picks them up as well. -->
+    <TestTargetsWasm Condition="'$(TargetArchitecture)' == 'wasm' or '$(TargetArchitecture)' == 'wasm64'">true</TestTargetsWasm>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -192,7 +195,7 @@
   <!-- Set Test Wrapper running host OS -->
   <PropertyGroup>
     <TestWrapperTargetsWindows>false</TestWrapperTargetsWindows>
-    <TestWrapperTargetsWindows Condition=" ('$(TargetsWindows)' != '' And '$(TargetsWindows)' ) OR ('$(TargetOS)' == 'android' And '$(TargetArchitecture)' == 'arm64' ) OR ($(WindowsHost) And '$(TargetArchitecture)' == 'wasm')">true</TestWrapperTargetsWindows>
+    <TestWrapperTargetsWindows Condition=" ('$(TargetsWindows)' != '' And '$(TargetsWindows)' ) OR ('$(TargetOS)' == 'android' And '$(TargetArchitecture)' == 'arm64' ) OR ($(WindowsHost) And '$(TestTargetsWasm)' == 'true')">true</TestWrapperTargetsWindows>
     <TestScriptExtension Condition="'$(TestWrapperTargetsWindows)' != 'true' ">sh</TestScriptExtension>
     <TestScriptExtension Condition="'$(TestWrapperTargetsWindows)' == 'true' ">cmd</TestScriptExtension>
   </PropertyGroup>
