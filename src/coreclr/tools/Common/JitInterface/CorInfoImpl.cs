@@ -4220,10 +4220,7 @@ namespace Internal.JitInterface
             }
 
 #if READYTORUN
-            if (helper.Method is not null)
-            {
-                AddManagedHelperDependency(helper.Method);
-            }
+            AddHelperDependencies(ftnNum, helper.Method);
 #endif
 
             if (pNativeEntrypoint != null)

@@ -1110,6 +1110,23 @@ namespace Internal.JitInterface
             pLookup.constLookup = CreateConstLookupToSymbol(_compilation.SymbolNodeFactory.DelegateCtor(delegateTypeDesc, targetMethod));
         }
 
+        private void AddHelperDependencies(CorInfoHelpFunc helper, MethodDesc helperMethod)
+        {
+            if (helperMethod is not null)
+            {
+                AddManagedHelperDependency(helperMethod);
+            }
+            else if (_compilation.NodeFactory.Target.IsWasm &&
+                     ReadyToRunJitHelperRootProvider.GetManagedHelper(_compilation.TypeSystemContext, helper) is MethodDesc managedHelper)
+            {
+                // The runtime binds this helper to a managed CoreLib method that may be interpreted.
+                // Calling its portable entrypoint from R2R code requires a thunk with the helper's signature.
+                WasmSignature signature = WasmLowering.GetSignature(managedHelper);
+                AddAdditionalDependency(_compilation.NodeFactory.WasmR2RToInterpreterThunk(signature),
+                    "Interpreter fallback for managed JIT helper");
+            }
+        }
+
         private void AddManagedHelperDependency(MethodDesc helperMethod)
         {
             // Cached helper targets outlive the current compilation's dependencies, including probes.
