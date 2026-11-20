@@ -10,9 +10,15 @@ using ILCompiler.DependencyAnalysis;
 using ILCompiler.DependencyAnalysis.ReadyToRun;
 using ILCompiler.DependencyAnalysisFramework;
 using ILCompiler.ObjectWriter;
+using ILCompiler.DependencyAnalysis.Wasm;
+using ILCompiler.ObjectWriter.WasmInstructions;
 using ILCompiler.Win32Resources;
+using Internal.IL;
+using Internal.JitInterface;
 using Internal.ReadyToRunConstants;
 using Internal.Text;
+using Internal.TypeSystem;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.PortableCallHelpers.WasmObject
 {
@@ -29,6 +35,8 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             ReadyToRunCompilationModuleGroupBase compilationGroup,
             string outputPath,
             IReadOnlyCollection<string> interpToNativeSignatures,
+            PInvokeTableGenerator pinvokeGenerator,
+            PInvokeTableGenerator.PInvokeTable pinvokeTable,
             uint? r2rImageSize,
             Logger logger)
         {
@@ -51,6 +59,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             var analyzer = new DependencyAnalyzer<NoLogStrategy<NodeFactory>, NodeFactory>(
                 factory, new SortableDependencyNode.ObjectNodeComparer(CompilerComparer.Instance));
             AddInterpToNativeThunks(factory, analyzer, interpToNativeSignatures);
+            new PInvokeTableEmitter(factory, analyzer, pinvokeGenerator).Add(pinvokeTable, context.Target);
             if (r2rImageSize is uint size)
                 AddR2RImageBuffer(factory, analyzer, size);
 
@@ -98,9 +107,193 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                 CallHelperDataNode.UInt32("g_wasi_r2r_image_cap", CallHelperDataNode.Data, size),
                 "ReadyToRun image buffer capacity");
 
-            var capacity = new ConstantFunctionNode(factory.TypeSystemContext, "__wasi_r2r_image_cap", size);
+            var capacity = new CallHelperFunctionNode(
+                factory.TypeSystemContext,
+                "__wasi_r2r_image_cap",
+                new WasmFuncType(new WasmResultType([]), new WasmResultType([WasmValueType.I32])),
+                [],
+                [I32.Const(unchecked((int)size))]);
             factory.AddExport(capacity, new Utf8String("wasi_r2r_image_cap"));
             analyzer.AddRoot(capacity, "ReadyToRun image buffer capacity export");
+        }
+    }
+
+    /// <summary>
+    /// The P/Invoke and runtime helper tables of callhelpers-pinvoke.cpp, and the functions the runtime looks
+    /// entry points up with: <c>callhelpers_pinvoke_override</c> and <c>ResolveRuntimeHelperEntrypoint</c>.
+    /// </summary>
+    internal sealed class PInvokeTableEmitter(NodeFactory factory, DependencyAnalyzerBase<NodeFactory> analyzer, PInvokeTableGenerator generator)
+    {
+        private const int PointerSize = 4;
+        private const int LibraryTableEntrySize = 3 * PointerSize; // { LibraryName, Entries, EntryCount }
+        private const int EntrySize = 2 * PointerSize;             // { name, method }
+
+        private readonly Dictionary<string, CallHelperDataNode> _strings = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, ExternFunctionSymbolNode> _functions = new(StringComparer.Ordinal);
+
+        // A function the linker binds by its symbol name, like a C declaration without import attributes.
+        private static readonly LinkageMetadata s_boundBySymbol = new(default);
+
+        private static readonly WasmFuncType s_resolveType = new(
+            new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([WasmValueType.I32]));
+
+        public void Add(PInvokeTableGenerator.PInvokeTable table, TargetDetails target)
+        {
+            TypeSystemContext context = factory.TypeSystemContext;
+            ExternFunctionSymbolNode strcmp = Function("strcmp", new WasmFuncType(
+                new WasmResultType([WasmValueType.I32, WasmValueType.I32]), new WasmResultType([WasmValueType.I32])), s_boundBySymbol);
+
+            // minipal_resolve_dllimport: the method of the entry named `name` in `entries`, or null.
+            var resolve = new CallHelperFunctionNode(context, "__callhelpers_resolve_entry", s_resolveType, [WasmValueType.I32],
+            [
+                Block.Start(WasmBlockType.Empty),
+                Block.Loop(WasmBlockType.Empty),
+                Local.Get(3), Local.Get(1), I32.Ge_u, ControlFlow.BrIf(1),
+                Local.Get(2), Local.Get(0), Local.Get(3), I32.Const(EntrySize), I32.Mul, I32.Add, I32.Load(0),
+                ControlFlow.Call(strcmp), I32.Eqz,
+                Block.If(WasmBlockType.Empty),
+                Local.Get(0), Local.Get(3), I32.Const(EntrySize), I32.Mul, I32.Add, I32.Load(PointerSize), ControlFlow.Return,
+                Block.End,
+                Local.Get(3), I32.Const(1), I32.Add, Local.Set(3),
+                ControlFlow.Br(0),
+                Block.End,
+                Block.End,
+                I32.Const(0),
+            ]);
+
+            var libraries = new List<(ISymbolNode Name, ISymbolNode Entries, int Count)>();
+            foreach ((string library, List<IGrouping<string, PInvokeInfo>> entries) in table.Libraries)
+            {
+                var pairs = new List<(ISymbolNode, ISymbolNode)>(entries.Count);
+                foreach (IGrouping<string, PInvokeInfo> entry in entries)
+                {
+                    PInvokeInfo pinvoke = entry.First();
+                    pairs.Add((String(entry.Key), Native(pinvoke)));
+                }
+
+                libraries.Add((String(library), CallHelperDataNode.PointerPairTable($"__callhelpers_pinvoke_{libraries.Count}", pairs), pairs.Count));
+            }
+
+            WasmExpr[] overrideBody = [I32.Const(0)];
+            if (libraries.Count > 0)
+            {
+                byte[] data = new byte[libraries.Count * LibraryTableEntrySize];
+                var references = new List<(int, ISymbolNode)>();
+                for (int i = 0; i < libraries.Count; i++)
+                {
+                    int offset = i * LibraryTableEntrySize;
+                    references.Add((offset, libraries[i].Name));
+                    references.Add((offset + PointerSize, libraries[i].Entries));
+                    BitConverter.TryWriteBytes(data.AsSpan(offset + 2 * PointerSize), libraries[i].Count);
+                }
+
+                var tables = new CallHelperDataNode("__callhelpers_pinvoke_tables", CallHelperDataNode.ReadOnlyData, PointerSize, data, references.ToArray());
+
+                // Params: library_name (0), entry_point_name (1). Locals: i (2), &tables[i] (3).
+                overrideBody =
+                [
+                    Block.Start(WasmBlockType.Empty),
+                    Block.Loop(WasmBlockType.Empty),
+                    Local.Get(2), I32.Const(libraries.Count), I32.Ge_u, ControlFlow.BrIf(1),
+                    I32.ConstAddress(tables), Local.Get(2), I32.Const(LibraryTableEntrySize), I32.Mul, I32.Add, Local.Set(3),
+                    Local.Get(0), Local.Get(3), I32.Load(0), ControlFlow.Call(strcmp), I32.Eqz,
+                    Block.If(WasmBlockType.Empty),
+                    Local.Get(3), I32.Load(PointerSize), Local.Get(3), I32.Load(2 * PointerSize), Local.Get(1),
+                    ControlFlow.Call(resolve), ControlFlow.Return,
+                    Block.End,
+                    Local.Get(2), I32.Const(1), I32.Add, Local.Set(2),
+                    ControlFlow.Br(0),
+                    Block.End,
+                    Block.End,
+                    I32.Const(0),
+                ];
+            }
+
+            analyzer.AddRoot(new CallHelperFunctionNode(context, "_Z28callhelpers_pinvoke_overridePKcS0_",
+                new WasmFuncType(new WasmResultType([WasmValueType.I32, WasmValueType.I32]), new WasmResultType([WasmValueType.I32])),
+                [WasmValueType.I32, WasmValueType.I32], overrideBody), "P/Invoke table lookup");
+
+            WasmExpr[] helperBody = [I32.Const(0)];
+            if (table.RuntimeHelpers.Length > 0)
+            {
+                var pairs = new List<(ISymbolNode, ISymbolNode)>(table.RuntimeHelpers.Length);
+                foreach (PInvokeInfo helper in table.RuntimeHelpers)
+                    pairs.Add((String(helper.EntryPoint), RuntimeHelper(helper, target)));
+
+                CallHelperDataNode helpers = CallHelperDataNode.PointerPairTable("__callhelpers_runtime_helpers", pairs);
+                helperBody = [I32.ConstAddress(helpers), I32.Const(pairs.Count), Local.Get(0), ControlFlow.Call(resolve)];
+            }
+
+            analyzer.AddRoot(new CallHelperFunctionNode(context, "_Z30ResolveRuntimeHelperEntrypointPKc",
+                new WasmFuncType(new WasmResultType([WasmValueType.I32]), new WasmResultType([WasmValueType.I32])),
+                [], helperBody), "runtime helper lookup");
+        }
+
+        private ISymbolNode Native(PInvokeInfo pinvoke)
+        {
+            (string returnType, List<string> parameterTypes) = PInvokeTableGenerator.NativeSignature(pinvoke);
+            LinkageMetadata linkage = pinvoke.WasmLinkage
+                ? new WasmLinkageMetadata(new Utf8String(pinvoke.EntryPoint), new Utf8String(pinvoke.Module))
+                : s_boundBySymbol;
+            return Function(generator.NativeSymbol(pinvoke), NativeType(returnType, parameterTypes), linkage);
+        }
+
+        private ISymbolNode RuntimeHelper(PInvokeInfo helper, TargetDetails target)
+        {
+            // string.h's memmove and memset on WASI; bulk-memory wrappers on browser.
+            if (helper.EntryPoint is "memmove" or "memset")
+            {
+                string symbol = target.OperatingSystem == TargetOS.Browser ? $"QCall_{helper.EntryPoint}" : helper.EntryPoint;
+                return Function(symbol, s_resolveType, s_boundBySymbol);
+            }
+
+            return Native(helper);
+        }
+
+        private ExternFunctionSymbolNode Function(string symbol, WasmFuncType type, LinkageMetadata linkage)
+        {
+            if (!_functions.TryGetValue(symbol, out ExternFunctionSymbolNode node))
+            {
+                MethodSignature signature = WasmLowering.RaiseSignature(
+                    new WasmSignature(type, CallHelperFunctionNode.SignatureString(type)), factory.TypeSystemContext);
+                node = new ExternFunctionSymbolNode(new Utf8String(symbol), signature, isUnmanagedCallersOnly: true, isAsyncCall: false, hasGenericContextArg: false, linkage);
+                _functions.Add(symbol, node);
+            }
+
+            return node;
+        }
+
+        private CallHelperDataNode String(string value)
+        {
+            if (!_strings.TryGetValue(value, out CallHelperDataNode node))
+            {
+                node = CallHelperDataNode.String($"__callhelpers_str_{_strings.Count}", value);
+                _strings.Add(value, node);
+            }
+
+            return node;
+        }
+
+        // The wasm type clang gives a function declared with these C types.
+        private static WasmFuncType NativeType(string returnType, List<string> parameterTypes)
+        {
+            WasmValueType[] parameters = new WasmValueType[parameterTypes.Count];
+            for (int i = 0; i < parameters.Length; i++)
+                parameters[i] = ValueType(parameterTypes[i]) ?? throw new InvalidOperationException($"A 'void' parameter in a native declaration.");
+
+            return new WasmFuncType(
+                new WasmResultType(parameters),
+                new WasmResultType(ValueType(returnType) is WasmValueType result ? [result] : []));
+
+            static WasmValueType? ValueType(string cType) => cType switch
+            {
+                "void" => null,
+                "float" => WasmValueType.F32,
+                "double" => WasmValueType.F64,
+                "int64_t" or "uint64_t" => WasmValueType.I64,
+                "int32_t" or "uint32_t" or "void *" or "uintptr_t" => WasmValueType.I32,
+                _ => throw new InvalidOperationException($"No wasm type for the C type '{cType}'."),
+            };
         }
     }
 }

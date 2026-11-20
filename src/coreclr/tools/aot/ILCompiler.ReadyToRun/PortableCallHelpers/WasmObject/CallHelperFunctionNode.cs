@@ -12,25 +12,35 @@ using Internal.TypeSystem;
 
 namespace ILCompiler.PortableCallHelpers.WasmObject
 {
-    /// <summary>A native <c>uint32_t name(void)</c> that returns a constant.</summary>
-    internal sealed class ConstantFunctionNode : AssemblyStubNode, INodeWithTypeSignature
+    /// <summary>A native function of the call-helper object, given its wasm signature, locals and body.</summary>
+    internal sealed class CallHelperFunctionNode : AssemblyStubNode, INodeWithTypeSignature
     {
-        private static readonly WasmSignature s_signature = new(
-            new WasmFuncType(new WasmResultType([]), new WasmResultType([WasmValueType.I32])),
-            "i");
-
         private readonly TypeSystemContext _context;
         private readonly string _name;
-        private readonly uint _value;
+        private readonly WasmSignature _signature;
+        private readonly WasmValueType[] _locals;
+        private readonly WasmExpr[] _body;
 
-        public ConstantFunctionNode(TypeSystemContext context, string name, uint value)
+        public CallHelperFunctionNode(TypeSystemContext context, string name, WasmFuncType type, WasmValueType[] locals, WasmExpr[] body)
         {
             _context = context;
             _name = name;
-            _value = value;
+            _signature = new WasmSignature(type, SignatureString(type));
+            _locals = locals;
+            _body = body;
         }
 
-        MethodSignature INodeWithTypeSignature.Signature => WasmLowering.RaiseSignature(s_signature, _context);
+        /// <summary>The signature string <see cref="WasmLowering.RaiseSignature"/> reads for a native function of <paramref name="type"/>.</summary>
+        public static string SignatureString(WasmFuncType type)
+        {
+            var chars = new char[type.Params.Types.Length + 1];
+            chars[0] = type.Returns.Types.Length == 0 ? 'v' : WasmLowering.WasmValueTypeToSigChar(type.Returns.Types[0]);
+            for (int i = 0; i < type.Params.Types.Length; i++)
+                chars[i + 1] = WasmLowering.WasmValueTypeToSigChar(type.Params.Types[i]);
+            return new string(chars);
+        }
+
+        MethodSignature INodeWithTypeSignature.Signature => WasmLowering.RaiseSignature(_signature, _context);
         bool INodeWithTypeSignature.IsUnmanagedCallersOnly => true;
         bool INodeWithTypeSignature.IsAsyncCall => false;
         bool INodeWithTypeSignature.HasGenericContextArg => false;
@@ -44,17 +54,17 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
         protected override string GetName(NodeFactory factory) => _name;
 
         public override int CompareToImpl(ISortableNode other, CompilerComparer comparer) =>
-            string.CompareOrdinal(_name, ((ConstantFunctionNode)other)._name);
+            string.CompareOrdinal(_name, ((CallHelperFunctionNode)other)._name);
 
         protected override void ComputeNonRelocationBasedDependencies(DependencySink sink, NodeFactory factory)
         {
             base.ComputeNonRelocationBasedDependencies(sink, factory);
-            sink.Add(factory.WasmTypeNode(this), "type of a constant function");
+            sink.Add(factory.WasmTypeNode(this), "type of a call-helper function");
         }
 
         protected override void EmitCode(NodeFactory factory, ref WasmEmitter instructionEncoder, bool relocsOnly)
         {
-            instructionEncoder.FunctionBody = new WasmFunctionBody(s_signature.FuncType, [], [I32.Const(unchecked((int)_value))]);
+            instructionEncoder.FunctionBody = new WasmFunctionBody(_signature.FuncType, _locals, _body);
         }
 
         protected override void EmitCode(NodeFactory factory, ref DependencyAnalysis.X64.X64Emitter instructionEncoder, bool relocsOnly) => throw new NotSupportedException();

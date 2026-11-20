@@ -409,7 +409,7 @@
     <Compile Include="PortableCallHelpers\TypeNames.cs" />
     <Compile Include="PortableCallHelpers\WasmObject\CallHelperDataNode.cs" />
     <Compile Include="PortableCallHelpers\WasmObject\CallHelpersObjectEmitter.cs" />
-    <Compile Include="PortableCallHelpers\WasmObject\ConstantFunctionNode.cs" />
+    <Compile Include="PortableCallHelpers\WasmObject\CallHelperFunctionNode.cs" />
     <Compile Include="PortableCallHelpers\WasmObject\InterpToNativeThunkNode.cs" />
     <Compile Include="JitInterface\WasmLowering.ReadyToRun.cs" />
     <Compile Include="ObjectWriter\TargetExtensions.cs" />

@@ -307,10 +307,14 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     {
         public static WasmExpr Const(long value) => new WasmConstExpr(WasmOp.I32Const, checked((int)value));
         public static WasmExpr ConstRVA(ISymbolNode symbolNode) => new WasmLEBConstantReloc(WasmOp.I32Const, symbolNode, RelocType.WASM_MEMORY_ADDR_REL_SLEB);
+        // The absolute address of a data symbol, for objects linked without position independence.
+        public static WasmExpr ConstAddress(ISymbolNode symbolNode) => new WasmLEBConstantReloc(WasmOp.I32Const, symbolNode, RelocType.WASM_MEMORY_ADDR_SLEB);
 
         public static WasmExpr Add => new WasmOpExpr(WasmOp.I32Add);
         public static WasmExpr Sub => new WasmOpExpr(WasmOp.I32Sub);
         public static WasmExpr Eqz => new WasmOpExpr(WasmOp.I32Eqz);
+        public static WasmExpr Mul => new WasmOpExpr(WasmOp.I32Mul);
+        public static WasmExpr Ge_u => new WasmOpExpr(WasmOp.I32GeU);
         public static WasmExpr Ge_s => new WasmOpExpr(WasmOp.I32GeS);
         public static WasmExpr Load(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Load, 4, offset);
         public static WasmExpr Load16_u(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Load16U, 2, offset);
@@ -378,6 +382,9 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     internal static class ControlFlow
     {
         public static WasmExpr Unreachable => new WasmOpExpr(WasmOp.Unreachable);
+        public static WasmExpr Return => new WasmOpExpr(WasmOp.Return);
+        public static WasmExpr Br(int depth) => new WasmIndexExpr(WasmOp.Br, checked((uint)depth));
+        public static WasmExpr BrIf(int depth) => new WasmIndexExpr(WasmOp.BrIf, checked((uint)depth));
         public static WasmExpr Call(ISymbolNode target) => new WasmLEBConstantReloc(WasmOp.Call, target, RelocType.WASM_FUNCTION_INDEX_LEB);
         public static WasmExpr ReturnCall(ISymbolNode target) => new WasmLEBConstantReloc(WasmOp.ReturnCall, target, RelocType.WASM_FUNCTION_INDEX_LEB);
         public static WasmExpr CallIndirect(ISymbolNode funcType, uint tableIndex) => new WasmIndirectCallInstruction(WasmOp.CallIndirect, funcType, tableIndex);
@@ -398,6 +405,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     internal static class Block
     {
         public static WasmExpr If(WasmBlockType blockType) => new WasmBlockStartExpr(WasmOp.If, blockType);
+        public static WasmExpr Start(WasmBlockType blockType) => new WasmBlockStartExpr(WasmOp.Block, blockType);
+        public static WasmExpr Loop(WasmBlockType blockType) => new WasmBlockStartExpr(WasmOp.Loop, blockType);
         public static WasmExpr End => new WasmOpExpr(WasmOp.End);
     }
 }
