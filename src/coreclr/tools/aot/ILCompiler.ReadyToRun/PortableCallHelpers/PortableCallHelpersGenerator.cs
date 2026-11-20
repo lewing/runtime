@@ -137,8 +137,11 @@ namespace ILCompiler.PortableCallHelpers
                     w => generator.WritePInvokeTable(w, context.Target, pinvokeTable));
             }
 
-            WriteIfDifferent(Path.Combine(options.OutputDirectory, ReversePInvokeFileName), log,
-                w => generator.EmitNativeToInterp(w, callbacks));
+            if (!options.EmitObject)
+            {
+                WriteIfDifferent(Path.Combine(options.OutputDirectory, ReversePInvokeFileName), log,
+                    w => generator.EmitNativeToInterp(w, callbacks));
+            }
 
             foreach (KeyValuePair<string, MethodDesc> internalCall in internalCallCollector.Signatures)
                 signatures.TryAdd(internalCall.Key, internalCall.Value);
@@ -152,6 +155,7 @@ namespace ILCompiler.PortableCallHelpers
                     signatures.Keys,
                     generator,
                     pinvokeTable,
+                    callbacks,
                     options.WasiR2RImageSize,
                     logger);
             }

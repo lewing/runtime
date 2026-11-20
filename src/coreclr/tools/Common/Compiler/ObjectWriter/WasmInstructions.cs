@@ -315,6 +315,8 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public static WasmExpr Eqz => new WasmOpExpr(WasmOp.I32Eqz);
         public static WasmExpr Mul => new WasmOpExpr(WasmOp.I32Mul);
         public static WasmExpr Ge_u => new WasmOpExpr(WasmOp.I32GeU);
+        public static WasmExpr Eq => new WasmOpExpr(WasmOp.I32Eq);
+        public static WasmExpr ReinterpretF32 => new WasmOpExpr(WasmOp.I32ReinterpretF32);
         public static WasmExpr Ge_s => new WasmOpExpr(WasmOp.I32GeS);
         public static WasmExpr Load(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Load, 4, offset);
         public static WasmExpr Load16_u(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Load16U, 2, offset);
@@ -328,6 +330,9 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public static WasmExpr Const(long value) => new WasmConstExpr(WasmOp.I64Const, value);
         public static WasmExpr Load(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I64Load, 8, offset);
         public static WasmExpr Store(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I64Store, 8, offset);
+        public static WasmExpr ExtendI32_s => new WasmOpExpr(WasmOp.I64ExtendI32S);
+        public static WasmExpr ExtendI32_u => new WasmOpExpr(WasmOp.I64ExtendI32U);
+        public static WasmExpr ReinterpretF64 => new WasmOpExpr(WasmOp.I64ReinterpretF64);
     }
 
     internal static class F32
