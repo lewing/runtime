@@ -42,10 +42,11 @@ namespace Wasm.Build.Tests
             string symbols = File.ReadAllText(Path.Combine(nativeBuildDir, "dotnet.native.js.symbols"));
             Assert.Equal(useQCall, symbols.Contains("GCInterface_GetTotalMemory", StringComparison.Ordinal));
 
-            string table = File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
-            Assert.Contains("const void* ResolveRuntimeHelperEntrypoint(const char* name)", table);
-            Assert.Equal(useQCall, table.Contains("{ \"GCInterface_GetTotalMemory\",", StringComparison.Ordinal));
-            Assert.DoesNotContain("{\"QCall\",", table);
+            string table = ReadCallHelperTable(nativeBuildDir);
+            Assert.Contains(EmitCallHelpersAsWasm ? "ResolveRuntimeHelperEntrypoint" : "const void* ResolveRuntimeHelperEntrypoint(const char* name)", table);
+            Assert.Equal(useQCall, HasCallHelperEntry(table, "GCInterface_GetTotalMemory"));
+            if (!EmitCallHelpersAsWasm)
+                Assert.DoesNotContain("{\"QCall\",", table);
 
             RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(config, TestScenario: "DotnetRun", ExpectedExitCode: 42));
             Assert.Contains(result.TestOutput, line => line.Contains("QCall trimming sample passed", StringComparison.Ordinal));
@@ -71,13 +72,14 @@ namespace Wasm.Build.Tests
 
             string nativeBuildDir = Path.Combine(_projectDir, "obj", config.ToString(), DefaultTargetFramework, "wasm", "for-publish");
             string symbols = File.ReadAllText(Path.Combine(nativeBuildDir, "dotnet.native.js.symbols"));
-            string table = File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
-            Assert.Contains("const void* ResolveRuntimeHelperEntrypoint(const char* name)", table);
-            Assert.DoesNotContain("{\"QCall\",", table);
+            string table = ReadCallHelperTable(nativeBuildDir);
+            Assert.Contains(EmitCallHelpersAsWasm ? "ResolveRuntimeHelperEntrypoint" : "const void* ResolveRuntimeHelperEntrypoint(const char* name)", table);
+            if (!EmitCallHelpersAsWasm)
+                Assert.DoesNotContain("{\"QCall\",", table);
             foreach (string entryPoint in new[] { "GCInterface_GetTotalMemory", "Math_Asinh" })
             {
                 Assert.Equal(useEntryPoints, symbols.Split('\n').Any(line => line.TrimEnd('\r').EndsWith($":{entryPoint}", StringComparison.Ordinal)));
-                Assert.Equal(useEntryPoints, table.Contains($"{{ \"{entryPoint}\",", StringComparison.Ordinal));
+                Assert.Equal(useEntryPoints, HasCallHelperEntry(table, entryPoint));
             }
             Assert.False(File.Exists(Path.Combine(nativeBuildDir, "callhelpers-ecalls.cpp")));
 
@@ -97,11 +99,11 @@ namespace Wasm.Build.Tests
                 ExtraMSBuildArgs: $"{ReadyToRunTests.GetR2RBuildArgs(config)} -p:PublishTrimmed=false -p:IntermediateLinkDir={linkedDir}"), isNativeBuild: true);
 
             symbols = File.ReadAllText(Path.Combine(nativeBuildDir, "dotnet.native.js.symbols"));
-            table = File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
+            table = ReadCallHelperTable(nativeBuildDir);
             foreach (string entryPoint in new[] { "GCInterface_GetTotalMemory", "Math_Asinh" })
             {
                 Assert.Contains(symbols.Split('\n'), line => line.TrimEnd('\r').EndsWith($":{entryPoint}", StringComparison.Ordinal));
-                Assert.Contains($"{{ \"{entryPoint}\",", table);
+                Assert.True(HasCallHelperEntry(table, entryPoint), entryPoint);
             }
 
             result = await RunForPublishWithWebServer(new BrowserRunOptions(config, TestScenario: "DotnetRun", ExpectedExitCode: 42));
@@ -135,10 +137,18 @@ namespace Wasm.Build.Tests
                 ExtraMSBuildArgs: ReadyToRunTests.GetR2RBuildArgs(config)), isNativeBuild: true);
 
             string nativeBuildDir = Path.Combine(_projectDir, "obj", config.ToString(), DefaultTargetFramework, "wasm", "for-publish");
-            string table = File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
-            Assert.Contains("{ \"strlen\", (void*)&direct_pinvoke::strlen },", table);
-            Assert.Single(table.Split('\n'), line => line.Contains("__asm__(\"strlen\")", StringComparison.Ordinal));
-            Assert.Contains("{\"libc\", s_libc, 1}", table);
+            string table = ReadCallHelperTable(nativeBuildDir);
+            if (EmitCallHelpersAsWasm)
+            {
+                Assert.True(HasCallHelperEntry(table, "strlen"));
+                Assert.Contains("libc", table);
+            }
+            else
+            {
+                Assert.Contains("{ \"strlen\", (void*)&direct_pinvoke::strlen },", table);
+                Assert.Single(table.Split('\n'), line => line.Contains("__asm__(\"strlen\")", StringComparison.Ordinal));
+                Assert.Contains("{\"libc\", s_libc, 1}", table);
+            }
             Assert.DoesNotContain("definitely_not_in_libc", table);
 
             RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(config, TestScenario: "DotnetRun", ExpectedExitCode: 42));
@@ -556,17 +566,27 @@ namespace Wasm.Build.Tests
             // FIXME: Not possible in in-process mode for some reason, even with verbosity at "diagnostic"
             // Assert.Contains("Adding pinvoke signature FD for method 'Test.", output);
 
-            string pinvokeTableFileName = IsCoreClrRuntime ? "callhelpers-pinvoke.cpp" : "pinvoke-table.h";
-            string pinvokeTable = File.ReadAllText(Path.Combine(objDir, pinvokeTableFileName));
-            // Verify that the invoke is in the pinvoke table. Under various circumstances we will silently skip it,
-            //  for example if the module isn't found
-            string pinvokeTableEntry = IsCoreClrRuntime
-                ? "{ \"accept_double_struct_and_return_float_struct\", (void*)&direct_pinvoke::accept_double_struct_and_return_float_struct }"
-                : "\"accept_double_struct_and_return_float_struct\", accept_double_struct_and_return_float_struct";
-            Assert.Contains(pinvokeTableEntry, pinvokeTable);
-            // Verify the signature of the C function prototype. Wasm ABI specifies that the structs should both decompose into scalars.
-            Assert.Contains("float accept_double_struct_and_return_float_struct (double)", pinvokeTable);
-            Assert.Contains("int64_t accept_and_return_i64_struct (int64_t)", pinvokeTable);
+            if (IsCoreClrRuntime && EmitCallHelpersAsWasm)
+            {
+                // The object has no C prototypes to check; the run below exercises the scalarized signatures.
+                string table = ReadCallHelperTable(objDir);
+                Assert.True(HasCallHelperEntry(table, "accept_double_struct_and_return_float_struct"));
+                Assert.True(HasCallHelperEntry(table, "accept_and_return_i64_struct"));
+            }
+            else
+            {
+                string pinvokeTableFileName = IsCoreClrRuntime ? "callhelpers-pinvoke.cpp" : "pinvoke-table.h";
+                string pinvokeTable = File.ReadAllText(Path.Combine(objDir, pinvokeTableFileName));
+                // Verify that the invoke is in the pinvoke table. Under various circumstances we will silently skip it,
+                //  for example if the module isn't found
+                string pinvokeTableEntry = IsCoreClrRuntime
+                    ? "{ \"accept_double_struct_and_return_float_struct\", (void*)&direct_pinvoke::accept_double_struct_and_return_float_struct }"
+                    : "\"accept_double_struct_and_return_float_struct\", accept_double_struct_and_return_float_struct";
+                Assert.Contains(pinvokeTableEntry, pinvokeTable);
+                // Verify the signature of the C function prototype. Wasm ABI specifies that the structs should both decompose into scalars.
+                Assert.Contains("float accept_double_struct_and_return_float_struct (double)", pinvokeTable);
+                Assert.Contains("int64_t accept_and_return_i64_struct (int64_t)", pinvokeTable);
+            }
 
             var runOptions = new BrowserRunOptions(config, TestScenario: "DotnetRun", ExpectedExitCode: 3);
             RunResult result = isPublish ? await RunForPublishWithWebServer(runOptions) : await RunForBuildWithDotnetRun(runOptions);
@@ -634,15 +654,17 @@ namespace Wasm.Build.Tests
 
             string objDir = Path.Combine(_projectDir, "obj", config.ToString(), DefaultTargetFramework, "wasm", "for-build");
             string pinvokeTableFileName = IsCoreClrRuntime ? "callhelpers-pinvoke.cpp" : "pinvoke-table.h";
-            string pinvokeTable = File.ReadAllText(Path.Combine(objDir, pinvokeTableFileName));
+            string pinvokeTable = IsCoreClrRuntime ? ReadCallHelperTable(objDir) : File.ReadAllText(Path.Combine(objDir, pinvokeTableFileName));
 
-            string includedPInvokeTableEntry = IsCoreClrRuntime
-                ? "{ \"versioned_browser_add\", (void*)&direct_pinvoke::versioned_browser_add }"
-                : "\"versioned_browser_add\", versioned_browser_add";
+            string includedPInvokeTableEntry = !IsCoreClrRuntime
+                ? "\"versioned_browser_add\", versioned_browser_add"
+                : EmitCallHelpersAsWasm
+                    ? "versioned_browser_add"
+                    : "{ \"versioned_browser_add\", (void*)&direct_pinvoke::versioned_browser_add }";
             Assert.Contains(includedPInvokeTableEntry, pinvokeTable);
 
             string excludedPInvokeTableEntry = IsCoreClrRuntime
-                ? "\"versioned_windows_add\""
+                ? EmitCallHelpersAsWasm ? "versioned_windows_add" : "\"versioned_windows_add\""
                 : "\"versioned_windows_add\", versioned_windows_add";
             Assert.DoesNotContain(excludedPInvokeTableEntry, pinvokeTable);
 

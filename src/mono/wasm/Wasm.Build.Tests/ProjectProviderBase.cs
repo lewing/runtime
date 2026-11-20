@@ -356,19 +356,27 @@ public abstract class ProjectProviderBase(ITestOutputHelper _testOutput, string?
 
         if (BuildTestBase.IsCoreClrRuntime)
         {
-            string[] generatedFiles =
-            [
-                "callhelpers-generator.rsp",
-                "callhelpers-interp-to-managed.cpp",
-                "callhelpers-interp-to-managed.o",
-                "callhelpers-pinvoke.cpp",
-                "callhelpers-pinvoke.o",
-                "callhelpers-reverse.cpp",
-                "callhelpers-reverse.o",
-                "dotnet.native.js.symbols",
-                "emcc-compile-generated.rsp",
-                "emcc-link.rsp",
-            ];
+            string[] generatedFiles = BuildTestBase.EmitCallHelpersAsWasm
+                ?
+                [
+                    "callhelpers-generator.rsp",
+                    "callhelpers.o",
+                    "dotnet.native.js.symbols",
+                    "emcc-link.rsp",
+                ]
+                :
+                [
+                    "callhelpers-generator.rsp",
+                    "callhelpers-interp-to-managed.cpp",
+                    "callhelpers-interp-to-managed.o",
+                    "callhelpers-pinvoke.cpp",
+                    "callhelpers-pinvoke.o",
+                    "callhelpers-reverse.cpp",
+                    "callhelpers-reverse.o",
+                    "dotnet.native.js.symbols",
+                    "emcc-compile-generated.rsp",
+                    "emcc-link.rsp",
+                ];
             TestUtils.AssertFilesExist(paths.ObjWasmDir, generatedFiles);
             files.AddRange(generatedFiles.Select(file => Path.Combine(paths.ObjWasmDir, file)));
         }

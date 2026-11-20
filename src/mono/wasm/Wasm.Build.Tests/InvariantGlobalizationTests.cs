@@ -56,7 +56,7 @@ namespace Wasm.Build.Tests
             PublishProject(info, config, new PublishOptions(GlobalizationMode: GlobalizationMode.Invariant, AOT: aot), isNativeBuild: true);
 
             string nativeBuildDir = Path.Combine(_projectDir, "obj", config.ToString(), DefaultTargetFramework, "wasm", "for-publish");
-            string pinvokeTable = File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
+            string pinvokeTable = ReadCallHelperTable(nativeBuildDir);
             Assert.DoesNotContain("GlobalizationNative_", pinvokeTable);
 
             string linkRsp = File.ReadAllText(Path.Combine(nativeBuildDir, "emcc-link.rsp"));
