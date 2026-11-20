@@ -69,6 +69,19 @@ namespace Wasm.Build.Tests
         public static bool IsWorkloadWithMultiThreadingForDefaultFramework => s_buildEnv.IsWorkloadWithMultiThreadingForDefaultFramework;
         public static bool IsMonoRuntime => s_buildEnv.IsMonoRuntime;
         public static bool IsCoreClrRuntime => s_buildEnv.IsCoreClrRuntime;
+
+        // Experimental WasmEmitCallHelpersAsWasm, inherited from the environment by every test project build:
+        // crossgen2 writes the call helpers as one wasm object, callhelpers.o, instead of C++ sources.
+        public static bool EmitCallHelpersAsWasm =>
+            string.Equals(Environment.GetEnvironmentVariable("WasmEmitCallHelpersAsWasm"), "true", StringComparison.OrdinalIgnoreCase);
+
+        // The P/Invoke table, as text to search for entry point names. The object keeps the names as strings and symbols.
+        protected static string ReadCallHelperTable(string nativeBuildDir) => EmitCallHelpersAsWasm
+            ? Encoding.Latin1.GetString(File.ReadAllBytes(Path.Combine(nativeBuildDir, "callhelpers.o")))
+            : File.ReadAllText(Path.Combine(nativeBuildDir, "callhelpers-pinvoke.cpp"));
+
+        protected static bool HasCallHelperEntry(string table, string entryPoint) =>
+            table.Contains(EmitCallHelpersAsWasm ? entryPoint : $"{{ \"{entryPoint}\",", StringComparison.Ordinal);
         public static bool UseWebcil => s_buildEnv.UseWebcil;
         public static string GetNuGetConfigPath()
             => Path.Combine(BuildEnvironment.TestDataPath, "nuget.config");

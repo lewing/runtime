@@ -704,6 +704,11 @@
       <_WasmPInvokeTablePath>$(_WasmIntermediateOutputPath)callhelpers-pinvoke.cpp</_WasmPInvokeTablePath>
       <_WasmReversePInvokeTablePath>$(_WasmIntermediateOutputPath)callhelpers-reverse.cpp</_WasmReversePInvokeTablePath>
       <_WasmInterpToNativeTablePath>$(_WasmIntermediateOutputPath)callhelpers-interp-to-managed.cpp</_WasmInterpToNativeTablePath>
+      <!-- Experimental: crossgen2 writes all the per-app call helpers (interpreter-to-native thunks, P/Invoke and
+           runtime helper tables, reverse thunks) as a relocatable wasm object, callhelpers.o, through the shared
+           ObjectWriter, so the relink compiles no generated C++. -->
+      <WasmEmitCallHelpersAsWasm Condition="'$(WasmEmitCallHelpersAsWasm)' == ''">false</WasmEmitCallHelpersAsWasm>
+      <_WasmCallHelpersObject>$(_WasmIntermediateOutputPath)callhelpers.o</_WasmCallHelpersObject>
     </PropertyGroup>
 
     <!-- P/Invoke modules: user native libraries + system native libraries -->
@@ -787,6 +792,7 @@
       <_Crossgen2GeneratorArg Include="--targetos:browser" />
       <_Crossgen2GeneratorArg Include="--targetarch:wasm" />
       <_Crossgen2GeneratorArg Include="--generate-portable-callhelpers:$(_WasmIntermediateOutputPath)" />
+      <_Crossgen2GeneratorArg Include="--portable-callhelpers-object" Condition="'$(WasmEmitCallHelpersAsWasm)' == 'true'" />
       <_Crossgen2GeneratorArg Include="@(_WasmPInvokeModules->'--directpinvoke:%(Identity)')" />
       <_Crossgen2GeneratorArg Include="@(DirectPInvokeList->'--directpinvokelist:%(FullPath)')" />
       <_Crossgen2GeneratorArg Include="@(_WasmManagedAssemblies->'%(FullPath)')" />
@@ -797,11 +803,16 @@
     <Exec Command="&quot;$(Crossgen2Path)&quot; &quot;@$(_Crossgen2GeneratorRsp)&quot;" />
 
     <ItemGroup>
-      <FileWrites Include="$(_Crossgen2GeneratorRsp);$(_WasmPInvokeTablePath);$(_WasmReversePInvokeTablePath);$(_WasmInterpToNativeTablePath)" />
+      <FileWrites Include="$(_Crossgen2GeneratorRsp)" />
+      <FileWrites Include="$(_WasmPInvokeTablePath);$(_WasmReversePInvokeTablePath);$(_WasmInterpToNativeTablePath)" Condition="'$(WasmEmitCallHelpersAsWasm)' != 'true'" />
+      <FileWrites Include="$(_WasmCallHelpersObject)" Condition="'$(WasmEmitCallHelpersAsWasm)' == 'true'" />
+      <_WasmNativeFileForLinking Include="$(_WasmCallHelpersObject)" Condition="'$(WasmEmitCallHelpersAsWasm)' == 'true'" />
     </ItemGroup>
 
     <ItemGroup>
       <_WasmSourceFileToCompileGenerated Remove="@(_WasmSourceFileToCompileGenerated)" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(WasmEmitCallHelpersAsWasm)' != 'true'">
       <_WasmSourceFileToCompileGenerated Include="$(_WasmPInvokeTablePath)"          ObjectFile="$(_WasmIntermediateOutputPath)callhelpers-pinvoke.o"
                                                                                      Dependencies="$(_WasmCompileRspGenerated);$(MSBuildThisFileDirectory)coreclr_compat.h;$(_VmWasmIncludeDir)callhelpers.hpp;$(_MinipalIncludeDir)entrypoints.h;$(_MinipalIncludeDir)utils.h" />
       <_WasmSourceFileToCompileGenerated Include="$(_WasmReversePInvokeTablePath)"   ObjectFile="$(_WasmIntermediateOutputPath)callhelpers-reverse.o"
