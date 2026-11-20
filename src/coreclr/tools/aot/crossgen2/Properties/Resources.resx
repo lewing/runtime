@@ -483,4 +483,10 @@
   <data name="StripILBodiesOption" xml:space="preserve">
     <value>Replace IL method bodies of compiled methods with a throwing stub in composite R2R output assemblies.</value>
   </data>
+  <data name="PortableCallHelpersObjectOption" xml:space="preserve">
+    <value>With --generate-portable-callhelpers, write the interpreter-to-native thunks (and the WASI ReadyToRun image buffer) as a relocatable wasm object, callhelpers.o, instead of C++</value>
+  </data>
+  <data name="WasiR2RImageSizeOption" xml:space="preserve">
+    <value>With --portable-callhelpers-object, the size of the WASI ReadyToRun image buffer to define in callhelpers.o</value>
+  </data>
 </root>

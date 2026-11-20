@@ -179,7 +179,7 @@ namespace ILCompiler.PortableCallHelpers
             }
         }
 
-        private static string CallFuncName(List<string> args, string result, bool isPortableEntryPointCall)
+        internal static string CallFuncName(List<string> args, string result, bool isPortableEntryPointCall)
         {
             string paramTypes = args.Count > 0
                 ? string.Join("_", args.Select(InteropSignature.TokenToNameType))

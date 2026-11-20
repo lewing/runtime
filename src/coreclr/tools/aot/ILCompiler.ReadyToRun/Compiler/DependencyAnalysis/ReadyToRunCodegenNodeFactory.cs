@@ -1539,6 +1539,16 @@ namespace ILCompiler.DependencyAnalysis
             return _genericCycleDetector.CanBeInCycle(methodDefinition);
         }
 
+        private Dictionary<ISymbolNode, Utf8String> _exportNames;
+
+        /// <summary>
+        /// Exports <paramref name="node"/> from a relocatable object under <paramref name="exportName"/>.
+        /// </summary>
+        public void AddExport(ISymbolNode node, Utf8String exportName)
+        {
+            (_exportNames ??= new Dictionary<ISymbolNode, Utf8String>()).Add(node, exportName);
+        }
+
         public Utf8String GetSymbolAlternateName(ISymbolNode node, out bool isHidden)
         {
             isHidden = false;
@@ -1546,6 +1556,10 @@ namespace ILCompiler.DependencyAnalysis
             {
                 string symbolName = CompositeImageSettings?.ReadyToRunHeaderSymbolName;
                 return new Utf8String(string.IsNullOrEmpty(symbolName) ? "RTR_HEADER" : symbolName);
+            }
+            if (_exportNames is not null && _exportNames.TryGetValue(node, out Utf8String exportName))
+            {
+                return exportName;
             }
             return default;
         }
