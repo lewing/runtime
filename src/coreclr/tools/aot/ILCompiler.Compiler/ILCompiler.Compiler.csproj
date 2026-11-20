@@ -695,6 +695,7 @@
     <Compile Include="Compiler\ObjectWriter\CodeView\CodeViewTypesBuilder.cs" />
     <Compile Include="Compiler\ObjectWriter\Dwarf\DwarfAbbrev.cs" />
     <Compile Include="Compiler\ObjectWriter\Dwarf\DwarfBuilder.cs" />
+    <Compile Include="Compiler\ObjectWriter\WasmRelocatableObjectWriter.Aot.cs" />
     <Compile Include="Compiler\ObjectWriter\Dwarf\DwarfCfiOpcode.cs" />
     <Compile Include="Compiler\ObjectWriter\Dwarf\DwarfCie.cs" />
     <Compile Include="Compiler\ObjectWriter\Dwarf\DwarfEhFrame.cs" />

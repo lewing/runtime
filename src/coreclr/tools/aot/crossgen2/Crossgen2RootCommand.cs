@@ -104,6 +104,10 @@ namespace ILCompiler
             new("--print-repro-instructions") { Description = SR.PrintReproInstructionsOption };
         public Option<string> GeneratePortableCallHelpers { get; } =
             new("--generate-portable-callhelpers") { Description = SR.GeneratePortableCallHelpersOption };
+        public Option<bool> PortableCallHelpersObject { get; } =
+            new("--portable-callhelpers-object") { Description = SR.PortableCallHelpersObjectOption };
+        public Option<uint?> WasiR2RImageSize { get; } =
+            new("--wasi-r2r-image-size") { Description = SR.WasiR2RImageSizeOption };
         public Option<string[]> DirectPInvoke { get; } =
             new("--directpinvoke") { DefaultValueFactory = _ => Array.Empty<string>(), Description = SR.DirectPInvokeOption };
         public Option<string[]> DirectPInvokeList { get; } =
@@ -223,6 +227,8 @@ namespace ILCompiler
             Options.Add(JitPath);
             Options.Add(PrintReproInstructions);
             Options.Add(GeneratePortableCallHelpers);
+            Options.Add(PortableCallHelpersObject);
+            Options.Add(WasiR2RImageSize);
             Options.Add(DirectPInvoke);
             Options.Add(DirectPInvokeList);
             Options.Add(SingleMethodTypeName);

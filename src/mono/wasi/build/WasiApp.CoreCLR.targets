@@ -245,6 +245,10 @@
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.sh</_WasiComponentLd>
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.cmd</_WasiComponentLd>
       <_WasiSysroot>$(WASI_SDK_PATH)share/wasi-sysroot</_WasiSysroot>
+      <!-- Experimental: crossgen2 writes the interpreter-to-native thunks and the ReadyToRun image buffer as a
+           relocatable wasm object (callhelpers.o) through the shared ObjectWriter, instead of C++ for clang. -->
+      <WasiEmitCallHelpersAsWasm Condition="'$(WasiEmitCallHelpersAsWasm)' == ''">false</WasiEmitCallHelpersAsWasm>
+      <_WasiCallHelpersObject>$(_WasiRelinkObjDir)callhelpers.o</_WasiCallHelpersObject>
 
       <_WasiPInvokeTablePath>$(_WasiRelinkObjDir)callhelpers-pinvoke.cpp</_WasiPInvokeTablePath>
       <_WasiReversePInvokeTablePath>$(_WasiRelinkObjDir)callhelpers-reverse.cpp</_WasiReversePInvokeTablePath>
@@ -340,6 +344,8 @@
       <_Crossgen2GeneratorArg Include="--targetos:wasi" />
       <_Crossgen2GeneratorArg Include="--targetarch:wasm" />
       <_Crossgen2GeneratorArg Include="--generate-portable-callhelpers:$(_WasiRelinkObjDir)" />
+      <_Crossgen2GeneratorArg Include="--portable-callhelpers-object" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true'" />
+      <_Crossgen2GeneratorArg Include="--wasi-r2r-image-size:$(_WasiR2RPayloadSize)" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true' and '$(PublishReadyToRun)' == 'true'" />
       <_Crossgen2GeneratorArg Include="@(_WasiPInvokeModules->'--directpinvoke:%(Identity)')" />
       <_Crossgen2GeneratorArg Include="@(DirectPInvokeList->'--directpinvokelist:%(FullPath)')" />
       <_Crossgen2GeneratorArg Include="@(_WasiManagedAssemblies->'%(FullPath)')" />
@@ -351,6 +357,7 @@
 
     <ItemGroup>
       <FileWrites Include="$(_Crossgen2GeneratorRsp);$(_WasiPInvokeTablePath);$(_WasiReversePInvokeTablePath);$(_WasiInterpToNativeTablePath)" />
+      <FileWrites Include="$(_WasiCallHelpersObject)" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true'" />
     </ItemGroup>
 
     <!-- 2. Compile the generated per-app sources with the wasi-sdk clang.
@@ -419,11 +426,12 @@
     <ItemGroup>
       <_WasiCallHelperSource Include="$(_WasiPInvokeTablePath)"        ObjectFile="$(_WasiRelinkObjDir)callhelpers-pinvoke.o" />
       <_WasiCallHelperSource Include="$(_WasiReversePInvokeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-reverse.o" />
-      <_WasiCallHelperSource Include="$(_WasiInterpToNativeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-interp-to-managed.o" />
+      <_WasiCallHelperSource Include="$(_WasiInterpToNativeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-interp-to-managed.o"
+                             Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiRuntimeConfigPropertiesSourcePath)" ObjectFile="$(_WasiRelinkObjDir)runtimeconfig.o" />
       <_WasiCallHelperSource Include="$(_WasiR2RImageBufferSource)"
                              ObjectFile="$(_WasiRelinkObjDir)r2r-image-buffer.o"
-                             Condition="'$(PublishReadyToRun)' == 'true'" />
+                             Condition="'$(PublishReadyToRun)' == 'true' and '$(WasiEmitCallHelpersAsWasm)' != 'true'" />
     </ItemGroup>
 
     <Exec Command="&quot;$(_WasiClangxx)&quot; &quot;@$(_WasiRelinkCompileRsp)&quot; -c &quot;%(_WasiCallHelperSource.Identity)&quot; -o &quot;%(_WasiCallHelperSource.ObjectFile)&quot;"
@@ -445,6 +453,7 @@
       <_WasiHostLibsPre Condition="'$(InvariantTimezone)' != 'true'" Include="$(MicrosoftNetCoreAppRuntimePackRidNativeDir)libSystem.Native.TimeZoneData.a" />
       <!-- Per-app generated objects go here, with the callhelpers replacing libcoreclr_gen_static.a. -->
       <_WasiHostLibsPre Include="%(_WasiCallHelperSource.ObjectFile)" />
+      <_WasiHostLibsPre Include="$(_WasiCallHelpersObject)" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true'" />
       <_WasiHostLibsPre Include="$(WasiCoreCLRNativeRuntimeDir)libnativeresourcestring.a" />
       <!-- Not linking libgcinfo_unix_wasm.a (browser does): it's the gcinfo ENCODER
            (GcInfoArrayList, JIT/crossgen emit) the interp/R2R host never uses, so its refs

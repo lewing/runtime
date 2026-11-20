@@ -25,6 +25,8 @@ namespace ILCompiler.PortableCallHelpers
         public IReadOnlyList<string> PInvokeModules { get; init; } = [];
         public IReadOnlyList<string> PInvokeModuleLists { get; init; } = [];
         public string TargetOS { get; init; }
+        public bool EmitObject { get; init; }
+        public uint? WasiR2RImageSize { get; init; }
     }
 
     /// <summary>
@@ -64,7 +66,7 @@ namespace ILCompiler.PortableCallHelpers
                 if (string.IsNullOrEmpty(options.TargetOS))
                     throw new LogAsErrorException("--generate-portable-callhelpers needs a target OS to match platform attributes against.");
 
-                Generate(context, options, log);
+                Generate(context, options, log, logger);
                 return 0;
             }
             catch (LogAsErrorException ex)
@@ -74,9 +76,9 @@ namespace ILCompiler.PortableCallHelpers
             }
         }
 
-        private static void Generate(ReadyToRunCompilerContext context, PortableCallHelpersGeneratorOptions options, InteropLogger log)
+        private static void Generate(ReadyToRunCompilerContext context, PortableCallHelpersGeneratorOptions options, InteropLogger log, Logger logger)
         {
-            ConfigureCompilationGroup(context);
+            ReadyToRunCompilationModuleGroupBase compilationGroup = ConfigureCompilationGroup(context);
 
             var collector = new PInvokeCollector(log, options.TargetOS);
             var internalCallCollector = new InternalCallSignatureCollector(log);
@@ -136,8 +138,21 @@ namespace ILCompiler.PortableCallHelpers
             foreach (KeyValuePair<string, MethodDesc> internalCall in internalCallCollector.Signatures)
                 signatures.TryAdd(internalCall.Key, internalCall.Value);
 
-            WriteIfDifferent(Path.Combine(options.OutputDirectory, InterpToNativeFileName), log,
-                w => InterpToNativeGenerator.Emit(w, signatures));
+            if (options.EmitObject)
+            {
+                WasmObject.CallHelpersObjectEmitter.Emit(
+                    context,
+                    compilationGroup,
+                    Path.Combine(options.OutputDirectory, WasmObject.CallHelpersObjectEmitter.FileName),
+                    signatures.Keys,
+                    options.WasiR2RImageSize,
+                    logger);
+            }
+            else
+            {
+                WriteIfDifferent(Path.Combine(options.OutputDirectory, InterpToNativeFileName), log,
+                    w => InterpToNativeGenerator.Emit(w, signatures));
+            }
         }
 
         /// <summary>
@@ -173,13 +188,13 @@ namespace ILCompiler.PortableCallHelpers
         /// boundary, and there is no precompiled code here: the interpreter loads these assemblies
         /// and computes their layout itself. One bubble is what reports that layout.
         /// </remarks>
-        private static void ConfigureCompilationGroup(ReadyToRunCompilerContext context)
+        private static ReadyToRunCompilationModuleGroupBase ConfigureCompilationGroup(ReadyToRunCompilerContext context)
         {
             List<EcmaModule> modules = new(context.InputFilePaths.Count);
             foreach (string simpleName in context.InputFilePaths.Keys)
                 modules.Add(context.GetModuleForSimpleName(simpleName));
 
-            context.SetCompilationGroup(new ReadyToRunSingleAssemblyCompilationModuleGroup(new ReadyToRunCompilationModuleGroupConfig
+            var group = new ReadyToRunSingleAssemblyCompilationModuleGroup(new ReadyToRunCompilationModuleGroupConfig
             {
                 Context = context,
                 // "Many inputs, one output unit" is what composite mode means, and it is what makes
@@ -191,7 +206,9 @@ namespace ILCompiler.PortableCallHelpers
                 VersionBubbleModuleSet = modules,
                 CrossModuleInlineable = [],
                 InstructionSetSupport = context.InstructionSetSupport,
-            }));
+            });
+            context.SetCompilationGroup(group);
+            return group;
         }
     }
 }

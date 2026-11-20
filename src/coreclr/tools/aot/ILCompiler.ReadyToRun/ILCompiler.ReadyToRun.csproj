@@ -212,6 +212,8 @@
     <Compile Include="..\..\Common\Compiler\ObjectWriter\Wasm\WebcilSection.cs" Link="Compiler\ObjectWriter\Wasm\WebcilSection.cs" />
     <Compile Include="..\..\Common\Compiler\ObjectWriter\WasmFunctionBodyDeduplicator.cs" Link="Compiler\ObjectWriter\WasmFunctionBodyDeduplicator.cs" />
     <Compile Include="..\..\Common\Compiler\ObjectWriter\WasmObjectWriter.cs" Link="Compiler\ObjectWriter\WasmObjectWriter.cs" />
+    <Compile Include="..\..\Common\Compiler\ObjectWriter\WasmRelocatableObjectWriter.cs" Link="Compiler\ObjectWriter\WasmRelocatableObjectWriter.cs" />
+    <Compile Include="..\..\Common\Compiler\ObjectWriter\Wasm\WasmDataSegmentEmitter.cs" Link="Compiler\ObjectWriter\Wasm\WasmDataSegmentEmitter.cs" />
     <Compile Include="..\..\Common\Compiler\ObjectWriter\WebCilObjectWriter.cs" Link="Compiler\ObjectWriter\WebCilObjectWriter.cs" />
     <Compile Include="..\..\Common\Compiler\ObjectWriter\WasmSymbolManager.cs" Link="Compiler\ObjectWriter\WasmSymbolManager.cs" />
     <Compile Include="..\..\Common\Compiler\ObjectWriter\WasmGlobalImports.cs" Link="Compiler\ObjectWriter\WasmGlobalImports.cs" />
@@ -405,6 +407,10 @@
     <Compile Include="PortableCallHelpers\PInvokeCollector.cs" />
     <Compile Include="PortableCallHelpers\PInvokeTableGenerator.cs" />
     <Compile Include="PortableCallHelpers\TypeNames.cs" />
+    <Compile Include="PortableCallHelpers\WasmObject\CallHelperDataNode.cs" />
+    <Compile Include="PortableCallHelpers\WasmObject\CallHelpersObjectEmitter.cs" />
+    <Compile Include="PortableCallHelpers\WasmObject\ConstantFunctionNode.cs" />
+    <Compile Include="PortableCallHelpers\WasmObject\InterpToNativeThunkNode.cs" />
     <Compile Include="JitInterface\WasmLowering.ReadyToRun.cs" />
     <Compile Include="ObjectWriter\TargetExtensions.cs" />
     <Compile Include="TypeSystem\MethodDescExtensions.cs" />

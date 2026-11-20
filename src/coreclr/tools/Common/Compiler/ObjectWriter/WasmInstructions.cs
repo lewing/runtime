@@ -298,6 +298,9 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
     {
         public static WasmExpr Get(int index) => new WasmIndexExpr(WasmOp.GlobalGet, checked((uint)index));
         public static WasmExpr Set(int index) => new WasmIndexExpr(WasmOp.GlobalSet, checked((uint)index));
+        // Relocatable forms, for objects the linker combines with others (the global's index is assigned at link time).
+        public static WasmExpr Get(ISymbolNode global) => new WasmLEBConstantReloc(WasmOp.GlobalGet, global, RelocType.WASM_GLOBAL_INDEX_LEB);
+        public static WasmExpr Set(ISymbolNode global) => new WasmLEBConstantReloc(WasmOp.GlobalSet, global, RelocType.WASM_GLOBAL_INDEX_LEB);
     }
 
     internal static class I32
@@ -313,6 +316,7 @@ namespace ILCompiler.ObjectWriter.WasmInstructions
         public static WasmExpr Load16_u(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Load16U, 2, offset);
         public static WasmExpr LoadWithRVAOffset(ISymbolNode symbolNode) => new WasmMemoryArgInstruction(WasmOp.I32Load, 4, 0, symbolNode);
         public static WasmExpr Store(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Store, 4, offset);
+        public static WasmExpr Store8(ulong offset) => new WasmMemoryArgInstruction(WasmOp.I32Store8, 1, offset);
     }
 
     internal static class I64
