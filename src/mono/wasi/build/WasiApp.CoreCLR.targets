@@ -245,9 +245,9 @@
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.sh</_WasiComponentLd>
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.cmd</_WasiComponentLd>
       <_WasiSysroot>$(WASI_SDK_PATH)share/wasi-sysroot</_WasiSysroot>
-      <!-- Experimental: crossgen2 writes the interpreter-to-native thunks, the P/Invoke tables and the ReadyToRun
-           image buffer as a relocatable wasm object (callhelpers.o) through the shared ObjectWriter, instead of C++
-           for clang. -->
+      <!-- Experimental: crossgen2 writes all the per-app call helpers (interpreter-to-native thunks, P/Invoke and
+           runtime helper tables, reverse thunks and the ReadyToRun image buffer) as a relocatable wasm object,
+           callhelpers.o, through the shared ObjectWriter, so the relink compiles no C++. -->
       <WasiEmitCallHelpersAsWasm Condition="'$(WasiEmitCallHelpersAsWasm)' == ''">false</WasiEmitCallHelpersAsWasm>
       <_WasiCallHelpersObject>$(_WasiRelinkObjDir)callhelpers.o</_WasiCallHelpersObject>
 
@@ -431,7 +431,8 @@
     <ItemGroup>
       <_WasiCallHelperSource Include="$(_WasiPInvokeTablePath)"        ObjectFile="$(_WasiRelinkObjDir)callhelpers-pinvoke.o"
                              Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
-      <_WasiCallHelperSource Include="$(_WasiReversePInvokeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-reverse.o" />
+      <_WasiCallHelperSource Include="$(_WasiReversePInvokeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-reverse.o"
+                             Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiInterpToNativeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-interp-to-managed.o"
                              Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiR2RImageBufferSource)"
@@ -439,7 +440,8 @@
                              Condition="'$(PublishReadyToRun)' == 'true' and '$(WasiEmitCallHelpersAsWasm)' != 'true'" />
     </ItemGroup>
 
-    <Exec Command="&quot;$(_WasiClangxx)&quot; &quot;@$(_WasiRelinkCompileRsp)&quot; -c &quot;%(_WasiCallHelperSource.Identity)&quot; -o &quot;%(_WasiCallHelperSource.ObjectFile)&quot;"
+    <Exec Condition="'@(_WasiCallHelperSource)' != ''"
+          Command="&quot;$(_WasiClangxx)&quot; &quot;@$(_WasiRelinkCompileRsp)&quot; -c &quot;%(_WasiCallHelperSource.Identity)&quot; -o &quot;%(_WasiCallHelperSource.ObjectFile)&quot;"
           WorkingDirectory="$(_WasiRelinkObjDir)" />
 
     <!-- 3. Link the wasihost host: host archive (libWasiHost.a) + runtime-pack static libs + the

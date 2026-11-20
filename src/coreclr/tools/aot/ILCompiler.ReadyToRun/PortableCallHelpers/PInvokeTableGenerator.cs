@@ -376,6 +376,109 @@ namespace ILCompiler.PortableCallHelpers
                 """);
         }
 
+        /// <summary>
+        /// Puts the callbacks in table order, assigns each its wrapper symbol, and rejects the ones a
+        /// wrapper can't be generated for.
+        /// </summary>
+        internal static void PrepareCallbacks(List<PInvokeCallback> callbacks)
+        {
+            var callbackNames = new HashSet<string>();
+            var keys = new HashSet<string>();
+            callbacks.Sort(new PInvokeCallbackComparer());
+            foreach (PInvokeCallback cb in callbacks)
+            {
+                RejectUnsupportedCallbackSignature(cb);
+                cb.EntrySymbol = FixedSymbolName(cb);
+
+                if (!callbackNames.Add(cb.EntrySymbol))
+                    throw new LogAsErrorException($"Two callbacks with the same symbol '{cb.EntrySymbol}' are not supported.");
+
+                if (!keys.Add(cb.Key))
+                    throw new LogAsErrorException($"Two callbacks with the same Name and number of arguments '{cb.Key}' are not supported.");
+
+                // That check only catches overloads of the same arity, which collide outright. Different
+                // arities produce distinct keys and distinct symbols, yet the export wrapper resolves its
+                // MethodDesc through LookupUnmanagedCallersOnlyMethodByName, which matches on the
+                // declaring type and the method name alone. Overloads are indistinguishable to it, so an
+                // export sharing its name with another callback would be handed whichever MethodDesc the
+                // walk reached first and would then call it with its own arguments.
+                //
+                // This is a stopgap for a lookup that cannot express what it means to ask. If the runtime
+                // ever resolves these unambiguously, this rejection should go away with it.
+                if (cb.IsExport)
+                    RejectAmbiguousExport(cb);
+            }
+        }
+
+        /// <summary>The C types of a callback's native wrapper, and how it returns its result.</summary>
+        internal static (string[] ParameterTypes, string ReturnType, bool ReturnsViaBuffer, bool HasResult) NativeCallbackSignature(PInvokeCallback cb)
+        {
+            string[] parameterTypes = ParameterTypes(cb.Parameters).Select(MapType).ToArray();
+            // A struct the wasm C ABI returns by reference arrives as a hidden leading pointer to
+            // caller-owned storage, with no return value, so the interpreter writes straight into it.
+            bool returnsViaBuffer = IsPassedByReference(cb.ReturnType);
+            bool hasResult = !cb.IsVoid && !returnsViaBuffer;
+            string returnType = returnsViaBuffer ? "void" : MapType(cb.ReturnType);
+            return (parameterTypes, returnType, returnsViaBuffer, hasResult);
+        }
+
+        internal static uint ReverseThunkHash(PInvokeCallback cb) => HashString(cb.Key);
+
+        private static void RejectUnsupportedCallbackSignature(PInvokeCallback cb)
+        {
+            List<string> loweredTokens = InteropSignature.ParseSignatureTokens(
+                InteropSignature.GetMethodSignature(cb.Method, WasmLowering.LoweringFlags.IsUnmanagedCallersOnly));
+            string token = null;
+            for (int i = 1; i < loweredTokens.Count; i++)
+            {
+                if (IsUnsupportedToken(loweredTokens[i]))
+                {
+                    token = loweredTokens[i];
+                    break;
+                }
+            }
+
+            if (token is null && !cb.IsVoid)
+            {
+                string returnToken = InteropSignature.GetAbiToken(cb.ReturnType);
+                if (IsUnsupportedToken(returnToken))
+                    token = returnToken;
+            }
+
+            if (token is not null)
+            {
+                throw new LogAsErrorException(
+                    $"UnmanagedCallersOnly callback '{cb.Method}' has unsupported signature token '{token}', which the generated native wrapper does not support.");
+            }
+
+            static bool IsUnsupportedToken(string token) =>
+                token is "V" || InteropSignature.IsMultiSlotToken(token);
+        }
+
+        // The runtime walks every [UnmanagedCallersOnly] method the type declares, so match that.
+        private static void RejectAmbiguousExport(PInvokeCallback cb)
+        {
+            List<string> ambiguous = [];
+            foreach (MethodDesc candidate in cb.Method.OwningType.GetMethods())
+            {
+                if (candidate != cb.Method
+                    && candidate.Name.StringEquals(cb.MethodName)
+                    && candidate.HasCustomAttribute("System.Runtime.InteropServices", "UnmanagedCallersOnlyAttribute"))
+                {
+                    ambiguous.Add(candidate.ToString());
+                }
+            }
+
+            if (ambiguous.Count == 0)
+                return;
+
+            ambiguous.Add(cb.Method.ToString());
+            ambiguous.Sort(StringComparer.Ordinal);
+
+            throw new LogAsErrorException(
+                $"Exported callback '{cb.EntryPoint}' cannot be resolved at run time: '{cb.TypeFullName}' declares more than one [UnmanagedCallersOnly] method named '{cb.MethodName}', and the runtime looks them up by name alone. Give them distinct names: {string.Join(", ", ambiguous)}");
+        }
+
         public void EmitNativeToInterp(TextWriter w, List<PInvokeCallback> callbacks)
         {
             // Generate the native->interpreter entry functions. Native code calls these directly, so
@@ -411,35 +514,12 @@ namespace ILCompiler.PortableCallHelpers
 
                 """);
 
-            var callbackNames = new HashSet<string>();
-            var keys = new HashSet<string>();
-            callbacks.Sort(new PInvokeCallbackComparer());
+            PrepareCallbacks(callbacks);
             foreach (PInvokeCallback cb in callbacks)
             {
-                RejectUnsupportedCallbackSignature(cb);
-                cb.EntrySymbol = FixedSymbolName(cb);
-
-                if (!callbackNames.Add(cb.EntrySymbol))
-                    throw new LogAsErrorException($"Two callbacks with the same symbol '{cb.EntrySymbol}' are not supported.");
-
-                if (!keys.Add(cb.Key))
-                    throw new LogAsErrorException($"Two callbacks with the same Name and number of arguments '{cb.Key}' are not supported.");
-
-                // That check only catches overloads of the same arity, which collide outright. Different
-                // arities produce distinct keys and distinct symbols, yet the export wrapper resolves its
-                // MethodDesc through LookupUnmanagedCallersOnlyMethodByName, which matches on the
-                // declaring type and the method name alone. Overloads are indistinguishable to it, so an
-                // export sharing its name with another callback would be handed whichever MethodDesc the
-                // walk reached first and would then call it with its own arguments.
-                //
-                // This is a stopgap for a lookup that cannot express what it means to ask. If the runtime
-                // ever resolves these unambiguously, this rejection should go away with it.
-                if (cb.IsExport)
-                    RejectAmbiguousExport(cb);
-
                 int parameterCount = cb.Parameters.Length;
                 string argsArgs = parameterCount > 0 ? "(int8_t*)args, sizeof(args)" : "nullptr, 0";
-                string[] parameterCTypes = ParameterTypes(cb.Parameters).Select(MapType).ToArray();
+                (string[] parameterCTypes, string returnCType, bool returnsViaBuffer, bool hasResult) = NativeCallbackSignature(cb);
                 // A cast converts a float numerically, while the slot has to carry its bits, so copy
                 // those instead. Every other type this emits reaches the slot unchanged through a cast.
                 bool CarriesBits(int i) => parameterCTypes[i] is "float" or "double";
@@ -447,11 +527,6 @@ namespace ILCompiler.PortableCallHelpers
                     ? $"\n\n    int64_t args[{parameterCount}] = {{ {string.Join(", ", Enumerable.Range(0, parameterCount).Select(i => CarriesBits(i) ? "0" : $"(int64_t)arg{i}"))} }};"
                       + string.Concat(Enumerable.Range(0, parameterCount).Where(CarriesBits).Select(i => $"\n    memcpy(&args[{i}], &arg{i}, sizeof(arg{i}));"))
                     : string.Empty;
-                // A struct the wasm C ABI returns by reference arrives as a hidden leading pointer to
-                // caller-owned storage, with no return value, so the interpreter writes straight into it.
-                bool returnsViaBuffer = IsPassedByReference(cb.ReturnType);
-                bool hasResult = !cb.IsVoid && !returnsViaBuffer;
-                string returnCType = returnsViaBuffer ? "void" : MapType(cb.ReturnType);
                 string retArg = returnsViaBuffer ? "(int8_t*)sret" : hasResult ? "(int8_t*)&result" : "nullptr";
                 string parametersDeclaration = string.Join(", ",
                     (returnsViaBuffer ? ["void * sret"] : Array.Empty<string>())
@@ -537,60 +612,9 @@ namespace ILCompiler.PortableCallHelpers
 
                 """);
 
-            // The runtime walks every [UnmanagedCallersOnly] method the type declares, so match that.
-            static void RejectAmbiguousExport(PInvokeCallback cb)
-            {
-                List<string> ambiguous = [];
-                foreach (MethodDesc candidate in cb.Method.OwningType.GetMethods())
-                {
-                    if (candidate != cb.Method
-                        && candidate.Name.StringEquals(cb.MethodName)
-                        && candidate.HasCustomAttribute("System.Runtime.InteropServices", "UnmanagedCallersOnlyAttribute"))
-                    {
-                        ambiguous.Add(candidate.ToString());
-                    }
-                }
 
-                if (ambiguous.Count == 0)
-                    return;
 
-                ambiguous.Add(cb.Method.ToString());
-                ambiguous.Sort(StringComparer.Ordinal);
 
-                throw new LogAsErrorException(
-                    $"Exported callback '{cb.EntryPoint}' cannot be resolved at run time: '{cb.TypeFullName}' declares more than one [UnmanagedCallersOnly] method named '{cb.MethodName}', and the runtime looks them up by name alone. Give them distinct names: {string.Join(", ", ambiguous)}");
-            }
-
-            static void RejectUnsupportedCallbackSignature(PInvokeCallback cb)
-            {
-                List<string> loweredTokens = InteropSignature.ParseSignatureTokens(
-                    InteropSignature.GetMethodSignature(cb.Method, WasmLowering.LoweringFlags.IsUnmanagedCallersOnly));
-                string token = null;
-                for (int i = 1; i < loweredTokens.Count; i++)
-                {
-                    if (IsUnsupportedToken(loweredTokens[i]))
-                    {
-                        token = loweredTokens[i];
-                        break;
-                    }
-                }
-
-                if (token is null && !cb.IsVoid)
-                {
-                    string returnToken = InteropSignature.GetAbiToken(cb.ReturnType);
-                    if (IsUnsupportedToken(returnToken))
-                        token = returnToken;
-                }
-
-                if (token is not null)
-                {
-                    throw new LogAsErrorException(
-                        $"UnmanagedCallersOnly callback '{cb.Method}' has unsupported signature token '{token}', which the generated native wrapper does not support.");
-                }
-
-                static bool IsUnsupportedToken(string token) =>
-                    token is "V" || InteropSignature.IsMultiSlotToken(token);
-            }
         }
 
         /// <summary>The linker symbol the native function is bound by.</summary>
@@ -648,7 +672,7 @@ namespace ILCompiler.PortableCallHelpers
             return $"    {importAttributes}{externKeyword}{returnType} {symbolName ?? nativeSymbol} ({string.Join(", ", parameterTypes)}){symbolAlias};";
         }
 
-        private string FixedSymbolName(PInvokeCallback cb)
+        private static string FixedSymbolName(PInvokeCallback cb)
         {
             string paramTypes = cb.Parameters.Length > 0
                 ? string.Join("_", ParameterTypes(cb.Parameters).Select(TypeToNameType))

@@ -37,6 +37,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             IReadOnlyCollection<string> interpToNativeSignatures,
             PInvokeTableGenerator pinvokeGenerator,
             PInvokeTableGenerator.PInvokeTable pinvokeTable,
+            List<PInvokeCallback> callbacks,
             uint? r2rImageSize,
             Logger logger)
         {
@@ -59,7 +60,9 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             var analyzer = new DependencyAnalyzer<NoLogStrategy<NodeFactory>, NodeFactory>(
                 factory, new SortableDependencyNode.ObjectNodeComparer(CompilerComparer.Instance));
             AddInterpToNativeThunks(factory, analyzer, interpToNativeSignatures);
-            new PInvokeTableEmitter(factory, analyzer, pinvokeGenerator).Add(pinvokeTable, context.Target);
+            var interop = new PInvokeTableEmitter(factory, analyzer, pinvokeGenerator);
+            interop.Add(pinvokeTable, context.Target);
+            interop.AddReverseThunks(callbacks);
             if (r2rImageSize is uint size)
                 AddR2RImageBuffer(factory, analyzer, size);
 
@@ -124,9 +127,9 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
     /// </summary>
     internal sealed class PInvokeTableEmitter(NodeFactory factory, DependencyAnalyzerBase<NodeFactory> analyzer, PInvokeTableGenerator generator)
     {
-        private const int PointerSize = 4;
-        private const int LibraryTableEntrySize = 3 * PointerSize; // { LibraryName, Entries, EntryCount }
-        private const int EntrySize = 2 * PointerSize;             // { name, method }
+        private const int PointerSize = CallHelperLayout.PointerSize;
+        private const int LibraryTableEntrySize = CallHelperLayout.LibraryTableEntrySize;
+        private const int EntrySize = CallHelperLayout.KeyValueSize;
 
         private readonly Dictionary<string, CallHelperDataNode> _strings = new(StringComparer.Ordinal);
         private readonly Dictionary<string, ExternFunctionSymbolNode> _functions = new(StringComparer.Ordinal);
@@ -152,7 +155,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                 Local.Get(2), Local.Get(0), Local.Get(3), I32.Const(EntrySize), I32.Mul, I32.Add, I32.Load(0),
                 ControlFlow.Call(strcmp), I32.Eqz,
                 Block.If(WasmBlockType.Empty),
-                Local.Get(0), Local.Get(3), I32.Const(EntrySize), I32.Mul, I32.Add, I32.Load(PointerSize), ControlFlow.Return,
+                Local.Get(0), Local.Get(3), I32.Const(EntrySize), I32.Mul, I32.Add, I32.Load(CallHelperLayout.ValueOffset), ControlFlow.Return,
                 Block.End,
                 Local.Get(3), I32.Const(1), I32.Add, Local.Set(3),
                 ControlFlow.Br(0),
@@ -227,6 +230,141 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             analyzer.AddRoot(new CallHelperFunctionNode(context, "_Z30ResolveRuntimeHelperEntrypointPKc",
                 new WasmFuncType(new WasmResultType([WasmValueType.I32]), new WasmResultType([WasmValueType.I32])),
                 [], helperBody), "runtime helper lookup");
+        }
+
+        /// <summary>
+        /// callhelpers-reverse.cpp: a native wrapper for each [UnmanagedCallersOnly] method, which looks its
+        /// MethodDesc up on first use and runs it in the interpreter, and g_ReverseThunks, which maps the
+        /// runtime's key for each method to its wrapper.
+        /// </summary>
+        public void AddReverseThunks(List<PInvokeCallback> callbacks)
+        {
+            const int SlotSize = 8; // each argument travels in an int64_t
+            const int ReverseThunkEntrySize = CallHelperLayout.ReverseThunkEntrySize;
+
+            TypeSystemContext context = factory.TypeSystemContext;
+            PInvokeTableGenerator.PrepareCallbacks(callbacks);
+
+            ExternFunctionSymbolNode lookup = Function("LookupUnmanagedCallersOnlyMethodByName", new WasmFuncType(
+                new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([])), s_boundBySymbol);
+            ExternFunctionSymbolNode execute = Function("ExecuteInterpretedMethodFromUnmanaged", new WasmFuncType(
+                new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([])), s_boundBySymbol);
+            ISymbolNode stackPointer = factory.GetWellKnownWasmGlobalSymbol(new Utf8String(WasmWellKnownGlobalSymbolNode.StackPointerName));
+
+            var table = new List<(uint Hash, ISymbolNode Source, ISymbolNode Target, ISymbolNode EntryPoint)>(callbacks.Count);
+            foreach (PInvokeCallback cb in callbacks)
+            {
+                (string[] parameterCTypes, string returnCType, bool returnsViaBuffer, bool hasResult) = PInvokeTableGenerator.NativeCallbackSignature(cb);
+                WasmFuncType type = NativeType(returnCType, returnsViaBuffer ? ["void *", .. parameterCTypes] : [.. parameterCTypes]);
+                int parameterCount = type.Params.Types.Length;
+                int firstArgument = returnsViaBuffer ? 1 : 0;
+                int frame = parameterCount; // local: the frame holding args[] and result
+                int r2r = parameterCount + 1; // local: the cached R2R entry point (exports only)
+
+                var methodDesc = new CallHelperDataNode($"MD_{cb.EntrySymbol}", CallHelperDataNode.Data, PointerSize, new byte[PointerSize]);
+                var wrapper = new CallHelperFunctionNode(context, $"Call_{cb.EntrySymbol}", type,
+                    cb.IsExport ? [WasmValueType.I32, WasmValueType.I32] : [WasmValueType.I32]);
+
+                List<WasmExpr> body =
+                [
+                    // Lazy lookup of the MethodDesc, for the function export scenario.
+                    I32.ConstAddress(methodDesc), I32.Load(0), I32.Eqz,
+                    Block.If(WasmBlockType.Empty),
+                    I32.ConstAddress(String($"{cb.TypeFullName}, {cb.AssemblyName}")), I32.ConstAddress(String(cb.MethodName)), I32.ConstAddress(methodDesc),
+                    ControlFlow.Call(lookup),
+                    Block.End,
+                ];
+
+                if (cb.IsExport)
+                {
+                    // Prefer the R2R native entry point when the callback was compiled (partial R2R); resolve once.
+                    var r2rCode = new CallHelperDataNode($"R2RCode_{cb.EntrySymbol}", CallHelperDataNode.Data, PointerSize, BitConverter.GetBytes(-1));
+                    ExternFunctionSymbolNode getR2RCode = Function("GetR2RNativeCodeForUnmanagedCallersOnly", new WasmFuncType(
+                        new WasmResultType([WasmValueType.I32]), new WasmResultType([WasmValueType.I32])), s_boundBySymbol);
+                    body.AddRange(
+                    [
+                        I32.ConstAddress(r2rCode), I32.Load(0), Local.Tee(r2r), I32.Const(-1), I32.Eq,
+                        Block.If(WasmBlockType.Empty),
+                        I32.ConstAddress(methodDesc), I32.Load(0), ControlFlow.Call(getR2RCode), Local.Set(r2r),
+                        I32.ConstAddress(r2rCode), Local.Get(r2r), I32.Store(0),
+                        Block.End,
+                        Local.Get(r2r),
+                        Block.If(WasmBlockType.Empty),
+                    ]);
+                    for (int i = 0; i < parameterCount; i++)
+                        body.Add(Local.Get(i));
+                    body.AddRange([Local.Get(r2r), ControlFlow.CallIndirect(factory.WasmTypeNode(new WasmSignature(type, CallHelperFunctionNode.SignatureString(type))), 0), ControlFlow.Return, Block.End]);
+                }
+
+                // int64_t args[N] and the result, on the shadow stack.
+                int argumentBytes = cb.Parameters.Length * SlotSize;
+                int frameSize = (argumentBytes + (hasResult ? SlotSize : 0) + 15) & ~15;
+                if (frameSize != 0)
+                    body.AddRange([Global.Get(stackPointer), I32.Const(frameSize), I32.Sub, Local.Tee(frame), Global.Set(stackPointer)]);
+
+                for (int i = 0; i < parameterCTypes.Length; i++)
+                {
+                    body.Add(Local.Get(frame));
+                    body.Add(Local.Get(firstArgument + i));
+                    // A cast widens integers; a float slot carries the value's bits, and the rest stays zero.
+                    switch (parameterCTypes[i])
+                    {
+                        case "int32_t": body.Add(I64.ExtendI32_s); break;
+                        case "uint32_t" or "void *" or "uintptr_t": body.Add(I64.ExtendI32_u); break;
+                        case "float": body.AddRange([I32.ReinterpretF32, I64.ExtendI32_u]); break;
+                        case "double": body.Add(I64.ReinterpretF64); break;
+                        case "int64_t" or "uint64_t": break;
+                        default: throw new InvalidOperationException($"No slot conversion for the C type '{parameterCTypes[i]}'.");
+                    }
+
+                    body.Add(I64.Store((ulong)(i * SlotSize)));
+                }
+
+                body.AddRange([I32.ConstAddress(methodDesc), I32.Load(0)]);
+                body.Add(argumentBytes != 0 ? Local.Get(frame) : I32.Const(0));
+                body.Add(I32.Const(argumentBytes));
+                if (returnsViaBuffer)
+                    body.Add(Local.Get(0));
+                else if (hasResult)
+                    body.AddRange([Local.Get(frame), I32.Const(argumentBytes), I32.Add]);
+                else
+                    body.Add(I32.Const(0));
+                body.Add(I32.ConstAddress(wrapper)); // (PCODE)&Call_X
+                body.Add(ControlFlow.Call(execute));
+
+                if (hasResult)
+                    body.AddRange([Local.Get(frame), Memory.Load(type.Returns.Types[0], (ulong)argumentBytes)]);
+                if (frameSize != 0)
+                    body.AddRange([Local.Get(frame), I32.Const(frameSize), I32.Add, Global.Set(stackPointer)]);
+
+                wrapper.Body = body.ToArray();
+
+                if (cb.IsExport)
+                {
+                    // extern "C" RET EntryPoint(params) { return Call_X(params); }
+                    var export = new List<WasmExpr>();
+                    for (int i = 0; i < parameterCount; i++)
+                        export.Add(Local.Get(i));
+                    export.Add(ControlFlow.Call(wrapper));
+                    analyzer.AddRoot(new CallHelperFunctionNode(context, cb.EntryPoint, type, [], export.ToArray()), "exported [UnmanagedCallersOnly] method");
+                }
+
+                table.Add((PInvokeTableGenerator.ReverseThunkHash(cb), String(cb.Key), methodDesc, wrapper));
+            }
+
+            byte[] data = new byte[Math.Max(table.Count, 1) * ReverseThunkEntrySize];
+            var references = new List<(int, ISymbolNode)>();
+            for (int i = 0; i < table.Count; i++)
+            {
+                int offset = i * ReverseThunkEntrySize;
+                BitConverter.TryWriteBytes(data.AsSpan(offset + CallHelperLayout.ReverseThunkHashOffset), table[i].Hash);
+                references.Add((offset + CallHelperLayout.ReverseThunkSourceOffset, table[i].Source));
+                references.Add((offset + CallHelperLayout.ReverseThunkTargetOffset, table[i].Target));
+                references.Add((offset + CallHelperLayout.ReverseThunkEntryPointOffset, table[i].EntryPoint));
+            }
+
+            analyzer.AddRoot(new CallHelperDataNode("g_ReverseThunks", CallHelperDataNode.ReadOnlyData, PointerSize, data, references.ToArray()), "reverse thunk table");
+            analyzer.AddRoot(CallHelperDataNode.UInt32("g_ReverseThunksCount", CallHelperDataNode.ReadOnlyData, (uint)table.Count), "reverse thunk count");
         }
 
         private ISymbolNode Native(PInvokeInfo pinvoke)

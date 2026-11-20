@@ -19,9 +19,9 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
         private readonly string _name;
         private readonly WasmSignature _signature;
         private readonly WasmValueType[] _locals;
-        private readonly WasmExpr[] _body;
+        private WasmExpr[] _body;
 
-        public CallHelperFunctionNode(TypeSystemContext context, string name, WasmFuncType type, WasmValueType[] locals, WasmExpr[] body)
+        public CallHelperFunctionNode(TypeSystemContext context, string name, WasmFuncType type, WasmValueType[] locals, WasmExpr[] body = null)
         {
             _context = context;
             _name = name;
@@ -29,6 +29,11 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             _locals = locals;
             _body = body;
         }
+
+        public WasmFuncType Type => _signature.FuncType;
+
+        /// <summary>Sets the body of a function whose body refers to the function itself.</summary>
+        public WasmExpr[] Body { set => _body = value; }
 
         /// <summary>The signature string <see cref="WasmLowering.RaiseSignature"/> reads for a native function of <paramref name="type"/>.</summary>
         public static string SignatureString(WasmFuncType type)

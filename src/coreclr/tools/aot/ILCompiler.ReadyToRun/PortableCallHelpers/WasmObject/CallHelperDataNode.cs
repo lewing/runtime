@@ -77,15 +77,15 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
         /// <summary>An array of <c>{ const char* key; void* value; }</c> pairs, as callhelpers.hpp declares them.</summary>
         public static CallHelperDataNode PointerPairTable(string name, IReadOnlyList<(ISymbolNode First, ISymbolNode Second)> entries)
         {
-            const int PointerSize = 4;
+            const int PointerSize = CallHelperLayout.PointerSize;
             var references = new List<(int, ISymbolNode)>(entries.Count * 2);
             for (int i = 0; i < entries.Count; i++)
             {
-                references.Add((i * 2 * PointerSize, entries[i].First));
-                references.Add(((i * 2 + 1) * PointerSize, entries[i].Second));
+                references.Add((i * CallHelperLayout.KeyValueSize + CallHelperLayout.KeyOffset, entries[i].First));
+                references.Add((i * CallHelperLayout.KeyValueSize + CallHelperLayout.ValueOffset, entries[i].Second));
             }
 
-            return new CallHelperDataNode(name, ReadOnlyData, PointerSize, new byte[entries.Count * 2 * PointerSize], references.ToArray());
+            return new CallHelperDataNode(name, ReadOnlyData, PointerSize, new byte[entries.Count * CallHelperLayout.KeyValueSize], references.ToArray());
         }
     }
 }
