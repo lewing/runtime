@@ -294,6 +294,11 @@ public class WasmInterpreterTransitions
         s_sideEffect = 0; self.InterpretedCallsR2RTakesS16AndInt(new S16 { A = 10, B = 20 }, A); Assert.Equal(30 + A, s_sideEffect); // MvTS16ip
         s_sideEffect = 0; InterpretedCallsR2RStaticTakesS16AndTwoInt(new S16 { A = 10, B = 20 }, A, B); Assert.Equal(30 + A + B, s_sideEffect); // MvS16iip
         Assert.Equal(30 + A + B + C, self.InterpretedCallsR2RTakesS16AndTwoInt(new S16 { A = 10, B = 20 }, A, B)); // MiTS16iip
+        Assert.Equal(ExpectedVector128, self.InterpretedCallsR2RVector128(Vector128.Create(A, B, C, 7), C));      // MVTVip
+        Assert.Equal(ExpectedVector256, self.InterpretedCallsR2RVector256(TestVector256, Wide));                 // MS32TV2lp
+        Assert.Equal(ExpectedVector512, self.InterpretedCallsR2RVector512(A, TestVector512));                   // MiTiV4p
+        Assert.Equal(ExpectedInt128, self.InterpretedCallsR2RInt128(C, TestInt128, TestUInt128));                // MS16Til2l2p
+        Assert.Equal(ExpectedMixed, InterpretedCallsR2RMixedVectors(7, TestVector128F, TestInt128, TestVector256D, -5)); // MiiVl2V2ip
 
         // 1- and 2-byte struct shapes (S1 / S2). These small structs travel by value in a single
         // slot and are the 'S1'/'S2' encodings the runtime spells for the return buffer and by-ref
@@ -317,6 +322,14 @@ public class WasmInterpreterTransitions
         s_sideEffect = 0; self.InterpretedVoid3IntS48(A, B, C, new S48 { A = 10, F = 20 }); Assert.Equal(A + B + C + 30, s_sideEffect);   // IvTiiiS48p
         s_sideEffect = 0; self.InterpretedVoid3IntS304(A, B, C, new S304 { L00 = 10, L37 = 20 }); Assert.Equal(A + B + C + 30, s_sideEffect); // IvTiiiS304p
         s_sideEffect = 0; self.InterpretedVoidVector128(Vector128.Create(A, B, C, 7)); Assert.Equal(A + 7, s_sideEffect);   // IvTVp
+
+        // Vectors and Int128 cross as v128 values or split across several wasm parameters (V2, V4, l2), and
+        // come back directly (v128) or through the return buffer. Results depend on every element's position.
+        Assert.Equal(ExpectedVector128, self.InterpretedVector128(Vector128.Create(A, B, C, 7), C));              // IVTVip
+        Assert.Equal(ExpectedVector256, self.InterpretedVector256(TestVector256, Wide));                         // IS32TV2lp
+        Assert.Equal(ExpectedVector512, self.InterpretedVector512(A, TestVector512));                           // IiTiV4p
+        Assert.Equal(ExpectedInt128, self.InterpretedInt128(C, TestInt128, TestUInt128));                        // IS16Til2l2p
+        Assert.Equal(ExpectedMixed, InterpretedMixedVectors(7, TestVector128F, TestInt128, TestVector256D, -5));  // IiiVl2V2ip
         Assert.Equal(Wide, self.InterpretedLongFromFloat(F32));                                                    // IlTfp
         Assert.Equal((long)A + B + C + A + B, self.InterpretedLongFrom5Int(A, B, C, A, B));                        // IlTiiiiip
         Assert.Equal(190L, self.InterpretedLongFrom19Int(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)); // IlTiiiiiiiiiiiiiiiiiiip
@@ -863,6 +876,51 @@ public class WasmInterpreterTransitions
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void InterpretedVoidVector128(Vector128<int> v) => s_sideEffect = v.GetElement(0) + v.GetElement(3);
 
+    private static readonly Vector256<int> TestVector256 = Vector256.Create(A, B, C, 1, 2, 3, 4, 5);
+    private static readonly Vector512<int> TestVector512 = Vector512.Create(Vector256.Create(1, 2, 3, 4, 5, 6, 7, 8), Vector256.Create(9, 10, 11, 12, 13, 14, 15, 16));
+    private static readonly Vector128<float> TestVector128F = Vector128.Create(1f, 2f, 3f, 4f);
+    private static readonly Vector256<double> TestVector256D = Vector256.Create(1.5, 2.5, 3.5, 4.5);
+    private static readonly Int128 TestInt128 = ((Int128)A << 64) | (uint)B;
+    private static readonly UInt128 TestUInt128 = ((UInt128)C << 90) + 3;
+
+    private static Vector128<int> ExpectedVector128 => Vector128.Create(A + C * 1, B + C * 2, C + C * 3, 7 + C * 4);
+    private static Vector256<int> ExpectedVector256 => VectorShapes.Vector256(TestVector256, Wide);
+    private static int ExpectedVector512 => A + 1 * 1 + 16 * 3;
+    private static Int128 ExpectedInt128 => TestInt128 * C + (Int128)TestUInt128;
+    private static int ExpectedMixed => 7 + (1 + 40) + A - B + (3 + 4) - 5;
+
+    // The arithmetic both directions share. It is compiled, so the interpreted methods above reach it
+    // through an interpreter -> R2R thunk too, after their caller's R2R -> interpreter one.
+    private static class VectorShapes
+    {
+        public static Vector128<int> Vector128(Vector128<int> v, int a) => v + System.Runtime.Intrinsics.Vector128.Create(a) * System.Runtime.Intrinsics.Vector128.Create(1, 2, 3, 4);
+        public static Vector256<int> Vector256(Vector256<int> v, long l) => v * System.Runtime.Intrinsics.Vector256.Create(1, 2, 3, 4, 5, 6, 7, 8) + System.Runtime.Intrinsics.Vector256.Create((int)(l >> 32));
+        public static int Vector512(int a, Vector512<int> v) => a + v.GetElement(0) + 3 * v.GetElement(15);
+        public static Int128 Int128(int a, Int128 x, UInt128 y) => x * a + (Int128)y;
+        public static int Mixed(byte b, Vector128<float> v, Int128 x, Vector256<double> w, short s)
+            => b + (int)(v.GetElement(0) + 10 * v.GetElement(3)) + (int)(x >> 64) - (int)(uint)x + (int)(w.GetElement(0) * 2 + w.GetElement(3)) + s;
+    }
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector128<int> InterpretedVector128(Vector128<int> v, int a) => VectorShapes.Vector128(v, a);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector256<int> InterpretedVector256(Vector256<int> v, long l) => VectorShapes.Vector256(v, l);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int InterpretedVector512(int a, Vector512<int> v) => VectorShapes.Vector512(a, v);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Int128 InterpretedInt128(int a, Int128 x, UInt128 y) => VectorShapes.Int128(a, x, y);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int InterpretedMixedVectors(byte b, Vector128<float> v, Int128 x, Vector256<double> w, short s) => VectorShapes.Mixed(b, v, x, w, s);
+
     [BypassReadyToRun]
     [MethodImpl(MethodImplOptions.NoInlining)]
     private long InterpretedLongFromFloat(float f) => f == F32 ? Wide : 0;
@@ -938,6 +996,41 @@ public class WasmInterpreterTransitions
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private int R2RInstanceTakesS16AndTwoInt(S16 s, int a, int b) => (int)(s.A + s.B) + a + b + _state; // MiTS16iip
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector128<int> InterpretedCallsR2RVector128(Vector128<int> v, int a) => R2RVector128(v, a);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector256<int> InterpretedCallsR2RVector256(Vector256<int> v, long l) => R2RVector256(v, l);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int InterpretedCallsR2RVector512(int a, Vector512<int> v) => R2RVector512(a, v);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Int128 InterpretedCallsR2RInt128(int a, Int128 x, UInt128 y) => R2RInt128(a, x, y);
+
+    [BypassReadyToRun]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int InterpretedCallsR2RMixedVectors(byte b, Vector128<float> v, Int128 x, Vector256<double> w, short s) => R2RMixedVectors(b, v, x, w, s);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector128<int> R2RVector128(Vector128<int> v, int a) => VectorShapes.Vector128(v, a);                    // MVTVip
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Vector256<int> R2RVector256(Vector256<int> v, long l) => VectorShapes.Vector256(v, l);                   // MS32TV2lp
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int R2RVector512(int a, Vector512<int> v) => VectorShapes.Vector512(a, v);                               // MiTiV4p
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Int128 R2RInt128(int a, Int128 x, UInt128 y) => VectorShapes.Int128(a, x, y);                            // MS16Til2l2p
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int R2RMixedVectors(byte b, Vector128<float> v, Int128 x, Vector256<double> w, short s) => VectorShapes.Mixed(b, v, x, w, s); // MiiVl2V2ip
 }
 
 internal class VirtualDelegateBase(int state)
