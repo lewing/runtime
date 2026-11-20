@@ -245,8 +245,9 @@
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.sh</_WasiComponentLd>
       <_WasiComponentLd Condition="'$(WasiUseManagedWasmLinker)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(_WasiRelinkObjDir)wasm-link.cmd</_WasiComponentLd>
       <_WasiSysroot>$(WASI_SDK_PATH)share/wasi-sysroot</_WasiSysroot>
-      <!-- Experimental: crossgen2 writes the interpreter-to-native thunks and the ReadyToRun image buffer as a
-           relocatable wasm object (callhelpers.o) through the shared ObjectWriter, instead of C++ for clang. -->
+      <!-- Experimental: crossgen2 writes the interpreter-to-native thunks, the P/Invoke tables and the ReadyToRun
+           image buffer as a relocatable wasm object (callhelpers.o) through the shared ObjectWriter, instead of C++
+           for clang. -->
       <WasiEmitCallHelpersAsWasm Condition="'$(WasiEmitCallHelpersAsWasm)' == ''">false</WasiEmitCallHelpersAsWasm>
       <_WasiCallHelpersObject>$(_WasiRelinkObjDir)callhelpers.o</_WasiCallHelpersObject>
 
@@ -424,7 +425,8 @@
     <WriteLinesToFile Lines="@(_WasiRelinkCompileFlags)" File="$(_WasiRelinkCompileRsp)" Overwrite="true" WriteOnlyWhenDifferent="true" />
 
     <ItemGroup>
-      <_WasiCallHelperSource Include="$(_WasiPInvokeTablePath)"        ObjectFile="$(_WasiRelinkObjDir)callhelpers-pinvoke.o" />
+      <_WasiCallHelperSource Include="$(_WasiPInvokeTablePath)"        ObjectFile="$(_WasiRelinkObjDir)callhelpers-pinvoke.o"
+                             Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiReversePInvokeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-reverse.o" />
       <_WasiCallHelperSource Include="$(_WasiInterpToNativeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-interp-to-managed.o"
                              Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />

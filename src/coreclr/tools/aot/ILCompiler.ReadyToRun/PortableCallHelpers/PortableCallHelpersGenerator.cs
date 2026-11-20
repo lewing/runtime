@@ -129,8 +129,13 @@ namespace ILCompiler.PortableCallHelpers
             foreach (PInvokeInfo entry in internalCallCollector.Entrypoints)
                 pinvokes.Add(entry);
 
-            WriteIfDifferent(Path.Combine(options.OutputDirectory, PInvokeFileName), log,
-                w => generator.EmitPInvokeTable(w, context.Target, context.SystemModule, options.PInvokeModules, pinvokes, options.PInvokeModuleLists));
+            PInvokeTableGenerator.PInvokeTable pinvokeTable = generator.BuildPInvokeTable(
+                context.Target, context.SystemModule, options.PInvokeModules, pinvokes, options.PInvokeModuleLists);
+            if (!options.EmitObject)
+            {
+                WriteIfDifferent(Path.Combine(options.OutputDirectory, PInvokeFileName), log,
+                    w => generator.WritePInvokeTable(w, context.Target, pinvokeTable));
+            }
 
             WriteIfDifferent(Path.Combine(options.OutputDirectory, ReversePInvokeFileName), log,
                 w => generator.EmitNativeToInterp(w, callbacks));
@@ -145,6 +150,8 @@ namespace ILCompiler.PortableCallHelpers
                     compilationGroup,
                     Path.Combine(options.OutputDirectory, WasmObject.CallHelpersObjectEmitter.FileName),
                     signatures.Keys,
+                    generator,
+                    pinvokeTable,
                     options.WasiR2RImageSize,
                     logger);
             }
