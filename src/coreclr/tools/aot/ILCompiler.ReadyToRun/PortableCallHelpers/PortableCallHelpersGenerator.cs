@@ -152,7 +152,7 @@ namespace ILCompiler.PortableCallHelpers
                     context,
                     compilationGroup,
                     Path.Combine(options.OutputDirectory, WasmObject.CallHelpersObjectEmitter.FileName),
-                    signatures.Keys,
+                    signatures,
                     generator,
                     pinvokeTable,
                     callbacks,
