@@ -7,6 +7,10 @@ using System.Linq;
 
 using ILCompiler.ObjectWriter;
 using Internal.JitInterface;
+using Microsoft.NET.WebAssembly.Binary.Writing;
+using ValType = Microsoft.NET.WebAssembly.Types.ValType;
+using System.Runtime.InteropServices;
+using System.Buffers;
 
 namespace ILCompiler.DependencyAnalysis.Wasm
 {
@@ -93,23 +97,6 @@ namespace ILCompiler.DependencyAnalysis.Wasm
             }
 
             return code;
-        }
-
-        public int EncodeSize()
-        {
-            uint sizeLength = DwarfHelper.SizeOfULEB128((ulong)_types.Length);
-            return (int)(sizeLength + (uint)_types.Length);
-        }
-
-        public int Encode(Span<byte> buffer)
-        {
-            int sizeLength = DwarfHelper.WriteULEB128(buffer, (ulong)_types.Length);
-            Span<byte> rest = buffer.Slice(sizeLength);
-            for (int i = 0; i < _types.Length; i++)
-            {
-                rest[i] = (byte)_types[i];
-            }
-            return (int)(sizeLength + (uint)_types.Length);
         }
 
         public int CompareTo(WasmResultType other) => MemoryExtensions.SequenceCompareTo(Types, other.Types);
@@ -233,21 +220,14 @@ namespace ILCompiler.DependencyAnalysis.Wasm
             return new WasmFuncType(ps, rs);
         }
 
-        public readonly int EncodeSize()
+        /// <summary>Encodes this type as a type-section entry.</summary>
+        public readonly byte[] Encode()
         {
-            return 1 + _params.EncodeSize() + _returns.EncodeSize();
-        }
-
-        public readonly int Encode(Span<byte> buffer)
-        {
-            int totalSize = EncodeSize();
-            buffer[0] = 0x60; // function type indicator
-
-            int paramSize = _params.Encode(buffer.Slice(1));
-            int returnSize = _returns.Encode(buffer.Slice(1 + paramSize));
-            Debug.Assert(totalSize == 1 + paramSize + returnSize);
-
-            return totalSize;
+            ArrayBufferWriter<byte> output = new();
+            new WasmModuleEntryWriter(output).FuncType(
+                MemoryMarshal.Cast<WasmValueType, ValType>(_params.Types),
+                MemoryMarshal.Cast<WasmValueType, ValType>(_returns.Types));
+            return output.WrittenSpan.ToArray();
         }
 
         public bool Equals(WasmFuncType other)

@@ -7,6 +7,7 @@ using System.IO;
 using ILCompiler.ObjectWriter.WasmInstructions;
 using Internal.TypeSystem;
 using Microsoft.NET.WebAssembly.Webcil;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -40,8 +41,7 @@ namespace ILCompiler.ObjectWriter
             }
         }
 
-        public int HeaderSize =>
-            WasmDataSegmentEncoding.GetHeaderSize(WasmDataSegmentType.Active, _initExpr);
+        public int HeaderSize => WasmDataSegmentEncoding.GetActiveHeaderSize(_initExpr.Bytes);
 
         public int FileAlignment => _alignment;
 
@@ -72,37 +72,26 @@ namespace ILCompiler.ObjectWriter
 
         public int EmitToStream(Stream outputFileStream)
         {
-            Span<byte> headerBuffer = stackalloc byte[HeaderSize];
-            int headerSize = WasmDataSegmentEncoding.EncodeHeader(
-                headerBuffer,
-                WasmDataSegmentType.Active,
-                _initExpr,
-                ContentSize);
-            Debug.Assert(headerSize == HeaderSize);
-            outputFileStream.Write(headerBuffer);
+            WasmDataSegmentEncoding.EmitActiveHeader(outputFileStream, _initExpr.Bytes, ContentSize);
 
-            long payloadStart = outputFileStream.Position;
-            WebcilEncoder.EmitHeader(_header, outputFileStream);
+            // Offsets are tracked here rather than read from the stream, which may not be seekable.
+            long payloadOffset = WebcilEncoder.EmitHeader(_header, outputFileStream);
 
             foreach (WebcilSection section in _sections)
             {
-                WebcilEncoder.EncodeSectionHeader(section.Header, outputFileStream);
+                payloadOffset += WebcilEncoder.EncodeSectionHeader(section.Header, outputFileStream);
             }
 
             foreach (WebcilSection section in _sections)
             {
-                long sectionStart = payloadStart + section.Header.PointerToRawData;
-                Debug.Assert(outputFileStream.Position <= sectionStart);
-                int padding = (int)(sectionStart - outputFileStream.Position);
-                WasmDataSegmentEncoding.EmitPadding(outputFileStream, padding);
-                section.EmitToStream(outputFileStream);
+                long sectionStart = section.Header.PointerToRawData;
+                Debug.Assert(payloadOffset <= sectionStart);
+                WasmDataSegmentEncoding.EmitPadding(outputFileStream, (int)(sectionStart - payloadOffset));
+                payloadOffset = sectionStart + section.EmitToStream(outputFileStream);
             }
 
-            long payloadEnd = payloadStart + RawContentSize;
-            Debug.Assert(outputFileStream.Position <= payloadEnd);
-            WasmDataSegmentEncoding.EmitPadding(
-                outputFileStream,
-                (int)(payloadEnd - outputFileStream.Position));
+            Debug.Assert(payloadOffset <= RawContentSize);
+            WasmDataSegmentEncoding.EmitPadding(outputFileStream, (int)(RawContentSize - payloadOffset));
             WasmDataSegmentEncoding.EmitPadding(outputFileStream, _paddingBytesCount);
 
             return EncodeSize();

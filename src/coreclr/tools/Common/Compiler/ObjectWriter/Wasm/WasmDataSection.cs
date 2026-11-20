@@ -8,12 +8,13 @@ using System.IO;
 using ILCompiler.DependencyAnalysis;
 using Internal.Text;
 using Internal.TypeSystem;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
     // WasmDataSection should be aligned to the maximum file alignment of its segments,
     // and each segment should be aligned to its own alignment within the section.
-    internal sealed class WasmDataSection : IWasmEmittable, IWasmSection
+    internal sealed class WasmDataSection : IWasmSection
     {
         private readonly List<IWasmDataSegment> _segments;
         private readonly Dictionary<IWasmDataSegment, (int Index, int ContentOffset)> _segmentLayouts = new();
@@ -26,7 +27,7 @@ namespace ILCompiler.ObjectWriter
         }
 
         public Utf8String Name { get; }
-        public WasmSectionType Type => WasmSectionType.Data;
+        public WasmSectionId Type => WasmSectionId.Data;
         public int SegmentCount => _segments.Count;
 
         /// <summary>
@@ -73,46 +74,26 @@ namespace ILCompiler.ObjectWriter
             return _segmentLayouts[segment].ContentOffset;
         }
 
-        // Webcil could shrink the header to a non-padded int, but in nativeaot this is the patch site of a reloc
-        private static int HeaderSize => 1 + Relocation.WASM_PADDED_RELOC_SIZE_32;
+        // The section's size field is padded so that segment file offsets don't depend on the content size.
+        // Webcil could use a minimal one, but in NativeAOT this is the patch site of a relocation.
+        private const int SizeFieldWidth = Relocation.WASM_PADDED_RELOC_SIZE_32;
+        private const int HeaderSize = 1 + SizeFieldWidth;
 
-        private int EncodeHeader(Span<byte> headerBuffer)
-        {
-            uint encodeLength = Relocation.WASM_PADDED_RELOC_SIZE_32;
-            headerBuffer[0] = (byte)Type;
-            DwarfHelper.WritePaddedULEB128(headerBuffer.Slice(1), (ulong)ContentSize);
-            return 1 + (int)encodeLength;
-        }
-
-        public int EncodeSize()
+        public int Emit(WasmModuleWriter writer)
         {
             // The active segment memory offset expression may change the size of a segment, so the layout must be
             // assigned before calculating the total size of the data section.
             AssignSegmentLayout();
-            return HeaderSize + ContentSize;
-        }
-
-        public int EmitToStream(Stream outputFileStream)
-        {
-            AssignSegmentLayout();
-            int size = 0;
-            Span<byte> headerBuffer = stackalloc byte[HeaderSize];
-            int wroteHeaderSize = EncodeHeader(headerBuffer);
-            Debug.Assert(wroteHeaderSize == HeaderSize);
-            outputFileStream.Write(headerBuffer);
-            size += wroteHeaderSize;
-
-            Span<byte> countBuffer = stackalloc byte[(int)DwarfHelper.SizeOfULEB128((ulong)_segments.Count)];
-            int countSize = DwarfHelper.WriteULEB128(countBuffer, (ulong)_segments.Count);
-            outputFileStream.Write(countBuffer.Slice(0, countSize));
-            size += countSize;
-
+            int index = writer.BeginSection(WasmSectionId.Data, ContentSize, SizeFieldWidth);
+            Span<byte> count = stackalloc byte[WasmLeb128.MaxLength];
+            writer.Write(count.Slice(0, WasmLeb128.WriteULeb128(count, (ulong)_segments.Count)));
             foreach (IWasmDataSegment segment in _segments)
             {
-                size += segment.EmitToStream(outputFileStream);
+                segment.EmitToStream(writer.ContentStream);
             }
 
-            return size;
+            writer.EndSection();
+            return index;
         }
 
         /// <summary>
@@ -128,7 +109,7 @@ namespace ILCompiler.ObjectWriter
             // Assign sizes to ensure each segment's content is aligned to its FileAlignment.
             // The first should have no alignment requirements - this simplifies that the alignment of the data section itself.
             Debug.Assert(_segments.Count == 0 || _segments[0].FileAlignment == 1);
-            int fileOffset = HeaderSize + (int)DwarfHelper.SizeOfULEB128((ulong)_segments.Count);
+            int fileOffset = HeaderSize + WasmLeb128.GetULeb128Size((ulong)_segments.Count);
             for (int i = 1; i < _segments.Count; i++)
             {
                 IWasmDataSegment segment = _segments[i];
@@ -143,7 +124,7 @@ namespace ILCompiler.ObjectWriter
             }
 
             int memoryOffset = 0;
-            int contentOffset = (int)DwarfHelper.SizeOfULEB128((ulong)_segments.Count);
+            int contentOffset = WasmLeb128.GetULeb128Size((ulong)_segments.Count);
             for (int i = 0; i < _segments.Count; i++)
             {
                 IWasmDataSegment segment = _segments[i];
