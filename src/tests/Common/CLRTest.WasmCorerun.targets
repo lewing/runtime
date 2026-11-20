@@ -241,15 +241,22 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
       <!-- The file the linker is asked to produce: the loader on browser, the module on WASI. -->
       <_WasmCorerunLinkOutput>$(OutDir)corerun.wasm</_WasmCorerunLinkOutput>
       <_WasmCorerunLinkOutput Condition="'$(TargetOS)' == 'browser'">$(OutDir)corerun.js</_WasmCorerunLinkOutput>
+      <_WasmCorerunEmitCallHelpersAsWasm Condition="'$(TargetOS)' == 'wasi' and '$(WasiEmitCallHelpersAsWasm)' == 'true'">true</_WasmCorerunEmitCallHelpersAsWasm>
     </PropertyGroup>
 
-    <ItemGroup Condition="'$(_WasmCorerunSkip)' != 'true'">
+    <ItemGroup Condition="'$(_WasmCorerunSkip)' != 'true' and '$(_WasmCorerunEmitCallHelpersAsWasm)' == 'true'">
+      <!-- Experimental (WasiEmitCallHelpersAsWasm): crossgen2 writes the call helpers as a wasm object. -->
+      <_WasmCorerunGeneratedObject Include="$(_WasmCorerunDir)callhelpers.o" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(_WasmCorerunSkip)' != 'true' and '$(_WasmCorerunEmitCallHelpersAsWasm)' != 'true'">
       <_WasmCorerunGeneratedSource Include="$(_WasmCorerunDir)callhelpers-pinvoke.cpp"
                                    ObjectFile="$(_WasmCorerunDir)callhelpers-pinvoke.o" />
       <_WasmCorerunGeneratedSource Include="$(_WasmCorerunDir)callhelpers-reverse.cpp"
                                    ObjectFile="$(_WasmCorerunDir)callhelpers-reverse.o" />
       <_WasmCorerunGeneratedSource Include="$(_WasmCorerunDir)callhelpers-interp-to-managed.cpp"
                                    ObjectFile="$(_WasmCorerunDir)callhelpers-interp-to-managed.o" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(_WasmCorerunSkip)' != 'true'">
 
       <!-- Track the kit payload itself, not just its response files: those name their inputs
            relatively and so do not change when the runtime is rebuilt, and a coreclr native
@@ -331,7 +338,7 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
           DependsOnTargets="_WasmResolveTestCorerunAssemblies;_WasmWriteTestCorerunInputManifest"
           Condition="'$(_WasmCorerunSkip)' != 'true'"
           Inputs="@(_WasmCorerunAssembly);@(_WasmCorerunNativeSource);@(_WasmCorerunTestLib);$(_WasmCorerunInputManifest);$(WasmCoreClrFrameworkPInvokeModuleListFile);@(_WasmCorerunGeneratorInput)"
-          Outputs="@(_WasmCorerunGeneratedSource)">
+          Outputs="@(_WasmCorerunGeneratedSource);@(_WasmCorerunGeneratedObject)">
     <MakeDir Directories="$(_WasmCorerunDir)" />
 
     <ItemGroup>
@@ -369,6 +376,7 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
       <_Crossgen2GeneratorArg Include="--targetos:$(TargetOS)" />
       <_Crossgen2GeneratorArg Include="--targetarch:wasm" />
       <_Crossgen2GeneratorArg Include="--generate-portable-callhelpers:$(_WasmCorerunDir)" />
+      <_Crossgen2GeneratorArg Include="--portable-callhelpers-object" Condition="'$(_WasmCorerunEmitCallHelpersAsWasm)' == 'true'" />
       <_Crossgen2GeneratorArg Include="@(_WasmCorerunPInvokeModule->'--directpinvoke:%(Identity)')" />
       <_Crossgen2GeneratorArg Include="@(_WasmCorerunManagedAssembly->'%(FullPath)')" />
     </ItemGroup>
@@ -379,7 +387,7 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
 
     <ItemGroup>
       <FileWrites Include="$(_Crossgen2GeneratorRsp)" />
-      <FileWrites Include="@(_WasmCorerunGeneratedSource)" />
+      <FileWrites Include="@(_WasmCorerunGeneratedSource);@(_WasmCorerunGeneratedObject)" />
     </ItemGroup>
   </Target>
 
@@ -392,7 +400,8 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
           Outputs="@(_WasmCorerunGeneratedSource->'%(ObjectFile)');@(_WasmCorerunNativeSource->'%(ObjectFile)')">
     <Message Importance="High" Text="$(MSBuildProjectName) -> compiling native sources and managed-to-native tables for a test-specific corerun" />
 
-    <Exec Command="&quot;$(_WasmCorerunCxx)&quot; $(_WasmCorerunToolArgs) &quot;@$(_WasmCorerunCompileRsp)&quot; -c &quot;%(_WasmCorerunGeneratedSource.Identity)&quot; -o &quot;%(_WasmCorerunGeneratedSource.ObjectFile)&quot;"
+    <Exec Condition="'@(_WasmCorerunGeneratedSource)' != ''"
+          Command="&quot;$(_WasmCorerunCxx)&quot; $(_WasmCorerunToolArgs) &quot;@$(_WasmCorerunCompileRsp)&quot; -c &quot;%(_WasmCorerunGeneratedSource.Identity)&quot; -o &quot;%(_WasmCorerunGeneratedSource.ObjectFile)&quot;"
           WorkingDirectory="$(WasmCorerunKitDir)"
           EnvironmentVariables="@(_WasmCorerunToolEnv)" />
 
@@ -423,12 +432,12 @@ against CORE_ROOT, and no SDK is involved. Only the generator task assembly is s
   <Target Name="_WasmLinkTestCorerun"
           DependsOnTargets="_WasmResolveTestCorerunInputs;_WasmWriteTestCorerunInputManifest"
           Condition="'$(_WasmCorerunSkip)' != 'true'"
-          Inputs="@(_WasmCorerunGeneratedSource->'%(ObjectFile)');@(_WasmCorerunNativeSource->'%(ObjectFile)');@(_WasmCorerunTestLib);@(_WasmCorerunCommonLib);@(_WasmCorerunKitLinkInput);$(_WasmCorerunLinkRsp);$(_WasmCorerunInputManifest)"
+          Inputs="@(_WasmCorerunGeneratedSource->'%(ObjectFile)');@(_WasmCorerunGeneratedObject);@(_WasmCorerunNativeSource->'%(ObjectFile)');@(_WasmCorerunTestLib);@(_WasmCorerunCommonLib);@(_WasmCorerunKitLinkInput);$(_WasmCorerunLinkRsp);$(_WasmCorerunInputManifest)"
           Outputs="@(_WasmCorerunOutput)">
     <Message Importance="High" Text="$(MSBuildProjectName) -> $(_WasmCorerunLinkOutput)" />
 
     <PropertyGroup>
-      <_WasmCorerunLinkInputs>@(_WasmCorerunGeneratedSource->'&quot;%(ObjectFile)&quot;', ' ') @(_WasmCorerunNativeSource->'&quot;%(ObjectFile)&quot;', ' ') @(_WasmCorerunTestLib->'&quot;%(FullPath)&quot;', ' ') @(_WasmCorerunCommonLib->'&quot;%(FullPath)&quot;', ' ')</_WasmCorerunLinkInputs>
+      <_WasmCorerunLinkInputs>@(_WasmCorerunGeneratedSource->'&quot;%(ObjectFile)&quot;', ' ') @(_WasmCorerunGeneratedObject->'&quot;%(FullPath)&quot;', ' ') @(_WasmCorerunNativeSource->'&quot;%(ObjectFile)&quot;', ' ') @(_WasmCorerunTestLib->'&quot;%(FullPath)&quot;', ' ') @(_WasmCorerunCommonLib->'&quot;%(FullPath)&quot;', ' ')</_WasmCorerunLinkInputs>
     </PropertyGroup>
 
     <Exec Command="&quot;$(_WasmCorerunCxx)&quot; $(_WasmCorerunToolArgs) $(_WasmCorerunLinkInputs) &quot;@$(_WasmCorerunLinkRsp)&quot; $(_WasmCorerunLinkToolArgs) -o &quot;$(_WasmCorerunLinkOutput)&quot;"
