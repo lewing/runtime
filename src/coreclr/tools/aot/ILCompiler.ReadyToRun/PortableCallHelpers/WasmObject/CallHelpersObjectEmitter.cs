@@ -34,7 +34,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             ReadyToRunCompilerContext context,
             ReadyToRunCompilationModuleGroupBase compilationGroup,
             string outputPath,
-            IReadOnlyCollection<string> interpToNativeSignatures,
+            IReadOnlyDictionary<string, MethodDesc> interpToNativeSignatures,
             PInvokeTableGenerator pinvokeGenerator,
             PInvokeTableGenerator.PInvokeTable pinvokeTable,
             List<PInvokeCallback> callbacks,
@@ -59,16 +59,18 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
 
             var analyzer = new DependencyAnalyzer<NoLogStrategy<NodeFactory>, NodeFactory>(
                 factory, new SortableDependencyNode.ObjectNodeComparer(CompilerComparer.Instance));
-            AddInterpToNativeThunks(factory, analyzer, interpToNativeSignatures);
+            // Callbacks are validated first, as the C++ generator does, so both report the same error first.
             var interop = new PInvokeTableEmitter(factory, analyzer, pinvokeGenerator);
-            interop.Add(pinvokeTable, context.Target);
             interop.AddReverseThunks(callbacks);
+            interop.Add(pinvokeTable, context.Target);
+            AddInterpToNativeThunks(factory, analyzer, interpToNativeSignatures);
             if (r2rImageSize is uint size)
                 AddR2RImageBuffer(factory, analyzer, size);
 
             analyzer.ComputeMarkedNodes();
             factory.SetMarkingComplete();
 
+            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             using FileStream stream = File.Create(outputPath);
             new WasmRelocatableObjectWriter(factory, ObjectWritingOptions.None)
                 .EmitObject(stream, analyzer.MarkedNodeList, dumper: null, logger);
@@ -76,16 +78,25 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
 
         // InterpToNativeGenerator: the CallFunc_* thunks and g_portableCallHelperThunks, which maps
         // "M" + signature to each one.
-        private static void AddInterpToNativeThunks(NodeFactory factory, DependencyAnalyzerBase<NodeFactory> analyzer, IReadOnlyCollection<string> signatures)
+        private static void AddInterpToNativeThunks(NodeFactory factory, DependencyAnalyzerBase<NodeFactory> analyzer, IReadOnlyDictionary<string, MethodDesc> signatures)
         {
-            string[] sorted = signatures.ToArray();
+            string[] sorted = signatures.Keys.ToArray();
             Array.Sort(sorted, StringComparer.Ordinal);
 
             var entries = new List<(ISymbolNode, ISymbolNode)>(sorted.Length);
             var thunks = new Dictionary<string, InterpToNativeThunkNode>(StringComparer.Ordinal);
             for (int i = 0; i < sorted.Length; i++)
             {
-                var thunk = new InterpToNativeThunkNode(factory, sorted[i]);
+                InterpToNativeThunkNode thunk;
+                try
+                {
+                    thunk = new InterpToNativeThunkNode(factory, sorted[i]);
+                }
+                catch (Exception e) when (e is InvalidSignatureCharException or LogAsErrorException)
+                {
+                    throw InterpToNativeGenerator.ThunkError(sorted[i], signatures[sorted[i]], e);
+                }
+
                 // Signatures that differ only in an async marker share one thunk, as the C++ does.
                 if (thunks.TryGetValue(thunk.Name, out InterpToNativeThunkNode existing))
                     thunk = existing;

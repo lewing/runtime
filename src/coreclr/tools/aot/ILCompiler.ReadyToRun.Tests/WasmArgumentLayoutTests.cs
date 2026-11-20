@@ -910,12 +910,16 @@ public class WasmArgumentLayoutTests
     }
 
     [Theory]
-    [InlineData("int", "System.Int128", "l2")]
-    [InlineData("System.Int128", "int", "l2")]
-    [InlineData("int", "System.Runtime.Intrinsics.Vector128<int>", "V")]
-    [InlineData("System.Runtime.Intrinsics.Vector128<int>", "int", "V")]
+    [InlineData("int", "System.Int128", "l2", false)]
+    [InlineData("System.Int128", "int", "l2", false)]
+    [InlineData("int", "System.Runtime.Intrinsics.Vector128<int>", "V", false)]
+    [InlineData("System.Runtime.Intrinsics.Vector128<int>", "int", "V", false)]
+    [InlineData("int", "System.Int128", "l2", true)]
+    [InlineData("System.Int128", "int", "l2", true)]
+    [InlineData("int", "System.Runtime.Intrinsics.Vector128<int>", "V", true)]
+    [InlineData("System.Runtime.Intrinsics.Vector128<int>", "int", "V", true)]
     public void PortableCallHelpersGeneratorRejectsUnsupportedSignatureTokens(
-        string returnType, string parameterType, string expectedToken)
+        string returnType, string parameterType, string expectedToken, bool emitObject)
     {
         string source = $$"""
             using System;
@@ -928,10 +932,37 @@ public class WasmArgumentLayoutTests
             }
             """;
 
-        AssertPortableCallHelpersGeneratorRejects(source, $"has unsupported signature token '{expectedToken}'");
+        AssertPortableCallHelpersGeneratorRejects(source, $"has unsupported signature token '{expectedToken}'", emitObject);
     }
 
-    private void AssertPortableCallHelpersGeneratorRejects(string source, string expectedError)
+    // P/Invokes reach the interpreter-to-native thunks, which can't pass multi-slot or V128 values either.
+    // (A multi-slot return is fine: it comes back through a hidden pointer.)
+    [Theory]
+    [InlineData("int", "System.Int128", "Multi-slot signature token 'l2'", false)]
+    [InlineData("int", "System.Runtime.Intrinsics.Vector128<int>", "which interop thunks cannot pass", false)]
+    [InlineData("System.Runtime.Intrinsics.Vector128<int>", "int", "which interop thunks cannot pass", false)]
+    [InlineData("int", "System.Int128", "Multi-slot signature token 'l2'", true)]
+    [InlineData("int", "System.Runtime.Intrinsics.Vector128<int>", "which interop thunks cannot pass", true)]
+    [InlineData("System.Runtime.Intrinsics.Vector128<int>", "int", "which interop thunks cannot pass", true)]
+    public void PortableCallHelpersGeneratorRejectsUnsupportedPInvokeSignatures(
+        string returnType, string parameterType, string expectedError, bool emitObject)
+    {
+        string source = $$"""
+            using System;
+            using System.Runtime.InteropServices;
+
+            public static class Imports
+            {
+                [DllImport("libSystem.Native", EntryPoint = "native_function")]
+                public static extern {{returnType}} Native({{parameterType}} value);
+            }
+            """;
+
+        AssertPortableCallHelpersGeneratorRejects(source, "Cannot generate an interop thunk for '[Callbacks]Imports.Native(", emitObject);
+        AssertPortableCallHelpersGeneratorRejects(source, expectedError, emitObject);
+    }
+
+    private void AssertPortableCallHelpersGeneratorRejects(string source, string expectedError, bool emitObject = false)
     {
         string workingDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(workingDirectory);
@@ -942,8 +973,9 @@ public class WasmArgumentLayoutTests
             var options = new PortableCallHelpersGeneratorOptions
             {
                 OutputDirectory = Path.Combine(workingDirectory, "generated"),
-                TargetOS = "browser",
+                TargetOS = emitObject ? "wasi" : "browser",
                 PInvokeModules = new[] { "libSystem.Native" },
+                EmitObject = emitObject,
             };
 
             var log = new StringWriter();
@@ -952,6 +984,8 @@ public class WasmArgumentLayoutTests
 
             Assert.Equal(1, exitCode);
             Assert.Contains(expectedError, log.ToString());
+            Assert.False(File.Exists(Path.Combine(options.OutputDirectory, "callhelpers.o")) && new FileInfo(Path.Combine(options.OutputDirectory, "callhelpers.o")).Length != 0,
+                "a rejected signature must not leave an object behind");
         }
         finally
         {

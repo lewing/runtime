@@ -103,16 +103,9 @@ namespace ILCompiler.PortableCallHelpers
 
                         """);
                 }
-                catch (InvalidSignatureCharException e)
+                catch (Exception e) when (e is InvalidSignatureCharException or LogAsErrorException)
                 {
-                    throw new LogAsErrorException(
-                        $"Cannot generate an interop thunk for '{cookies[signature]}': its signature '{signature}' contains {WasmLowering.DescribeSigChar(e.Char)}, " +
-                        "which interop thunks cannot pass. Take it by reference, or wrap it in a blittable struct.");
-                }
-                catch (LogAsErrorException e)
-                {
-                    // The only place that still knows which method the signature came from.
-                    throw new LogAsErrorException($"Cannot generate an interop thunk for '{cookies[signature]}': {e.Message}");
+                    throw ThunkError(signature, cookies[signature], e);
                 }
             }
 
@@ -178,6 +171,19 @@ namespace ILCompiler.PortableCallHelpers
                     tokens.RemoveAt(asyncMarkerIndex);
             }
         }
+
+        /// <summary>
+        /// The build error for a signature no interop thunk can be generated for: V128 values and types passed by
+        /// value across several wasm parameters (multi-slot tokens such as <c>l2</c>) are not supported.
+        /// </summary>
+        /// <remarks>The only place that still knows which method the signature came from.</remarks>
+        internal static LogAsErrorException ThunkError(string signature, MethodDesc method, Exception e) => e switch
+        {
+            InvalidSignatureCharException c => new LogAsErrorException(
+                $"Cannot generate an interop thunk for '{method}': its signature '{signature}' contains {WasmLowering.DescribeSigChar(c.Char)}, " +
+                "which interop thunks cannot pass. Take it by reference, or wrap it in a blittable struct."),
+            _ => new LogAsErrorException($"Cannot generate an interop thunk for '{method}': {e.Message}"),
+        };
 
         internal static string CallFuncName(List<string> args, string result, bool isPortableEntryPointCall)
         {

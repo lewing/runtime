@@ -694,7 +694,10 @@ namespace ILCompiler.PortableCallHelpers
             if (!type.IsValueType || type.IsPrimitive || type.IsEnum || type is FunctionPointerType)
                 return false;
 
-            return InteropSignature.GetAbiToken(type)[0] is 'S' or 'A';
+            // A multi-slot type (Int128, Vector256) travels by value across several parameters, which
+            // the thunks reject, but is returned through a hidden pointer like any other aggregate.
+            string token = InteropSignature.GetAbiToken(type);
+            return token[0] is 'S' or 'A' || InteropSignature.IsMultiSlotToken(token);
         }
 
         private static string TypeToNameType(TypeDesc type)
