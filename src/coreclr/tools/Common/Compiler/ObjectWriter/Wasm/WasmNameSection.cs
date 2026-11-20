@@ -3,10 +3,10 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using Internal.Text;
+using Microsoft.NET.WebAssembly.Binary;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -20,14 +20,10 @@ namespace ILCompiler.ObjectWriter
     /// stripped when size matters, so it is the only one of the three properties - loadable at scale,
     /// named, and small - that does not cost the other two.
     /// </remarks>
-    internal sealed class WasmNameSection : IWasmEmittable
+    internal sealed class WasmNameSection : IWasmSection
     {
-        private const byte FunctionNameSubsectionId = 1;
-        private static ReadOnlySpan<byte> SectionName => "name"u8;
-
         private readonly WasmSymbol[] _functionSymbols;
-        private readonly int _subsectionSize;
-        private readonly int _payloadSize;
+        private readonly long _entriesSize;
 
         public WasmNameSection(IEnumerable<WasmSymbol> functionSymbols)
         {
@@ -36,64 +32,32 @@ namespace ILCompiler.ObjectWriter
             // Sized in a first pass so that the payload can be written straight to the output stream.
             // At framework scale the payload is tens of megabytes, so buffering it would put several
             // copies of it on the large object heap.
-            long nameMapSize = 0;
             foreach (WasmSymbol symbol in _functionSymbols)
             {
-                int nameLength = symbol.Name.Length;
-                nameMapSize += DwarfHelper.SizeOfULEB128((ulong)symbol.Index)
-                    + DwarfHelper.SizeOfULEB128((ulong)nameLength)
-                    + nameLength;
+                _entriesSize += NameMapWriter.GetEntrySize((uint)symbol.Index, symbol.Name.Length);
             }
-
-            _subsectionSize = checked((int)(DwarfHelper.SizeOfULEB128((ulong)_functionSymbols.Length) + nameMapSize));
-            _payloadSize = checked(
-                (int)DwarfHelper.SizeOfULEB128((ulong)SectionName.Length) + SectionName.Length +
-                1 + // subsection id
-                (int)DwarfHelper.SizeOfULEB128((ulong)_subsectionSize) + _subsectionSize);
         }
 
         /// <summary>Number of functions named by this section.</summary>
         public int FunctionCount => _functionSymbols.Length;
 
-        public int EncodeSize() =>
-            1 + (int)DwarfHelper.SizeOfULEB128((ulong)_payloadSize) + _payloadSize;
+        public WasmSectionId Type => WasmSectionId.Custom;
 
-        public int EmitToStream(Stream outputFileStream)
+        public int Emit(WasmModuleWriter writer)
         {
-            outputFileStream.WriteByte((byte)WasmSectionType.Custom);
-            WriteULEB128(outputFileStream, (ulong)_payloadSize);
+            int index = writer.BeginCustomSection("name"u8, NameMapWriter.GetSubsectionSize(_functionSymbols.Length, _entriesSize));
 
-            WriteName(outputFileStream, SectionName);
-            outputFileStream.WriteByte(FunctionNameSubsectionId);
-            WriteULEB128(outputFileStream, (ulong)_subsectionSize);
-            WriteULEB128(outputFileStream, (ulong)_functionSymbols.Length);
-
-            // The name map must be sorted by index and free of duplicates. GetDefinitions already
-            // orders by index, so this only asserts rather than re-sorting a very large sequence.
-            int previousIndex = -1;
+            // The name map must be sorted by index and free of duplicates, which NameMapWriter checks. GetDefinitions
+            // already orders by index.
+            NameMapWriter functionNames = new(writer, NameSubsectionId.Function, _functionSymbols.Length, _entriesSize);
             foreach (WasmSymbol symbol in _functionSymbols)
             {
-                Debug.Assert(symbol.Index > previousIndex, "Function name map must be sorted by index and duplicate-free");
-                previousIndex = symbol.Index;
-
-                WriteULEB128(outputFileStream, (ulong)symbol.Index);
-                WriteName(outputFileStream, symbol.Name.AsSpan());
+                functionNames.Write((uint)symbol.Index, symbol.Name.AsSpan());
             }
 
-            return EncodeSize();
-        }
-
-        private static void WriteName(Stream stream, ReadOnlySpan<byte> utf8Name)
-        {
-            WriteULEB128(stream, (ulong)utf8Name.Length);
-            stream.Write(utf8Name);
-        }
-
-        private static void WriteULEB128(Stream stream, ulong value)
-        {
-            Span<byte> buffer = stackalloc byte[(int)DwarfHelper.SizeOfULEB128(value)];
-            int written = DwarfHelper.WriteULEB128(buffer, value);
-            stream.Write(buffer.Slice(0, written));
+            functionNames.Complete();
+            writer.EndSection();
+            return index;
         }
     }
 }

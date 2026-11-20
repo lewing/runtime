@@ -5,7 +5,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using ILCompiler.DependencyAnalysis;
-using ILCompiler.ObjectWriter.WasmInstructions;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.ObjectWriter
 {
@@ -77,41 +77,25 @@ namespace ILCompiler.ObjectWriter
 
     internal static class WasmDataSegmentEncoding
     {
-        public static int GetHeaderSize(
-            WasmDataSegmentType type,
-            WasmInstructionGroup initExpr)
+        // Segment size fields are padded so that a header's length doesn't depend on its content size, which the
+        // file alignment of segments needs. In NativeAOT objects the size is also a relocation site.
+        private const int SizeFieldWidth = Relocation.WASM_PADDED_RELOC_SIZE_32;
+
+        public static int GetPassiveHeaderSize() => DataSegmentEncoder.GetPassiveHeaderSize(0, SizeFieldWidth);
+
+        public static int GetActiveHeaderSize(ReadOnlySpan<byte> offsetExpression) =>
+            DataSegmentEncoder.GetActiveHeaderSize(offsetExpression, 0, SizeFieldWidth);
+
+        public static void EmitPassiveHeader(Stream outputFileStream, int contentSize)
         {
-            return type switch
-            {
-                WasmDataSegmentType.Active =>
-                    (int)DwarfHelper.SizeOfULEB128((ulong)type) +
-                    initExpr.EncodeSize() +
-                    Relocation.WASM_PADDED_RELOC_SIZE_32,
-                WasmDataSegmentType.Passive =>
-                    (int)DwarfHelper.SizeOfULEB128((ulong)type) +
-                    Relocation.WASM_PADDED_RELOC_SIZE_32,
-                _ => throw new NotSupportedException(),
-            };
+            Span<byte> header = stackalloc byte[DataSegmentEncoder.MaxHeaderLength];
+            outputFileStream.Write(header.Slice(0, DataSegmentEncoder.EncodePassiveHeader(header, contentSize, SizeFieldWidth)));
         }
 
-        public static int EncodeHeader(
-            Span<byte> headerBuffer,
-            WasmDataSegmentType type,
-            WasmInstructionGroup initExpr,
-            int contentSize)
+        public static void EmitActiveHeader(Stream outputFileStream, ReadOnlySpan<byte> offsetExpression, int contentSize)
         {
-            int length = DwarfHelper.WriteULEB128(headerBuffer, (ulong)type);
-            Debug.Assert(length == 1);
-            if (type == WasmDataSegmentType.Active)
-            {
-                length += initExpr.Encode(headerBuffer.Slice(length));
-            }
-
-            Debug.Assert(headerBuffer.Slice(length).Length == Relocation.WASM_PADDED_RELOC_SIZE_32);
-            // File alignment of data segments requires that the header doesn't change size based on the content size,
-            // so we use a padded ULEB128 here.
-            DwarfHelper.WritePaddedULEB128(headerBuffer.Slice(length), (ulong)contentSize);
-            return headerBuffer.Length;
+            Span<byte> header = stackalloc byte[DataSegmentEncoder.MaxHeaderLength];
+            outputFileStream.Write(header.Slice(0, DataSegmentEncoder.EncodeActiveHeader(header, offsetExpression, contentSize, SizeFieldWidth)));
         }
 
         public static void EmitPadding(Stream outputFileStream, int padding)

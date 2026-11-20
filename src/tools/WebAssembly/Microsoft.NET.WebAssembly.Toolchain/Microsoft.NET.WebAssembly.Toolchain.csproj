@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    WebAssembly binary encoding (instructions, LEB128, sections, linking metadata) used by the
+    ILCompiler and crossgen2 ObjectWriters. Subset of the managed toolchain in Blazor-Playground/nesm.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsTrimmable>true</IsTrimmable>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+</Project>

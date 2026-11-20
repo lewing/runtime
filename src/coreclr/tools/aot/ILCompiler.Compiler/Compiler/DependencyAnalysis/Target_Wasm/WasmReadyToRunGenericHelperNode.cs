@@ -10,6 +10,7 @@ using ILCompiler.ObjectWriter.WasmInstructions;
 
 using Internal.JitInterface;
 using Internal.TypeSystem;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler.DependencyAnalysis
 {

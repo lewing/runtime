@@ -5,7 +5,6 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Numerics;
-using ILCompiler.ObjectWriter.WasmInstructions;
 using Internal.Text;
 
 namespace ILCompiler.ObjectWriter
@@ -33,25 +32,17 @@ namespace ILCompiler.ObjectWriter
 
         public Utf8String Name { get; }
         public int FileAlignment { get; }
-        public int HeaderSize => WasmDataSegmentEncoding.GetHeaderSize(WasmDataSegmentType.Passive, initExpr: null);
+        public int HeaderSize => WasmDataSegmentEncoding.GetPassiveHeaderSize();
         public int ContentSize => checked(_contents.Length + _paddingBytesCount);
 
         public int EncodeSize() => HeaderSize + ContentSize;
 
         public int EmitToStream(Stream outputFileStream)
         {
-            Span<byte> headerBuffer = stackalloc byte[HeaderSize];
-            int headerSize = WasmDataSegmentEncoding.EncodeHeader(
-                headerBuffer,
-                WasmDataSegmentType.Passive,
-                initExpr: null,
-                ContentSize);
-            Debug.Assert(headerSize == HeaderSize);
-
-            outputFileStream.Write(headerBuffer);
+            WasmDataSegmentEncoding.EmitPassiveHeader(outputFileStream, ContentSize);
             outputFileStream.Write(_contents);
             WasmDataSegmentEncoding.EmitPadding(outputFileStream, _paddingBytesCount);
-            return headerSize + _contents.Length + _paddingBytesCount;
+            return EncodeSize();
         }
 
         public int GetMemoryAddressOfOffset(int offsetInSegment)

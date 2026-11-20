@@ -11,6 +11,7 @@ using ILCompiler.ObjectWriter;
 using ILCompiler.ObjectWriter.WasmInstructions;
 using Internal.JitInterface;
 using Internal.Text;
+using Microsoft.NET.WebAssembly.Binary.Writing;
 
 namespace ILCompiler;
 
@@ -187,12 +188,12 @@ internal sealed class DeferredWasmCallRewriter(ReadyToRunCodegenCompilation comp
                 }
 
                 ISymbolNode imageBase = factory.GetWellKnownWasmGlobalSymbol(new Utf8String(WasmWellKnownGlobalSymbolNode.ImageBaseName));
-                bool tailCall = original.Data[relocation.Offset - 1] == (byte)WasmExprKind.ReturnCall;
+                bool tailCall = original.Data[relocation.Offset - 1] == (byte)WasmOp.ReturnCall;
                 edits.Add(EncodeEdit(instructionOffset, DeferredCallLength,
-                    new WasmLEBConstantReloc(WasmExprKind.GlobalGet, imageBase, RelocType.WASM_GLOBAL_INDEX_LEB),
+                    new WasmLEBConstantReloc(WasmOp.GlobalGet, imageBase, RelocType.WASM_GLOBAL_INDEX_LEB),
                     I32.LoadWithRVAOffset(call.Fallback), Local.Tee(scratchLocal), Local.Get(scratchLocal), I32.Load(0),
                     new WasmIndirectCallInstruction(
-                        tailCall ? WasmExprKind.ReturnCallIndirect : WasmExprKind.CallIndirect,
+                        tailCall ? WasmOp.ReturnCallIndirect : WasmOp.CallIndirect,
                         call.Signature, 0)));
             }
         }
@@ -256,7 +257,7 @@ internal sealed class DeferredWasmCallRewriter(ReadyToRunCodegenCompilation comp
             newFrames[i] = new FrameInfo(frame.Flags, start, end, frame.BlobData);
             if (edits.Count != 0)
             {
-                DwarfHelper.WritePaddedULEB128(code.AsSpan(start, BodySizePrefixLength), checked((ulong)(end - start - BodySizePrefixLength)));
+                WasmLeb128.WritePaddedULeb128(code.AsSpan(start, BodySizePrefixLength), checked((ulong)(end - start - BodySizePrefixLength)));
             }
         }
 
@@ -317,14 +318,14 @@ internal sealed class DeferredWasmCallRewriter(ReadyToRunCodegenCompilation comp
 
         bool extendLastGroup = groupCount != 0 && lastGroupType == (byte)WasmValueType.I32;
         int newGroupCount = groupCount + (extendLastGroup ? 0 : 1);
-        int prefixSize = checked((int)DwarfHelper.SizeOfULEB128((ulong)newGroupCount));
+        int prefixSize = WasmLeb128.GetULeb128Size((ulong)newGroupCount);
         int copiedLength = (extendLastGroup ? lastGroupStart : position) - groupsStart;
         int appendedCount = extendLastGroup ? checked(lastGroupCount + 1) : 1;
-        int appendedSize = checked((int)DwarfHelper.SizeOfULEB128((ulong)appendedCount) + 1);
+        int appendedSize = WasmLeb128.GetULeb128Size((ulong)appendedCount) + 1;
         byte[] declarations = new byte[checked(prefixSize + copiedLength + appendedSize)];
-        DwarfHelper.WriteULEB128(declarations, (ulong)newGroupCount);
+        WasmLeb128.WriteULeb128(declarations, (ulong)newGroupCount);
         code.AsSpan(groupsStart, copiedLength).CopyTo(declarations.AsSpan(prefixSize));
-        DwarfHelper.WriteULEB128(declarations.AsSpan(prefixSize + copiedLength), (ulong)appendedCount);
+        WasmLeb128.WriteULeb128(declarations.AsSpan(prefixSize + copiedLength), (ulong)appendedCount);
         declarations[^1] = (byte)WasmValueType.I32;
         edits.Add(new Edit(start, position - start, declarations, []));
 
@@ -337,9 +338,7 @@ internal sealed class DeferredWasmCallRewriter(ReadyToRunCodegenCompilation comp
     // Decode a count from the locals prefix, leaving the cursor at the next field.
     private static int ReadUnsigned(byte[] code, ref int position)
     {
-        int value = checked((int)DwarfHelper.ReadULEB128(code.AsSpan(position), out int count));
-        position += count;
-        return value;
+        return checked((int)WasmLeb128.ReadU32(code, ref position));
     }
 
     // Check the instruction-boundary assumptions needed to replace the identity
@@ -348,36 +347,15 @@ internal sealed class DeferredWasmCallRewriter(ReadyToRunCodegenCompilation comp
     private static void AssertDeferredCall(byte[] code, int callOffset)
     {
         Debug.Assert(callOffset >= RelocInstructionLength + 1);
-        Debug.Assert(code[callOffset - RelocInstructionLength - 1] == (byte)WasmExprKind.I32Const);
-        Debug.Assert(code[callOffset - 1] is (byte)WasmExprKind.Call or (byte)WasmExprKind.ReturnCall);
+        Debug.Assert(code[callOffset - RelocInstructionLength - 1] == (byte)WasmOp.I32Const);
+        Debug.Assert(code[callOffset - 1] is (byte)WasmOp.Call or (byte)WasmOp.ReturnCall);
     }
 
     // Encode a replacement independently of its final position, keeping its
     // relocations relative to the replacement for later rebasing.
     private static Edit EncodeEdit(int offset, int length, params ReadOnlySpan<WasmExpr> instructions)
     {
-        int byteCount = 0;
-        int relocationCount = 0;
-        foreach (WasmExpr instruction in instructions)
-        {
-            byteCount = checked(byteCount + instruction.EncodeSize());
-            relocationCount = checked(relocationCount + instruction.EncodeRelocationCount());
-        }
-        byte[] bytes = new byte[byteCount];
-        var relocations = new Relocation[relocationCount];
-        int position = 0;
-        int relocationPosition = 0;
-        foreach (WasmExpr instruction in instructions)
-        {
-            int count = instruction.EncodeRelocations(relocations.AsSpan(relocationPosition));
-            for (int i = relocationPosition; i < relocationPosition + count; i++)
-            {
-                Relocation relocation = relocations[i];
-                relocations[i] = new Relocation(relocation.RelocType, position + relocation.Offset, relocation.Target);
-            }
-            relocationPosition += count;
-            position += instruction.Encode(bytes.AsSpan(position));
-        }
-        return new Edit(offset, length, bytes, relocations);
+        WasmEncodedInstructions encoded = WasmEncodedInstructions.Encode(instructions);
+        return new Edit(offset, length, encoded.Bytes, encoded.Relocations);
     }
 }
