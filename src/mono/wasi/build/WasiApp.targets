@@ -63,7 +63,9 @@
     <PropertyGroup>
       <_MainAssemblyPath Condition="'%(WasmAssembliesToBundle.FileName)' == '$(AssemblyName)' and '%(WasmAssembliesToBundle.Extension)' == '.dll' and $(WasmGenerateAppBundle) == 'true'">%(WasmAssembliesToBundle.Identity)</_MainAssemblyPath>
       <_WasmRuntimeConfigFilePath Condition="'$(_WasmRuntimeConfigFilePath)' == '' and $(_MainAssemblyPath) != ''">$([System.IO.Path]::ChangeExtension($(_MainAssemblyPath), '.runtimeconfig.json'))</_WasmRuntimeConfigFilePath>
-      <_WasiRuntimeConfigPropertiesSourcePath Condition="'$(WasmAppRuntimeFlavor)' == 'CoreCLR' and '$(_WasiRuntimeConfigPropertiesSourcePath)' == ''">$([MSBuild]::NormalizePath('$(_WasmIntermediateOutputPath)', 'corerun-relink', 'runtimeconfig.cpp'))</_WasiRuntimeConfigPropertiesSourcePath>
+      <_WasiRuntimeConfigPropertiesSourcePath Condition="'$(WasmAppRuntimeFlavor)' == 'CoreCLR' and '$(WasiEmitCallHelpersAsWasm)' != 'true' and '$(_WasiRuntimeConfigPropertiesSourcePath)' == ''">$([MSBuild]::NormalizePath('$(_WasmIntermediateOutputPath)', 'corerun-relink', 'runtimeconfig.cpp'))</_WasiRuntimeConfigPropertiesSourcePath>
+      <!-- Experimental (WasiEmitCallHelpersAsWasm): the properties as a wasm object, so the relink compiles no C++. -->
+      <_WasiRuntimeConfigPropertiesObjectPath Condition="'$(WasmAppRuntimeFlavor)' == 'CoreCLR' and '$(WasiEmitCallHelpersAsWasm)' == 'true' and '$(_WasiRuntimeConfigPropertiesObjectPath)' == ''">$([MSBuild]::NormalizePath('$(_WasmIntermediateOutputPath)', 'corerun-relink', 'runtimeconfig.o'))</_WasiRuntimeConfigPropertiesObjectPath>
     </PropertyGroup>
   </Target>
 
@@ -128,7 +130,7 @@
   <!-- FIXME: make this similar to what browser targets has -->
   <Target Name="_WasiGenerateAppBundle"
           Inputs="@(_WasmAssembliesInternal);@(WasmNativeAsset);$(_WasmRuntimeConfigFilePath)"
-          Outputs="$(WasmAppDir)\.stamp;$(_WasiRuntimeConfigPropertiesSourcePath)"
+          Outputs="$(WasmAppDir)\.stamp;$(_WasiRuntimeConfigPropertiesSourcePath);$(_WasiRuntimeConfigPropertiesObjectPath)"
           Condition="'$(WasmGenerateAppBundle)' == 'true'">
 
     <PropertyGroup>
@@ -153,6 +155,7 @@
       OutputSymbolsToAppBundle="$(_WasmOutputSymbolsToAppBundle)"
       RuntimeConfigJsonPath="$(_WasmRuntimeConfigFilePath)"
       RuntimeConfigPropertiesSourcePath="$(_WasiRuntimeConfigPropertiesSourcePath)"
+      RuntimeConfigPropertiesObjectPath="$(_WasiRuntimeConfigPropertiesObjectPath)"
       />
   </Target>
 

@@ -247,14 +247,16 @@
       <_WasiSysroot>$(WASI_SDK_PATH)share/wasi-sysroot</_WasiSysroot>
       <!-- Experimental: crossgen2 writes all the per-app call helpers (interpreter-to-native thunks, P/Invoke and
            runtime helper tables, reverse thunks and the ReadyToRun image buffer) as a relocatable wasm object,
-           callhelpers.o, through the shared ObjectWriter, so the relink compiles no C++. -->
+           callhelpers.o, through the shared ObjectWriter, and WasiAppBuilder writes the runtimeconfig properties as
+           runtimeconfig.o, so the relink compiles no C++. -->
       <WasiEmitCallHelpersAsWasm Condition="'$(WasiEmitCallHelpersAsWasm)' == ''">false</WasiEmitCallHelpersAsWasm>
       <_WasiCallHelpersObject>$(_WasiRelinkObjDir)callhelpers.o</_WasiCallHelpersObject>
 
       <_WasiPInvokeTablePath>$(_WasiRelinkObjDir)callhelpers-pinvoke.cpp</_WasiPInvokeTablePath>
       <_WasiReversePInvokeTablePath>$(_WasiRelinkObjDir)callhelpers-reverse.cpp</_WasiReversePInvokeTablePath>
       <_WasiInterpToNativeTablePath>$(_WasiRelinkObjDir)callhelpers-interp-to-managed.cpp</_WasiInterpToNativeTablePath>
-      <_WasiRuntimeConfigPropertiesSourcePath Condition="'$(_WasiRuntimeConfigPropertiesSourcePath)' == ''">$(_WasiRelinkObjDir)runtimeconfig.cpp</_WasiRuntimeConfigPropertiesSourcePath>
+      <_WasiRuntimeConfigPropertiesSourcePath Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true' and '$(_WasiRuntimeConfigPropertiesSourcePath)' == ''">$(_WasiRelinkObjDir)runtimeconfig.cpp</_WasiRuntimeConfigPropertiesSourcePath>
+      <_WasiRuntimeConfigPropertiesObjectPath Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true' and '$(_WasiRuntimeConfigPropertiesObjectPath)' == ''">$(_WasiRelinkObjDir)runtimeconfig.o</_WasiRuntimeConfigPropertiesObjectPath>
 
       <!-- Curated header set for the generated callhelpers (mirrors browser's
            _EmccCFlagsGenerated): force-include coreclr_compat.h + -I the dirs with
@@ -294,8 +296,10 @@
 
     <Error Condition="!Exists('$(_WasiCoreClrCompatHeader)')"
            Text="coreclr_compat.h not found at $(_WasiCoreClrCompatHeader). For out-of-tree/pack builds set %24(CORECLR_COMPAT_HEADER) to the staged header (and CORECLR_VM_WASM_INCLUDE_DIR/MINIPAL_INCLUDE_DIR for the include dirs); see #128362." />
-    <Error Condition="!Exists('$(_WasiRuntimeConfigPropertiesSourcePath)')"
+    <Error Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true' and !Exists('$(_WasiRuntimeConfigPropertiesSourcePath)')"
            Text="Generated runtime configuration properties source not found at '$(_WasiRuntimeConfigPropertiesSourcePath)'." />
+    <Error Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true' and !Exists('$(_WasiRuntimeConfigPropertiesObjectPath)')"
+           Text="Generated runtime configuration properties object not found at '$(_WasiRuntimeConfigPropertiesObjectPath)'." />
 
     <!-- 1. Generate the per-app callhelper tables over the bundled managed closure.
          The bundle can carry native payloads named .dll, and the generator reads managed
@@ -431,7 +435,8 @@
                              Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiInterpToNativeTablePath)" ObjectFile="$(_WasiRelinkObjDir)callhelpers-interp-to-managed.o"
                              Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
-      <_WasiCallHelperSource Include="$(_WasiRuntimeConfigPropertiesSourcePath)" ObjectFile="$(_WasiRelinkObjDir)runtimeconfig.o" />
+      <_WasiCallHelperSource Include="$(_WasiRuntimeConfigPropertiesSourcePath)" ObjectFile="$(_WasiRelinkObjDir)runtimeconfig.o"
+                             Condition="'$(WasiEmitCallHelpersAsWasm)' != 'true'" />
       <_WasiCallHelperSource Include="$(_WasiR2RImageBufferSource)"
                              ObjectFile="$(_WasiRelinkObjDir)r2r-image-buffer.o"
                              Condition="'$(PublishReadyToRun)' == 'true' and '$(WasiEmitCallHelpersAsWasm)' != 'true'" />
@@ -457,7 +462,7 @@
       <_WasiHostLibsPre Condition="'$(InvariantTimezone)' != 'true'" Include="$(MicrosoftNetCoreAppRuntimePackRidNativeDir)libSystem.Native.TimeZoneData.a" />
       <!-- Per-app generated objects go here, with the callhelpers replacing libcoreclr_gen_static.a. -->
       <_WasiHostLibsPre Include="%(_WasiCallHelperSource.ObjectFile)" />
-      <_WasiHostLibsPre Include="$(_WasiCallHelpersObject)" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true'" />
+      <_WasiHostLibsPre Include="$(_WasiCallHelpersObject);$(_WasiRuntimeConfigPropertiesObjectPath)" Condition="'$(WasiEmitCallHelpersAsWasm)' == 'true'" />
       <_WasiHostLibsPre Include="$(WasiCoreCLRNativeRuntimeDir)libnativeresourcestring.a" />
       <!-- Not linking libgcinfo_unix_wasm.a (browser does): it's the gcinfo ENCODER
            (GcInfoArrayList, JIT/crossgen emit) the interp/R2R host never uses, so its refs

@@ -12,11 +12,13 @@ using Microsoft.Build.Framework;
 
 namespace Microsoft.WebAssembly.Build.Tasks;
 
-public class WasiAppBuilder : WasmAppBuilderBaseTask
+public partial class WasiAppBuilder : WasmAppBuilderBaseTask
 {
     public bool IsSingleFileBundle { get; set; }
     public bool OutputSymbolsToAppBundle { get; set; }
     public string? RuntimeConfigPropertiesSourcePath { get; set; }
+    // Experimental: write the properties as a relocatable wasm object instead of C++ source (.NET MSBuild only).
+    public string? RuntimeConfigPropertiesObjectPath { get; set; }
 
     protected override bool ValidateArguments()
     {
@@ -149,7 +151,7 @@ public class WasiAppBuilder : WasmAppBuilderBaseTask
 
     private void GenerateRuntimeConfigPropertiesSource()
     {
-        if (string.IsNullOrEmpty(RuntimeConfigPropertiesSourcePath))
+        if (string.IsNullOrEmpty(RuntimeConfigPropertiesSourcePath) && string.IsNullOrEmpty(RuntimeConfigPropertiesObjectPath))
             return;
 
         Dictionary<string, string> properties = RuntimeConfigProperties.Read(
@@ -160,6 +162,17 @@ public class WasiAppBuilder : WasmAppBuilderBaseTask
             "APP_PATHS",
             "HOST_RUNTIME_CONTRACT");
         KeyValuePair<string, string>[] sortedProperties = properties.OrderBy(property => property.Key, StringComparer.Ordinal).ToArray();
+
+        if (!string.IsNullOrEmpty(RuntimeConfigPropertiesObjectPath))
+        {
+#if NET
+            WriteRuntimeConfigPropertiesObject(RuntimeConfigPropertiesObjectPath, sortedProperties);
+            _fileWrites.Add(RuntimeConfigPropertiesObjectPath);
+            return;
+#else
+            throw new LogAsErrorException($"{nameof(RuntimeConfigPropertiesObjectPath)} requires the .NET build of MSBuild.");
+#endif
+        }
 
         var source = new StringBuilder();
         source.AppendLine("// Licensed to the .NET Foundation under one or more agreements.");
@@ -188,11 +201,11 @@ public class WasiAppBuilder : WasmAppBuilderBaseTask
             .AppendLine(";");
         source.AppendLine("}");
 
-        string? directory = Path.GetDirectoryName(RuntimeConfigPropertiesSourcePath);
+        string? directory = Path.GetDirectoryName(RuntimeConfigPropertiesSourcePath!);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
 
-        File.WriteAllText(RuntimeConfigPropertiesSourcePath, source.ToString());
-        _fileWrites.Add(RuntimeConfigPropertiesSourcePath);
+        File.WriteAllText(RuntimeConfigPropertiesSourcePath!, source.ToString());
+        _fileWrites.Add(RuntimeConfigPropertiesSourcePath!);
     }
 }
