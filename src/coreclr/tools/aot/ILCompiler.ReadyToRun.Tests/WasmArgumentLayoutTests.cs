@@ -1230,6 +1230,88 @@ public class WasmArgumentLayoutTests
     }
 
     /// <summary>
+    /// A reverse thunk hands its arguments to the interpreter in a buffer the interpreter copies onto its stack,
+    /// so the buffer has to use the interpreter's layout. A struct the wasm C ABI passes by reference arrives as a
+    /// pointer, but sits inline in that layout: the thunk copies its bytes. Callbacks without one keep one int64_t
+    /// slot per parameter.
+    /// </summary>
+    [Fact]
+    public void PortableCallHelpersGeneratorLaysOutReverseThunkArgumentsLikeTheInterpreter()
+    {
+        string source = """
+            using System.Runtime.InteropServices;
+
+            public struct Wide
+            {
+                public long A;
+                public long B;
+            }
+
+            public struct Narrow
+            {
+                public int A;
+                public int B;
+            }
+
+            public struct Width
+            {
+                public float Value;
+            }
+
+            public static class Callbacks
+            {
+                [UnmanagedCallersOnly]
+                public static Wide Structs(Wide wide, Narrow narrow, long add) => default;
+
+                [UnmanagedCallersOnly]
+                public static float Scalars(Width width, int value) => default;
+            }
+            """;
+
+        string workingDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(workingDirectory);
+
+        try
+        {
+            string inputAssembly = CompileCallbackAssembly(source, Path.Combine(workingDirectory, "Callbacks.dll"));
+            string outputDirectory = Path.Combine(workingDirectory, "generated");
+
+            var options = new PortableCallHelpersGeneratorOptions
+            {
+                OutputDirectory = outputDirectory,
+                TargetOS = "wasi",
+                PInvokeModules = new[] { "libSystem.Native" },
+            };
+
+            var log = new StringWriter();
+            int exitCode = PortableCallHelpersGenerator.Run(
+                WasmTestHelpers.CreateContext(inputAssembly), options, new Logger(log, isVerbose: false));
+
+            Assert.True(exitCode == 0, log.ToString());
+
+            string reverse = File.ReadAllText(Path.Combine(outputDirectory, "callhelpers-reverse.cpp"));
+            Assert.Contains("(void * sret, void * arg0, void * arg1, int64_t arg2)", reverse);
+            Assert.Contains("alignas(8) int8_t args[32] = {};", reverse);
+            Assert.Contains("memcpy(&args[0], arg0, 16);", reverse);
+            Assert.Contains("memcpy(&args[16], arg1, 8);", reverse);
+            Assert.Contains("{ int64_t slot = (int64_t)arg2; memcpy(&args[24], &slot, sizeof(slot)); }", reverse);
+
+            Assert.Contains("(float arg0, int32_t arg1)", reverse);
+            Assert.Contains("int64_t args[2] = { 0, (int64_t)arg1 };", reverse);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(workingDirectory, recursive: true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
     /// The generated wrapper only needs to reach the R2R native entrypoint for callbacks exported by
     /// name: native code calls the extern "C" export (and thus the wrapper) directly. Every other
     /// reverse thunk is handed out by the runtime, which already prefers R2R code before falling back to

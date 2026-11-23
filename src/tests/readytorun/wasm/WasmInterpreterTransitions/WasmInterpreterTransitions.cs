@@ -189,6 +189,17 @@ public class WasmInterpreterTransitions
 
         unsafe { Assert.Equal(A + C, s_ucoToInterpreted(A)); }
 
+        // An interpreted UnmanagedCallersOnly method taking structs the wasm C ABI passes by reference. The reverse
+        // thunk receives their addresses, but the interpreter holds them inline, so the thunk has to copy their bytes
+        // into the interpreter's argument layout rather than pass the pointers on.
+        unsafe
+        {
+            delegate* unmanaged<S16, S8, long, S16> fp = &InterpretedUcoTakesStructs;
+            S16 result = fp(new S16 { A = Wide, B = C }, new S8 { A = A, B = B }, 5);
+            Assert.Equal(Wide + A + 5, result.A);
+            Assert.Equal((long)C + B + 5, result.B);
+        }
+
         {
             object first = new();
             object second = new();
@@ -788,6 +799,11 @@ public class WasmInterpreterTransitions
     [BypassReadyToRun]
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static int InterpretedFromUnmanagedCaller(int a) => a + C;
+
+    [BypassReadyToRun]
+    [UnmanagedCallersOnly]
+    private static S16 InterpretedUcoTakesStructs(S16 wide, S8 narrow, long add)
+        => new S16 { A = wide.A + narrow.A + add, B = wide.B + narrow.B + add };
 
     [BypassReadyToRun]
     [MethodImpl(MethodImplOptions.NoInlining)]

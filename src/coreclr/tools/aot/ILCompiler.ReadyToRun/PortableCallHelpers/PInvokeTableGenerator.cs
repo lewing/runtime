@@ -8,7 +8,9 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
+using ILCompiler.DependencyAnalysis.ReadyToRun;
 using ILCompiler.DependencyAnalysis.Wasm;
+using Internal.CallingConvention;
 using Internal.JitInterface;
 using Internal.TypeSystem;
 using Internal.TypeSystem.Ecma;
@@ -423,6 +425,48 @@ namespace ILCompiler.PortableCallHelpers
 
         internal static uint ReverseThunkHash(PInvokeCallback cb) => HashString(cb.Key);
 
+        /// <summary>
+        /// Where a reverse thunk puts a callback's arguments in the buffer ExecuteInterpretedMethodFromUnmanaged copies
+        /// onto the interpreter stack: the interpreter's own argument layout, the ArgIterator area after the
+        /// TransitionBlock. A struct the wasm C ABI passes by reference arrives as a pointer, but the interpreter holds
+        /// it inline, so its bytes are copied rather than the pointer.
+        /// </summary>
+        internal readonly record struct InterpreterArgumentLayout(int Size, int[] Offsets, int[] IndirectStructSizes)
+        {
+            /// <summary>One 8-byte slot per parameter, in order, so each argument can travel as an int64_t.</summary>
+            public bool IsSlotPerParameter
+            {
+                get
+                {
+                    if (Size != Offsets.Length * 8)
+                        return false;
+                    for (int i = 0; i < Offsets.Length; i++)
+                    {
+                        if (Offsets[i] != i * 8 || IndirectStructSizes[i] != 0)
+                            return false;
+                    }
+
+                    return true;
+                }
+            }
+        }
+
+        internal static InterpreterArgumentLayout GetInterpreterArgumentLayout(PInvokeCallback cb)
+        {
+            (ArgIterator<TypeHandle> argit, TransitionBlock transitionBlock) = GCRefMapBuilder.BuildArgIterator(cb.Method.Signature, cb.Method.Context);
+            int count = cb.Parameters.Length;
+            var offsets = new int[count];
+            var indirectStructSizes = new int[count];
+            for (int i = 0; i < count; i++)
+            {
+                offsets[i] = argit.GetNextOffset() - transitionBlock.OffsetOfArgs;
+                if (IsPassedByReference(cb.Parameters[i]))
+                    indirectStructSizes[i] = cb.Parameters[i].GetElementSize().AsInt;
+            }
+
+            return new InterpreterArgumentLayout(argit.SizeOfFrameArgumentArray(), offsets, indirectStructSizes);
+        }
+
         private static void RejectUnsupportedCallbackSignature(PInvokeCallback cb)
         {
             List<string> loweredTokens = InteropSignature.ParseSignatureTokens(
@@ -524,10 +568,18 @@ namespace ILCompiler.PortableCallHelpers
                 // A cast converts a float numerically, while the slot has to carry its bits, so copy
                 // those instead. Every other type this emits reaches the slot unchanged through a cast.
                 bool CarriesBits(int i) => parameterCTypes[i] is "float" or "double";
-                string argsDeclaration = parameterCount > 0
+                InterpreterArgumentLayout layout = GetInterpreterArgumentLayout(cb);
+                string argsDeclaration = parameterCount == 0
+                    ? string.Empty
+                    : layout.IsSlotPerParameter
                     ? $"\n\n    int64_t args[{parameterCount}] = {{ {string.Join(", ", Enumerable.Range(0, parameterCount).Select(i => CarriesBits(i) ? "0" : $"(int64_t)arg{i}"))} }};"
                       + string.Concat(Enumerable.Range(0, parameterCount).Where(CarriesBits).Select(i => $"\n    memcpy(&args[{i}], &arg{i}, sizeof(arg{i}));"))
-                    : string.Empty;
+                    // A struct passed by reference sits inline in the interpreter's layout, so copy its bytes there.
+                    : $"\n\n    alignas(8) int8_t args[{layout.Size}] = {{}};"
+                      + string.Concat(Enumerable.Range(0, parameterCount).Select(i =>
+                          layout.IndirectStructSizes[i] != 0 ? $"\n    memcpy(&args[{layout.Offsets[i]}], arg{i}, {layout.IndirectStructSizes[i]});"
+                          : CarriesBits(i) ? $"\n    memcpy(&args[{layout.Offsets[i]}], &arg{i}, sizeof(arg{i}));"
+                          : $"\n    {{ int64_t slot = (int64_t)arg{i}; memcpy(&args[{layout.Offsets[i]}], &slot, sizeof(slot)); }}"));
                 string retArg = returnsViaBuffer ? "(int8_t*)sret" : hasResult ? "(int8_t*)&result" : "nullptr";
                 string parametersDeclaration = string.Join(", ",
                     (returnsViaBuffer ? ["void * sret"] : Array.Empty<string>())

@@ -311,14 +311,28 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                     body.AddRange([Local.Get(r2r), ControlFlow.CallIndirect(wrapperType, 0), ControlFlow.Return, Block.End]);
                 }
 
-                // int64_t args[N] and the result, on the shadow stack.
-                int argumentBytes = cb.Parameters.Length * SlotSize;
+                // The arguments, in the interpreter's layout, and the result, on the shadow stack.
+                PInvokeTableGenerator.InterpreterArgumentLayout layout = PInvokeTableGenerator.GetInterpreterArgumentLayout(cb);
+                int argumentBytes = layout.Size;
                 int frameSize = (argumentBytes + (hasResult ? SlotSize : 0) + 15) & ~15;
                 if (frameSize != 0)
                     body.AddRange([Global.Get(stackPointer), I32.Const(frameSize), I32.Sub, Local.Tee(frame), Global.Set(stackPointer)]);
 
                 for (int i = 0; i < parameterCTypes.Length; i++)
                 {
+                    int offset = layout.Offsets[i];
+                    int structSize = layout.IndirectStructSizes[i];
+                    if (structSize != 0)
+                    {
+                        // A struct passed by reference sits inline in the interpreter's layout: copy its bytes, and
+                        // zero the padding up to the next slot.
+                        body.AddRange([Local.Get(frame), I32.Const(offset), I32.Add, Local.Get(firstArgument + i), I32.Const(structSize), Memory.Copy()]);
+                        int padding = ((structSize + SlotSize - 1) & ~(SlotSize - 1)) - structSize;
+                        if (padding != 0)
+                            body.AddRange([Local.Get(frame), I32.Const(offset + structSize), I32.Add, I32.Const(0), I32.Const(padding), Memory.Fill()]);
+                        continue;
+                    }
+
                     body.Add(Local.Get(frame));
                     body.Add(Local.Get(firstArgument + i));
                     // A cast widens integers; a float slot carries the value's bits, and the rest stays zero.
@@ -332,7 +346,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                         default: throw new InvalidOperationException($"No slot conversion for the C type '{parameterCTypes[i]}'.");
                     }
 
-                    body.Add(I64.Store((ulong)(i * SlotSize)));
+                    body.Add(I64.Store((ulong)offset));
                 }
 
                 body.AddRange([I32.ConstAddress(methodDesc), I32.Load(0)]);
