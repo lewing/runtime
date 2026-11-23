@@ -259,7 +259,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
             ExternFunctionSymbolNode lookup = Function("LookupUnmanagedCallersOnlyMethodByName", new WasmFuncType(
                 new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([])), s_boundBySymbol);
             ExternFunctionSymbolNode execute = Function("ExecuteInterpretedMethodFromUnmanaged", new WasmFuncType(
-                new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([])), s_boundBySymbol);
+                new WasmResultType([WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32, WasmValueType.I32]), new WasmResultType([WasmValueType.I32])), s_boundBySymbol);
             ISymbolNode stackPointer = factory.GetWellKnownWasmGlobalSymbol(new Utf8String(WasmWellKnownGlobalSymbolNode.StackPointerName));
 
             var table = new List<(uint Hash, ISymbolNode Source, ISymbolNode Target, ISymbolNode EntryPoint)>(callbacks.Count);
@@ -271,10 +271,15 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                 int firstArgument = returnsViaBuffer ? 1 : 0;
                 int frame = parameterCount; // local: the frame holding args[] and result
                 int r2r = parameterCount + 1; // local: the cached R2R entry point (exports only)
+                int nativeCode = parameterCount + (cb.IsExport ? 2 : 1); // local: native code the interpreter reports
 
                 var methodDesc = new CallHelperDataNode($"MD_{cb.EntrySymbol}", CallHelperDataNode.Data, PointerSize, new byte[PointerSize]);
                 var wrapper = new CallHelperFunctionNode(context, $"Call_{cb.EntrySymbol}", type,
-                    cb.IsExport ? [WasmValueType.I32, WasmValueType.I32] : [WasmValueType.I32]);
+                    cb.IsExport ? [WasmValueType.I32, WasmValueType.I32, WasmValueType.I32] : [WasmValueType.I32, WasmValueType.I32]);
+                WasmTypeNode wrapperType = factory.WasmTypeNode(new WasmSignature(type, CallHelperFunctionNode.SignatureString(type)));
+                CallHelperDataNode r2rCode = cb.IsExport
+                    ? new CallHelperDataNode($"R2RCode_{cb.EntrySymbol}", CallHelperDataNode.Data, PointerSize, BitConverter.GetBytes(-1))
+                    : null;
 
                 List<WasmExpr> body =
                 [
@@ -289,7 +294,6 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                 if (cb.IsExport)
                 {
                     // Prefer the R2R native entry point when the callback was compiled (partial R2R); resolve once.
-                    var r2rCode = new CallHelperDataNode($"R2RCode_{cb.EntrySymbol}", CallHelperDataNode.Data, PointerSize, BitConverter.GetBytes(-1));
                     ExternFunctionSymbolNode getR2RCode = Function("GetR2RNativeCodeForUnmanagedCallersOnly", new WasmFuncType(
                         new WasmResultType([WasmValueType.I32]), new WasmResultType([WasmValueType.I32])), s_boundBySymbol);
                     body.AddRange(
@@ -304,7 +308,7 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                     ]);
                     for (int i = 0; i < parameterCount; i++)
                         body.Add(Local.Get(i));
-                    body.AddRange([Local.Get(r2r), ControlFlow.CallIndirect(factory.WasmTypeNode(new WasmSignature(type, CallHelperFunctionNode.SignatureString(type))), 0), ControlFlow.Return, Block.End]);
+                    body.AddRange([Local.Get(r2r), ControlFlow.CallIndirect(wrapperType, 0), ControlFlow.Return, Block.End]);
                 }
 
                 // int64_t args[N] and the result, on the shadow stack.
@@ -341,12 +345,21 @@ namespace ILCompiler.PortableCallHelpers.WasmObject
                 else
                     body.Add(I32.Const(0));
                 body.Add(I32.ConstAddress(wrapper)); // (PCODE)&Call_X
-                body.Add(ControlFlow.Call(execute));
+                body.AddRange([ControlFlow.Call(execute), Local.Set(nativeCode)]);
 
                 if (hasResult)
                     body.AddRange([Local.Get(frame), Memory.Load(type.Returns.Types[0], (ulong)argumentBytes)]);
                 if (frameSize != 0)
                     body.AddRange([Local.Get(frame), I32.Const(frameSize), I32.Add, Global.Set(stackPointer)]);
+
+                // The method gained native code (delayed R2R activation) since this thunk was handed out, so the
+                // interpreter didn't run it: call that code instead, and refresh an export's cached entry point.
+                body.AddRange([Local.Get(nativeCode), Block.If(WasmBlockType.Empty)]);
+                if (r2rCode is not null)
+                    body.AddRange([I32.ConstAddress(r2rCode), Local.Get(nativeCode), I32.Store(0)]);
+                for (int i = 0; i < parameterCount; i++)
+                    body.Add(Local.Get(i));
+                body.AddRange([Local.Get(nativeCode), ControlFlow.CallIndirect(wrapperType, 0), ControlFlow.Return, Block.End]);
 
                 wrapper.Body = body.ToArray();
 
