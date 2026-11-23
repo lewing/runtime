@@ -4,7 +4,7 @@
 namespace Microsoft.NET.WebAssembly.Validation;
 
 /// <summary>
-/// Thrown by <see cref="WasmModuleValidator.ValidateAndThrow"/> when the module
+/// Thrown by <see cref="WasmModuleValidator.ValidateAndThrow(Module.WasmModule, WasmFeatures)"/> when the module
 /// violates one or more Wasm spec rules.  Distinct from <c>WasmFormatException</c>
 /// which covers unreadable/malformed bytes.
 /// </summary>

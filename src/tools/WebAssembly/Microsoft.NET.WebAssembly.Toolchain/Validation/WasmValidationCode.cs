@@ -37,4 +37,5 @@ public enum WasmValidationCode
     FunctionBodyImmutableGlobal,
     FunctionBodyInvalidImmediate,
     InternalRuleMissing,
+    TableSizeExceedsLimit,
 }

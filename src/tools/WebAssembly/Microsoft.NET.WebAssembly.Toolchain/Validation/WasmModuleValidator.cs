@@ -9,7 +9,7 @@ using Microsoft.NET.WebAssembly.Types;
 /// <summary>
 /// Post-parse semantic validator.  Checks a parsed <see cref="WasmModule"/> against
 /// the Wasm spec §3 validity rules.  Never throws — callers inspect the returned
-/// <see cref="WasmValidationResult"/> or call <see cref="ValidateAndThrow"/>.
+/// <see cref="WasmValidationResult"/> or call <see cref="ValidateAndThrow(WasmModule, WasmFeatures)"/>.
 /// </summary>
 public static class WasmModuleValidator
 {
@@ -19,13 +19,24 @@ public static class WasmModuleValidator
     public static WasmValidationResult Validate(
         WasmModule module,
         WasmFeatures features = WasmFeatures.Default)
+        => Validate(module, features, prevalidatedBodies: null);
+
+    /// <summary>
+    /// <see cref="Validate(WasmModule, WasmFeatures)"/> for a module just decoded by a validating load, taking each
+    /// function body's result from <paramref name="prevalidatedBodies"/> where the decoder recorded one.
+    /// </summary>
+    internal static WasmValidationResult Validate(
+        WasmModule module,
+        WasmFeatures features,
+        FunctionBodyValidator.FusedBodyValidation? prevalidatedBodies)
         => Validate(
             module,
             features,
             validateTypeDeclarations: true,
             validateFunctionBodies: true,
             validateConstantExpressions: true,
-            validateRemainingModuleHygiene: true);
+            validateRemainingModuleHygiene: true,
+            prevalidatedBodies);
 
     internal static WasmValidationResult ValidateForTests(
         WasmModule module,
@@ -40,7 +51,8 @@ public static class WasmModuleValidator
             validateTypeDeclarations,
             validateFunctionBodies,
             validateConstantExpressions,
-            validateRemainingModuleHygiene);
+            validateRemainingModuleHygiene,
+            prevalidatedBodies: null);
 
     private static WasmValidationResult Validate(
         WasmModule module,
@@ -48,7 +60,8 @@ public static class WasmModuleValidator
         bool validateTypeDeclarations,
         bool validateFunctionBodies,
         bool validateConstantExpressions,
-        bool validateRemainingModuleHygiene)
+        bool validateRemainingModuleHygiene,
+        FunctionBodyValidator.FusedBodyValidation? prevalidatedBodies)
     {
         var diagnostics = new List<WasmValidationDiagnostic>();
 
@@ -82,6 +95,7 @@ public static class WasmModuleValidator
         foreach (var tbl in module.Tables)
         {
             CheckLimits(tbl.Limits, diagnostics);
+            CheckTableAbsoluteLimits(tbl.Limits, diagnostics, "Table");
             if (validateRemainingModuleHygiene &&
                 tbl.InitExpr.Length == 0 &&
                 TableElementType(tbl) is Microsoft.NET.WebAssembly.Types.ValueType.Reference { Nullability: Nullability.NonNullable } elementType)
@@ -101,7 +115,10 @@ public static class WasmModuleValidator
                     CheckMemoryAbsoluteLimits(mImp.Type.Limits, diagnostics, "Imported memory");
             }
             else if (imp.Descriptor is ImportDescriptor.Table tImp)
+            {
                 CheckLimits(tImp.Type.Limits, diagnostics);
+                CheckTableAbsoluteLimits(tImp.Type.Limits, diagnostics, "Imported table");
+            }
         }
 
         // ── MVP singleton constraints ─────────────────────────────────────
@@ -256,7 +273,7 @@ public static class WasmModuleValidator
             ConstantExpressionValidator.ValidateModule(module, WasmFeatures.All, diagnostics);
 
         if (validateFunctionBodies)
-            diagnostics.AddRange(FunctionBodyValidator.ValidateModule(module, WasmFeatures.All).Diagnostics);
+            diagnostics.AddRange(FunctionBodyValidator.ValidateModule(module, WasmFeatures.All, prevalidatedBodies).Diagnostics);
 
         return diagnostics.Count == 0
             ? WasmValidationResult.Valid
@@ -269,8 +286,14 @@ public static class WasmModuleValidator
     public static void ValidateAndThrow(
         WasmModule module,
         WasmFeatures features = WasmFeatures.Default)
+        => ValidateAndThrow(module, features, prevalidatedBodies: null);
+
+    internal static void ValidateAndThrow(
+        WasmModule module,
+        WasmFeatures features,
+        FunctionBodyValidator.FusedBodyValidation? prevalidatedBodies)
     {
-        var result = Validate(module, features);
+        var result = Validate(module, features, prevalidatedBodies);
         if (!result.IsValid)
             throw new WasmValidationException(
                 result.Diagnostics.Where(d => d.Severity == WasmValidationSeverity.Error).ToList());
@@ -461,6 +484,22 @@ public static class WasmModuleValidator
         if (limits.Max is { } max && max > absoluteMax)
             Add(diagnostics, WasmValidationCode.MemoryMaxExceedsLimit,
                 $"{context} max {max} exceeds {width} limit {absoluteMax} pages");
+    }
+
+    // Table limits are decoded as u64 whatever the address type; a 32-bit table's must fit in 32 bits (§3.2.5).
+    private static void CheckTableAbsoluteLimits(
+        Limits limits,
+        List<WasmValidationDiagnostic> diagnostics,
+        string context)
+    {
+        if (limits.Is64)
+            return;
+        if (limits.Min > uint.MaxValue)
+            Add(diagnostics, WasmValidationCode.TableSizeExceedsLimit,
+                $"{context} min {limits.Min} exceeds the table32 limit {uint.MaxValue}");
+        if (limits.Max is { } max && max > uint.MaxValue)
+            Add(diagnostics, WasmValidationCode.TableSizeExceedsLimit,
+                $"{context} max {max} exceeds the table32 limit {uint.MaxValue}");
     }
 
     private static void CheckDefinedHeapTypeReferences(

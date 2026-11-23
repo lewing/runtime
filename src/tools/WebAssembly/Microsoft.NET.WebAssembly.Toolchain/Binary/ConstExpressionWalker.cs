@@ -247,6 +247,36 @@ internal ref struct ConstExpressionWalker
     }
 
     /// <summary>
+    /// True when <paramref name="expression"/> is exactly <c>i64.const</c> followed by <c>end</c>; see
+    /// <see cref="TryReadSingle"/>.
+    /// </summary>
+    public static bool TryReadI64Const(ReadOnlySpan<byte> expression, out long value)
+    {
+        bool single = TryReadSingle(expression, out ConstOp op, out DecodedInstruction instruction) && op == ConstOp.I64Const;
+        value = single ? unchecked((long)instruction.MemOffset) : 0;
+        return single;
+    }
+
+    /// <summary>
+    /// True when <paramref name="expression"/> is exactly the constant of a table's or memory's address type followed
+    /// by <c>end</c>: <c>i64.const</c> when <paramref name="is64"/>, else <c>i32.const</c>. The value is the unsigned
+    /// address (an <c>i32</c> is zero-extended). A constant of the other address type is not a match.
+    /// </summary>
+    public static bool TryReadAddressConst(ReadOnlySpan<byte> expression, bool is64, out ulong value)
+    {
+        if (is64)
+        {
+            bool read64 = TryReadI64Const(expression, out long wide);
+            value = read64 ? unchecked((ulong)wide) : 0;
+            return read64;
+        }
+
+        bool read32 = TryReadI32Const(expression, out int narrow);
+        value = read32 ? unchecked((uint)narrow) : 0;
+        return read32;
+    }
+
+    /// <summary>
     /// The length of the constant expression <paramref name="code"/> begins with, including its <c>end</c>, or -1 when
     /// it contains a non-constant instruction, is malformed, or runs out before <c>end</c>. Never throws.
     /// </summary>

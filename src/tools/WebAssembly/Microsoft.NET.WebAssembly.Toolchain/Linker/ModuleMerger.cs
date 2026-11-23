@@ -950,8 +950,12 @@ public static class ModuleMerger
                     continue;
                 }
 
-                foreach (var (local, name) in moduleNames.OrderBy(p => p.Key))
+                var locals = new int[moduleNames.Count];
+                moduleNames.Keys.CopyTo(locals, 0);
+                Array.Sort(locals);
+                foreach (int local in locals)
                 {
+                    string name = moduleNames[local];
                     var item = new ItemRef(m, local);
                     if (!IsLiveRepresentative(Kind.Func, item) || !_assigned.TryGetValue((Kind.Func, item), out uint index))
                         continue;
@@ -962,20 +966,18 @@ public static class ModuleMerger
             if (names.Count == 0)
                 return null;
 
-            using var subsection = new MemoryStream();
-            WasmEncoder.WriteU32Leb(subsection, (uint)names.Count);
+            long entriesSize = 0;
+            foreach (var (index, name) in names)
+                entriesSize += NameMapWriter.GetEntrySize(index, Encoding.UTF8.GetByteCount(name));
+            var content = new ExactArrayBufferWriter(NameMapWriter.GetSubsectionSize(names.Count, entriesSize));
+            var map = new NameMapWriter(content, NameSubsectionId.Function, names.Count, entriesSize);
+            Span<byte> scratch = stackalloc byte[Utf8Scratch.StackSize];
             foreach (var (index, name) in names)
             {
-                WasmEncoder.WriteU32Leb(subsection, index);
-                byte[] utf8 = Encoding.UTF8.GetBytes(name);
-                WasmEncoder.WriteU32Leb(subsection, (uint)utf8.Length);
-                subsection.Write(utf8);
+                using var utf8 = new Utf8Scratch(name, scratch);
+                map.Write(index, utf8.Bytes);
             }
-
-            using var content = new MemoryStream();
-            content.WriteByte(1);
-            WasmEncoder.WriteU32Leb(content, (uint)subsection.Length);
-            content.Write(subsection.GetBuffer(), 0, (int)subsection.Length);
+            map.Complete();
             return new CustomSection("name", content.ToArray());
 
             string Unique(string name)

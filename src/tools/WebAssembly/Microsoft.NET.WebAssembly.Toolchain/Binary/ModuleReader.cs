@@ -40,7 +40,9 @@ public static partial class ModuleReader
         WasmModule decodeModule,
         WasmFunction function,
         bool hasDataCountSection,
-        WasmFeatures features);
+        WasmFeatures features,
+        FunctionBodyValidator.FusedBodyValidation? bodies,
+        int definedIndex);
 
     // ── Typed entry points (when caller knows the format) ─────────────────────
 
@@ -48,8 +50,9 @@ public static partial class ModuleReader
     public static WasmModule ReadModule(Stream stream, ModuleReaderOptions? options = null)
     {
         options ??= ModuleReaderOptions.Default;
-        var module = ParseCoreModule(stream, options);
-        WasmModuleValidator.ValidateAndThrow(module, options.Features);
+        ArgumentNullException.ThrowIfNull(stream);
+        var module = ReadCoreFromStream(stream, includesHeader: true, options, validateBodies: true, out var bodies);
+        WasmModuleValidator.ValidateAndThrow(module, options.Features, bodies);
         return module;
     }
 
@@ -69,7 +72,7 @@ public static partial class ModuleReader
     internal static WasmModule ParseCoreModule(Stream stream, ModuleReaderOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        return ReadCoreFromStream(stream, includesHeader: true, options ?? ModuleReaderOptions.Default);
+        return ReadCoreFromStream(stream, includesHeader: true, options ?? ModuleReaderOptions.Default, validateBodies: false, out _);
     }
 
     /// <summary>Read and validate a core module.</summary>
@@ -80,7 +83,17 @@ public static partial class ModuleReader
 
     /// <summary>Parse a core module from an in-memory buffer. Internal only.</summary>
     internal static WasmModule ParseCoreModule(ReadOnlyMemory<byte> bytes, ModuleReaderOptions? options = null)
-        => ReadCoreInPlace(bytes.Span, baseOffset: 0, includesHeader: true, options);
+        => ReadCoreInPlace(bytes.Span, baseOffset: 0, includesHeader: true, options, validateBodies: false, out _);
+
+    /// <summary>
+    /// Parses a core module from an in-memory buffer for a caller that validates it next, recording each function
+    /// body's validation result as the body is decoded. Pass <paramref name="bodies"/> to
+    /// <see cref="WasmModuleValidator.ValidateAndThrow(WasmModule, WasmFeatures, FunctionBodyValidator.FusedBodyValidation?)"/>
+    /// before anything can change the module.
+    /// </summary>
+    internal static WasmModule ParseCoreModuleForValidation(
+        ReadOnlyMemory<byte> bytes, ModuleReaderOptions? options, out FunctionBodyValidator.FusedBodyValidation? bodies)
+        => ReadCoreInPlace(bytes.Span, baseOffset: 0, includesHeader: true, options, validateBodies: true, out bodies);
 
     /// <summary>
     /// Parses a core module from <paramref name="stream"/>, reading each section once. A <see cref="MemoryStream"/>
@@ -90,13 +103,17 @@ public static partial class ModuleReader
     /// <param name="stream">The stream, positioned at the module.</param>
     /// <param name="includesHeader">Whether the stream starts at the 8-byte header, or just after it.</param>
     /// <param name="options">The reader options; <see langword="null"/> skips the debug sections.</param>
-    private static WasmModule ReadCoreFromStream(Stream stream, bool includesHeader, ModuleReaderOptions? options)
+    /// <param name="validateBodies">Whether to validate each function body as it is decoded, for a caller that validates next.</param>
+    /// <param name="bodies">The recorded body validation results, or <see langword="null"/> when none were recorded.</param>
+    private static WasmModule ReadCoreFromStream(
+        Stream stream, bool includesHeader, ModuleReaderOptions? options,
+        bool validateBodies, out FunctionBodyValidator.FusedBodyValidation? bodies)
     {
         if (stream.GetType() == typeof(MemoryStream) && ((MemoryStream)stream).TryGetBuffer(out ArraySegment<byte> buffer)
             && stream.Position <= buffer.Count)
         {
             int start = (int)stream.Position;
-            var parsed = ReadCoreInPlace(buffer.AsSpan(start), start, includesHeader, options);
+            var parsed = ReadCoreInPlace(buffer.AsSpan(start), start, includesHeader, options, validateBodies, out bodies);
             stream.Position = buffer.Count;
             return parsed;
         }
@@ -104,7 +121,7 @@ public static partial class ModuleReader
         using var framing = new WasmSectionStream(stream, nonSeekableStart: includesHeader ? 0 : 8);
         if (includesHeader)
             ValidateHeader(framing);
-        var module = new CoreModuleSections(options);
+        var module = new CoreModuleSections(options, validateBodies: validateBodies);
         while (framing.TryReadByte(out byte sectionId))
         {
             uint sectionSize = framing.ReadU32();
@@ -113,16 +130,19 @@ public static partial class ModuleReader
             ReadSection(module, sectionId, sectionSize, ref section);
         }
 
+        bodies = module.Bodies;
         return FinishCore(module, options);
     }
 
     /// <summary>Parses a core module whose bytes are all in memory.</summary>
-    private static WasmModule ReadCoreInPlace(ReadOnlySpan<byte> bytes, long baseOffset, bool includesHeader, ModuleReaderOptions? options)
+    private static WasmModule ReadCoreInPlace(
+        ReadOnlySpan<byte> bytes, long baseOffset, bool includesHeader, ModuleReaderOptions? options,
+        bool validateBodies, out FunctionBodyValidator.FusedBodyValidation? bodies)
     {
         var reader = new WasmSpanReader(bytes, baseOffset);
         if (includesHeader)
             ValidateHeader(ref reader);
-        var module = new CoreModuleSections(options);
+        var module = new CoreModuleSections(options, validateBodies: validateBodies);
         while (reader.HasMore)
         {
             byte sectionId = reader.ReadByte();
@@ -132,6 +152,7 @@ public static partial class ModuleReader
             ReadSection(module, sectionId, sectionSize, ref section);
         }
 
+        bodies = module.Bodies;
         return FinishCore(module, options);
     }
 
@@ -202,10 +223,17 @@ public static partial class ModuleReader
         /// </summary>
         public readonly bool Streaming;
 
-        public CoreModuleSections(ModuleReaderOptions? options, bool streaming = false)
+        /// <summary>Whether function bodies are validated as they are decoded, for a caller that validates next.</summary>
+        public readonly bool ValidateBodies;
+
+        /// <summary>The body validation results recorded while the code section was decoded, if <see cref="ValidateBodies"/>.</summary>
+        public FunctionBodyValidator.FusedBodyValidation? Bodies;
+
+        public CoreModuleSections(ModuleReaderOptions? options, bool streaming = false, bool validateBodies = false)
         {
             Features = (options ?? ModuleReaderOptions.Default).Features;
             Streaming = streaming;
+            ValidateBodies = validateBodies;
             DecodeModule = new WasmModule
             {
                 Types = Types,
@@ -215,6 +243,13 @@ public static partial class ModuleReader
                 Memories = Memories,
             };
         }
+
+        /// <summary>
+        /// Starts recording body validation results when the code section is reached: every section a body's
+        /// validation reads has been read by then, and data indices are checked against the data count section.
+        /// </summary>
+        public FunctionBodyValidator.FusedBodyValidation? BeginBodyValidation()
+            => ValidateBodies ? Bodies ??= new FunctionBodyValidator.FusedBodyValidation(CreateModule(), TypeIndices, DataCount) : null;
 
         public WasmModule CreateModule() => new()
         {
@@ -409,7 +444,7 @@ public static partial class ModuleReader
                 ReadElementSection(ref section, module.Elements);
                 break;
             case WasmSectionId.Code:
-                ReadCodeSection(ref section, module.Functions, module.TypeIndices, module.DecodeModule, module.DataCount.HasValue, module.Features);
+                ReadCodeSection(ref section, module.Functions, module.TypeIndices, module.DecodeModule, module.DataCount.HasValue, module.Features, module.BeginBodyValidation());
                 module.CodeSectionSeen = true;
                 break;
             case WasmSectionId.Data:
@@ -1013,7 +1048,8 @@ public static partial class ModuleReader
         List<int> typeIndices,
         WasmModule decodeModule,
         bool hasDataCountSection,
-        WasmFeatures features = WasmFeatures.Default)
+        WasmFeatures features = WasmFeatures.Default,
+        FunctionBodyValidator.FusedBodyValidation? bodies = null)
     {
         int functionIndex = functions.Count;
         for (uint remaining = reader.ReadU32(); remaining > 0; remaining--)
@@ -1031,7 +1067,7 @@ public static partial class ModuleReader
                 Locals = [],
                 Body = [],
             };
-            PopulateCodeEntry(ref body, bodySize, func, decodeModule, hasDataCountSection, features);
+            PopulateCodeEntry(ref body, bodySize, func, decodeModule, hasDataCountSection, features, bodies, functionIndex);
             func.CodeSectionOffset = funcOffset;
             func.BodyCodeSectionOffset = bodyStartOffset + (bodySize - (uint)func.Body.Length);
             func.LocalsCodeSectionOffset = bodyStartOffset;
@@ -1055,7 +1091,9 @@ public static partial class ModuleReader
         WasmFunction function,
         WasmModule decodeModule,
         bool hasDataCountSection,
-        WasmFeatures features = WasmFeatures.Default)
+        WasmFeatures features = WasmFeatures.Default,
+        FunctionBodyValidator.FusedBodyValidation? bodies = null,
+        int definedIndex = 0)
     {
         // Each declaration is at least a count byte and a type byte.
         uint declarationCount = reader.ReadVectorCount(minElementSize: 2);
@@ -1103,7 +1141,10 @@ public static partial class ModuleReader
         function.Body = body;
         function.OriginalLocalsByteLength =
             checked((uint)(bodySize - (uint)body.Length));
-        DecodeBody(body, decodeModule, function, hasDataCountSection, features);
+        // Only a load that validates (and so may execute) builds the retained execution form; an analysis load
+        // checks the grammar alone, and the form is decoded on demand if anything later needs it.
+        if (bodies is not null)
+            DecodeBody(body, decodeModule, function, hasDataCountSection, features, bodies, definedIndex);
         if (function.DecodedBody is null)
             // Naming trap: despite "Validate", this is a PARSE-stage activity. It walks the
             // instruction grammar and throws WasmFormatException (not WasmValidationException)
@@ -1111,7 +1152,7 @@ public static partial class ModuleReader
             // is a separate, later stage run by WasmModuleValidator. The distinction is
             // load-bearing: ParseModuleForAnalysis survives a semantically-invalid module but
             // still rejects one whose bytes do not decode.
-            ValidateCodeBody(body, hasDataCountSection, features);
+            ValidateCodeBody(body, hasDataCountSection, features, decodeModule.TypeDefinitions.Count);
     }
 
     private static void ReadDataSection(ref WasmSpanReader reader, List<Data> dataSegments)
@@ -1480,7 +1521,7 @@ public static partial class ModuleReader
     /// </summary>
     private static TableType ReadTableDefinition(ref WasmSpanReader reader)
     {
-        if (reader.PeekByte() is not 0x40)
+        if (reader.PeekByte() is not TableDefinitionEncoding.Initialized)
             return ReadBareTableType(ref reader);
 
         // Table with an initializer expression: 0x40 0x00 reftype limits expr.
@@ -1490,7 +1531,7 @@ public static partial class ModuleReader
         // never sets the reserved byte. The affirmative check is the one nobody wrote.
         reader.ReadByte(); // consume 0x40
         byte reserved = reader.ReadByte();
-        if (reserved != 0x00)
+        if (reserved != TableDefinitionEncoding.Reserved)
             throw new WasmFormatException($"Invalid table encoding: reserved byte after 0x40 must be 0x00, got 0x{reserved:X2}");
 
         var valType = ReadValTypeInfo(ref reader);
@@ -1533,11 +1574,10 @@ public static partial class ModuleReader
         bool hasMax = (flag & WasmLimitsFlags.HasMaximum) != 0;
         bool is64 = (flag & WasmLimitsFlags.Is64) != 0;
 
-        // For 64-bit memories/tables the bounds are u64 LEB128; otherwise u32.
-        ulong min = is64 ? reader.ReadU64() : reader.ReadU32();
-        ulong? max = hasMax
-            ? (is64 ? reader.ReadU64() : reader.ReadU32())
-            : null;
+        // The bounds are u64 LEB128 for every address type (§5.3.7). Whether they fit the address type is a
+        // validation rule (§3.2.5), checked by WasmModuleValidator, not a decoding one.
+        ulong min = reader.ReadU64();
+        ulong? max = hasMax ? reader.ReadU64() : null;
 
         return new Limits(min, max, is64);
     }
@@ -1573,8 +1613,10 @@ public static partial class ModuleReader
     /// its bytes, <c>end</c> included.
     /// </summary>
     /// <remarks>
-    /// The walk refuses an instruction outside the constant-expression grammar before decoding it, so the messages
-    /// below name the instruction rather than whatever follows it. A malformed immediate of a constant instruction is
+    /// An expression is any instruction sequence ending in <c>end</c> (§5.4.9); being <i>constant</i> is a
+    /// validation rule (§3.3.10). So an instruction outside the constant-expression grammar does not end the read:
+    /// the rest of the expression is read with the full instruction grammar, and
+    /// <see cref="Microsoft.NET.WebAssembly.Validation.ConstantExpressionValidator"/> rejects the expression. A malformed immediate is
     /// reported by the instruction decoder, as it is in a function body; bytes that run out before <c>end</c> are
     /// reported by the section reader, at the missing byte.
     /// </remarks>
@@ -1586,7 +1628,7 @@ public static partial class ModuleReader
             if (op == ConstOp.End)
                 return reader.ReadBytes(walker.Position).ToArray();
             if (op == ConstOp.NotConstant)
-                throw new WasmFormatException(NotConstantInitExprMessage(instruction.OpcodeId), reader.AbsolutePosition + instruction.ByteOffset);
+                return reader.ReadBytes(NonConstantExprLength(reader.RemainingBytes, instruction.ByteOffset, reader.AbsolutePosition)).ToArray();
         }
 
         reader.ReadBytes(walker.Position);
@@ -1594,12 +1636,45 @@ public static partial class ModuleReader
         throw new WasmFormatException("Init expression has no end opcode.", reader.AbsolutePosition);
     }
 
-    private static string NotConstantInitExprMessage(OpcodeId opcode) => opcode.Opcode switch
+    /// <summary>
+    /// The length of an expression whose instruction at <paramref name="start"/> is not constant, up to and
+    /// including the <c>end</c> that closes it, read with the full instruction grammar.
+    /// </summary>
+    private static int NonConstantExprLength(ReadOnlySpan<byte> bytes, int start, long baseOffset)
     {
-        WasmOpcode.SimdPrefix => $"Invalid SIMD init expression sub-opcode: 0x{opcode.SubOpcode:X}",
-        WasmOpcode.GcPrefix => $"Invalid GC init expression sub-opcode: 0x{opcode.SubOpcode:X}",
-        _ => $"Invalid init expression opcode: 0x{opcode.Opcode:X2}",
-    };
+        var cursor = new InstructionCursor(bytes[start..], WasmFeatures.All);
+        int depth = 0;
+        while (true)
+        {
+            DecodedInstruction instruction;
+            try
+            {
+                if (!cursor.MoveNext(out instruction))
+                    break;
+            }
+            catch (WasmFormatException ex) when (ex.GetType() == typeof(WasmFormatException) && ex.BinaryOffset is null)
+            {
+                throw new WasmFormatException(ex.Message, ex, baseOffset + start + cursor.Position);
+            }
+
+            switch (instruction.OpcodeId.Opcode)
+            {
+                case WasmOpcode.Block or WasmOpcode.Loop or WasmOpcode.If or WasmOpcode.Try or WasmOpcode.TryTable:
+                    depth++;
+                    break;
+                case WasmOpcode.Delegate:
+                    depth--;
+                    break;
+                case WasmOpcode.End when depth == 0:
+                    return start + cursor.Position;
+                case WasmOpcode.End:
+                    depth--;
+                    break;
+            }
+        }
+
+        throw new WasmFormatException("Init expression has no end opcode.", baseOffset + bytes.Length);
+    }
 
     private static int ReadElemExprFunctionIndex(byte[] expr)
     {
@@ -1654,10 +1729,26 @@ public static partial class ModuleReader
     // ── Code body validation ────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Rejects a <c>ref.null</c> heap-type immediate that is neither a known abstract heap type nor an index into the
+    /// type table. Shared by the execution decoder and the grammar-only walk, so both load paths reject the same bodies.
+    /// </summary>
+    internal static void CheckRefNullHeapType(long heapType, int typeDefinitionCount)
+    {
+        if (heapType < 0 && !AbstractHeapTypeCodes.TryFromCode((byte)(heapType & 0x7F), out _))
+            throw new WasmFormatException(
+                $"Unknown heap type 0x{(byte)(heapType & 0x7F):X2} in ref.null");
+
+        if (heapType >= 0 && (ulong)heapType >= (ulong)typeDefinitionCount)
+            throw new WasmFormatException(
+                $"Defined type index {heapType} is out of range in ref.null " +
+                $"(type table has {typeDefinitionCount} entries)");
+    }
+
+    /// <summary>
     /// Validates the binary grammar of a function body using the shared instruction cursor,
     /// including well-formed immediates, known prefix sub-opcodes, and structural termination.
     /// </summary>
-    private static void ValidateCodeBody(byte[] body, bool hasDataCountSection, WasmFeatures features)
+    private static void ValidateCodeBody(byte[] body, bool hasDataCountSection, WasmFeatures features, int typeDefinitionCount)
     {
         var cursor = new InstructionCursor(body, features);
         var stack = new List<(byte opcode, bool isIf, bool isTry)>(4);
@@ -1706,6 +1797,8 @@ public static partial class ModuleReader
 
             if (instruction.OpcodeId.Opcode == WasmOpcode.MiscPrefix && instruction.OpcodeId.SubOpcode is 8 or 9 && !hasDataCountSection)
                 throw new WasmFormatException("data count section required");
+            if (instruction.OpcodeId.Opcode == WasmOpcode.RefNull)
+                CheckRefNullHeapType(instruction.HeapType0, typeDefinitionCount);
         }
 
         throw new WasmFormatException("END opcode expected in function body");

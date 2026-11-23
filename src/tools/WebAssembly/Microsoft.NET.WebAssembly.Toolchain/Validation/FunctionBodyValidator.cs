@@ -95,13 +95,28 @@ internal static class FunctionBodyValidator
         => LookupRule(table, key) ?? fallback[key];
 
     public static WasmValidationResult ValidateModule(WasmModule module, WasmFeatures features = WasmFeatures.Default)
+        => ValidateModule(module, features, prevalidated: null);
+
+    /// <summary>
+    /// Validates every function body, taking the result for each body <paramref name="prevalidated"/> recorded while
+    /// the module was decoded, and walking only the bodies it could not decide.
+    /// </summary>
+    internal static WasmValidationResult ValidateModule(WasmModule module, WasmFeatures features, FusedBodyValidation? prevalidated)
     {
+        if (prevalidated is not null && prevalidated.FunctionCount != module.Functions.Count)
+            prevalidated = null;
+
         var diagnostics = new List<WasmValidationDiagnostic>();
-        var context = new ModuleValidationContext(module);
-        var validator = new FunctionValidator(context, features);
+        ModuleValidationContext? context = null;
+        FunctionValidator? validator = null;
         for (int definedIndex = 0; definedIndex < module.Functions.Count; definedIndex++)
         {
-            var diagnostic = validator.Validate(definedIndex);
+            if (prevalidated is null || !prevalidated.TryGetResult(definedIndex, out var diagnostic))
+            {
+                validator ??= new FunctionValidator(context ??= new ModuleValidationContext(module), features);
+                diagnostic = validator.Validate(definedIndex);
+            }
+
             if (diagnostic is not null)
                 diagnostics.Add(diagnostic);
         }
@@ -160,9 +175,28 @@ internal static class FunctionBodyValidator
         private readonly HashSet<int> _declaredFunctionReferences = [];
         private readonly FunctionSignature?[] _functionSignatures;
 
+        private readonly int _definedFunctionCount;
+        private readonly uint? _dataCount;
+        private readonly bool _deferDataIndices;
+
         public ModuleValidationContext(WasmModule module)
+            : this(module, definedFunctionTypeIndices: null, dataCount: null)
+        {
+        }
+
+        /// <summary>
+        /// A context for validating bodies while the code section is decoded, when the function section's type
+        /// indices are known but <see cref="WasmModule.Functions"/> is still being filled in, and the data section
+        /// has not been read: data indices are checked against the data count section, which must agree with the
+        /// data section once it is read. Without one, a data index is not decided here (see
+        /// <see cref="DeferredBodyException"/>).
+        /// </summary>
+        public ModuleValidationContext(WasmModule module, IReadOnlyList<int>? definedFunctionTypeIndices, uint? dataCount)
         {
             _module = module;
+            _dataCount = dataCount;
+            _deferDataIndices = definedFunctionTypeIndices is not null && dataCount is null;
+            _definedFunctionCount = definedFunctionTypeIndices?.Count ?? module.Functions.Count;
             _functionSignatures = new FunctionSignature?[module.Types.Count];
             for (int typeIndex = 0; typeIndex < _functionSignatures.Length; typeIndex++)
             {
@@ -204,8 +238,17 @@ internal static class FunctionBodyValidator
                 }
             }
 
-            foreach (var function in module.Functions)
-                _functionTypeIndices.Add(function.TypeIndex);
+            if (definedFunctionTypeIndices is not null)
+            {
+                foreach (int typeIndex in definedFunctionTypeIndices)
+                    _functionTypeIndices.Add(typeIndex);
+            }
+            else
+            {
+                foreach (var function in module.Functions)
+                    _functionTypeIndices.Add(function.TypeIndex);
+            }
+
             foreach (var memory in module.Memories)
                 _memoryTypes.Add(memory);
             foreach (var table in module.Tables)
@@ -238,7 +281,7 @@ internal static class FunctionBodyValidator
             }
         }
 
-        public int ImportedFunctionCount => _functionTypeIndices.Count - _module.Functions.Count;
+        public int ImportedFunctionCount => _functionTypeIndices.Count - _definedFunctionCount;
 
         public List<TypeDefinition> TypeDefinitions => _module.TypeDefinitions;
 
@@ -252,7 +295,14 @@ internal static class FunctionBodyValidator
 
         public GlobalType? Global(uint index) => index < _globalTypes.Count ? _globalTypes[(int)index] : null;
 
-        public Data? DataSegment(uint index) => index < _module.DataSegments.Count ? _module.DataSegments[(int)index] : null;
+        public bool HasDataSegment(uint index)
+        {
+            if (_dataCount is { } count)
+                return index < count;
+            if (_deferDataIndices)
+                throw new DeferredBodyException();
+            return index < (uint)_module.DataSegments.Count;
+        }
 
         public Element? ElementSegment(uint index) => index < _module.Elements.Count ? _module.Elements[(int)index] : null;
 
@@ -356,9 +406,12 @@ internal static class FunctionBodyValidator
         }
 
         private void Initialize(int definedFunctionIndex)
+            => Initialize(definedFunctionIndex, _context.DefinedFunction(definedFunctionIndex));
+
+        internal void Initialize(int definedFunctionIndex, WasmFunction function)
         {
             _absoluteFunctionIndex = _context.ImportedFunctionCount + definedFunctionIndex;
-            _function = _context.DefinedFunction(definedFunctionIndex);
+            _function = function;
             _values.Clear();
             _controls.Clear();
             _controlFramePoolCount = 0;
@@ -439,26 +492,41 @@ internal static class FunctionBodyValidator
                 var cursor = new InstructionCursor(_function.Body, _features);
                 while (cursor.MoveNext(out var instruction))
                 {
-                    _lastOffset = instruction.ByteOffset;
-                    _lastOpcode = instruction.OpcodeId;
-                    Apply(instruction);
-
-                    if (_controls.Count == 0)
-                    {
-                        if (cursor.Position != _function.Body.Length)
-                            throw Failure(WasmValidationCode.FunctionBodyControlMismatch, "Unexpected bytes after function end");
+                    if (Step(instruction, cursor.Position))
                         return null;
-                    }
                 }
 
-                throw Failure(WasmValidationCode.FunctionBodyControlMismatch, "Function body is missing final end");
+                throw MissingFinalEnd();
             }
             catch (ValidationFailure failure)
             {
-                return new WasmValidationDiagnostic(failure.Code,
-                    $"function {_absoluteFunctionIndex} offset 0x{_lastOffset:X}: {_lastOpcode?.ToString() ?? ""}: {failure.Message}");
+                return ToDiagnostic(failure);
             }
         }
+
+        /// <summary>
+        /// Applies one instruction; <paramref name="nextPosition"/> is where the next one starts. Returns true once the
+        /// function's own <c>end</c> has been applied, which must be the body's last byte.
+        /// </summary>
+        internal bool Step(DecodedInstruction instruction, int nextPosition)
+        {
+            _lastOffset = instruction.ByteOffset;
+            _lastOpcode = instruction.OpcodeId;
+            Apply(instruction);
+
+            if (_controls.Count != 0)
+                return false;
+            if (nextPosition != _function.Body.Length)
+                throw Failure(WasmValidationCode.FunctionBodyControlMismatch, "Unexpected bytes after function end");
+            return true;
+        }
+
+        internal static ValidationFailure MissingFinalEnd()
+            => Failure(WasmValidationCode.FunctionBodyControlMismatch, "Function body is missing final end");
+
+        internal WasmValidationDiagnostic ToDiagnostic(ValidationFailure failure)
+            => new(failure.Code,
+                $"function {_absoluteFunctionIndex} offset 0x{_lastOffset:X}: {_lastOpcode?.ToString() ?? ""}: {failure.Message}");
 
         private void Apply(DecodedInstruction instruction)
         {
@@ -1432,7 +1500,7 @@ internal static class FunctionBodyValidator
         private void ArrayNewData(uint typeIndex, uint dataIndex)
         {
             var field = ArrayField(typeIndex);
-            _ = DataSegment(dataIndex);
+            RequireDataSegment(dataIndex);
             EnsurePackedArrayForData(field.StorageType, typeIndex);
             Pop(I32);
             Pop(I32);
@@ -1502,7 +1570,7 @@ internal static class FunctionBodyValidator
         private void ArrayInitData(uint typeIndex, uint dataIndex)
         {
             var field = ArrayField(typeIndex);
-            _ = DataSegment(dataIndex);
+            RequireDataSegment(dataIndex);
             EnsureMutableArray(field, typeIndex);
             EnsurePackedArrayForData(field.StorageType, typeIndex);
             Pop(I32);
@@ -1613,7 +1681,7 @@ internal static class FunctionBodyValidator
         private void ScalarLoad(DecodedInstruction instruction)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, ScalarMemoryNaturalAlignment(instruction.OpcodeId.Opcode));
+            ValidateMemArg(instruction, memory, ScalarMemoryNaturalAlignment(instruction.OpcodeId.Opcode));
             Pop(IndexType(memory));
             Push(ScalarLoadResultType(instruction.OpcodeId.Opcode));
         }
@@ -1621,14 +1689,14 @@ internal static class FunctionBodyValidator
         private void ScalarStore(DecodedInstruction instruction)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, ScalarMemoryNaturalAlignment(instruction.OpcodeId.Opcode));
+            ValidateMemArg(instruction, memory, ScalarMemoryNaturalAlignment(instruction.OpcodeId.Opcode));
             Pop(ScalarStoreValueType(instruction.OpcodeId.Opcode));
             Pop(IndexType(memory));
         }
 
         private void MemoryInit(uint dataIndex, uint memoryIndex)
         {
-            _ = DataSegment(dataIndex);
+            RequireDataSegment(dataIndex);
             var memory = Memory(memoryIndex);
 
             Pop(I32);
@@ -1638,7 +1706,7 @@ internal static class FunctionBodyValidator
 
         private void DataDrop(uint dataIndex)
         {
-            _ = DataSegment(dataIndex);
+            RequireDataSegment(dataIndex);
         }
 
         private void MemoryCopy(uint destinationIndex, uint sourceIndex)
@@ -1729,7 +1797,7 @@ internal static class FunctionBodyValidator
         private void SimdLoad(DecodedInstruction instruction, uint subOpcode)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, SimdNaturalAlignment(subOpcode));
+            ValidateMemArg(instruction, memory, SimdNaturalAlignment(subOpcode));
             Pop(IndexType(memory));
             Push(V128);
         }
@@ -1737,7 +1805,7 @@ internal static class FunctionBodyValidator
         private void SimdStore(DecodedInstruction instruction, uint subOpcode)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, SimdNaturalAlignment(subOpcode));
+            ValidateMemArg(instruction, memory, SimdNaturalAlignment(subOpcode));
             Pop(V128);
             Pop(IndexType(memory));
         }
@@ -1745,7 +1813,7 @@ internal static class FunctionBodyValidator
         private void SimdLoadLane(DecodedInstruction instruction, uint subOpcode)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, SimdNaturalAlignment(subOpcode));
+            ValidateMemArg(instruction, memory, SimdNaturalAlignment(subOpcode));
             ValidateLane(instruction.Flags, LaneCount(subOpcode));
             Pop(V128);
             Pop(IndexType(memory));
@@ -1755,7 +1823,7 @@ internal static class FunctionBodyValidator
         private void SimdStoreLane(DecodedInstruction instruction, uint subOpcode)
         {
             var memory = Memory(instruction.Index1);
-            ValidateMemoryAlignment(instruction, SimdNaturalAlignment(subOpcode));
+            ValidateMemArg(instruction, memory, SimdNaturalAlignment(subOpcode));
             ValidateLane(instruction.Flags, LaneCount(subOpcode));
             Pop(V128);
             Pop(IndexType(memory));
@@ -1773,9 +1841,11 @@ internal static class FunctionBodyValidator
             => _context.Global(index)
                ?? throw Failure(WasmValidationCode.GlobalIndexOutOfRange, $"Global index {index} is out of range");
 
-        private Data DataSegment(uint index)
-            => _context.DataSegment(index)
-               ?? throw Failure(WasmValidationCode.DataMemoryIndexInvalid, $"Data segment index {index} is out of range");
+        private void RequireDataSegment(uint index)
+        {
+            if (!_context.HasDataSegment(index))
+                throw Failure(WasmValidationCode.DataMemoryIndexInvalid, $"Data segment index {index} is out of range");
+        }
 
         private Element ElementSegment(uint index)
             => _context.ElementSegment(index)
@@ -2040,11 +2110,16 @@ internal static class FunctionBodyValidator
             PushMany(rule.Outputs);
         }
 
-        private static void ValidateMemoryAlignment(DecodedInstruction instruction, uint naturalAlignment)
+        private static void ValidateMemArg(DecodedInstruction instruction, MemoryType memory, uint naturalAlignment)
         {
             if (instruction.Index0 > naturalAlignment)
                 throw Failure(WasmValidationCode.FunctionBodyInvalidImmediate,
                     $"Memory alignment {instruction.Index0} exceeds natural alignment {naturalAlignment}");
+
+            // The binary memarg offset is a u64 for every memory; the bound is the memory's address type (validation, not decoding).
+            if (!memory.Is64 && instruction.MemOffset > uint.MaxValue)
+                throw Failure(WasmValidationCode.FunctionBodyInvalidImmediate,
+                    $"Memory offset {instruction.MemOffset} is out of range for a 32-bit memory");
         }
 
         private static void ValidateLane(byte lane, uint laneCount)
@@ -2372,6 +2447,103 @@ internal static class FunctionBodyValidator
     private sealed record FunctionSignature(ExactValueType[] Parameters, ExactValueType[] Results);
     private readonly record struct BlockSignature(ExactValueType[] Inputs, ExactValueType[] Outputs);
     private sealed record SignatureRule(ExactValueType[] Inputs, ExactValueType[] Outputs);
+    /// <summary>A context cannot decide a check while the code section is decoded; the body is validated afterwards.</summary>
+    private sealed class DeferredBodyException : Exception;
+
+    /// <summary>
+    /// Validates function bodies from the decoder's instruction walk, so a validated load reads each body once
+    /// (docs/design/validator.md §7.1, §11.2) instead of walking it again in <see cref="ValidateModule(WasmModule, WasmFeatures)"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Results are recorded, never thrown: the module is decoded to the end first, so a malformed module is still
+    /// reported as malformed, and the diagnostics are merged in the same place and order as the separate pass.</para>
+    /// <para>A body is left undecided, and validated afterwards exactly as before, whenever its result could differ
+    /// from that pass: the validator threw something other than a validation failure, or it needed a data index
+    /// without a data count section (the data section has not been read yet).</para>
+    /// </remarks>
+    internal sealed class FusedBodyValidation(WasmModule module, IReadOnlyList<int> definedFunctionTypeIndices, uint? dataCount)
+    {
+        private readonly List<WasmValidationDiagnostic?> _results = [];
+        private readonly List<bool> _decided = [];
+        private FunctionValidator? _validator;
+        private bool _unavailable;
+        private int _current;
+        private bool _active;
+
+        public int FunctionCount => _results.Count;
+
+        public void Begin(int definedIndex, WasmFunction function)
+        {
+            while (_results.Count <= definedIndex)
+            {
+                _results.Add(null);
+                _decided.Add(false);
+            }
+
+            _current = definedIndex;
+            _active = false;
+            if (_unavailable)
+                return;
+
+            try
+            {
+                _validator ??= new FunctionValidator(
+                    new ModuleValidationContext(module, definedFunctionTypeIndices, dataCount), WasmFeatures.All);
+                _validator.Initialize(definedIndex, function);
+                _active = true;
+            }
+            catch (Exception) when (_validator is null)
+            {
+                _unavailable = true;
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        public void Observe(in DecodedInstruction instruction, int nextPosition)
+        {
+            if (!_active)
+                return;
+
+            try
+            {
+                if (_validator!.Step(instruction, nextPosition))
+                    Decide(null);
+            }
+            catch (ValidationFailure failure)
+            {
+                Decide(_validator!.ToDiagnostic(failure));
+            }
+            catch (Exception)
+            {
+                _active = false;
+            }
+        }
+
+        public void End()
+        {
+            if (_active)
+                Decide(_validator!.ToDiagnostic(FunctionValidator.MissingFinalEnd()));
+        }
+
+        public bool TryGetResult(int definedIndex, out WasmValidationDiagnostic? diagnostic)
+        {
+            diagnostic = null;
+            if ((uint)definedIndex >= (uint)_results.Count || !_decided[definedIndex])
+                return false;
+            diagnostic = _results[definedIndex];
+            return true;
+        }
+
+        private void Decide(WasmValidationDiagnostic? diagnostic)
+        {
+            _results[_current] = diagnostic;
+            _decided[_current] = true;
+            _active = false;
+        }
+    }
+
     private sealed class ValidationFailure(WasmValidationCode code, string message) : Exception(message)
     {
         public WasmValidationCode Code { get; } = code;

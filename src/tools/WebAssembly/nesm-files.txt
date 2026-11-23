@@ -39,10 +39,15 @@ Binary/WasmOpcode.cs
 Binary/WasmSectionStream.cs
 Binary/WasmSpanReader.cs
 Binary/WasmUnimplementedFormatException.cs
+Binary/Writing/BufferWriterStream.cs
 Binary/Writing/ComponentSectionId.cs
 Binary/Writing/DataSegmentEncoder.cs
+Binary/Writing/ExactArrayBufferWriter.cs
+Binary/Writing/IndirectNameMapWriter.cs
 Binary/Writing/LinkingSectionEncoder.cs
+Binary/Writing/ModuleNameWriter.cs
 Binary/Writing/NameMapWriter.cs
+Binary/Writing/NameSink.cs
 Binary/Writing/RelocationSectionEncoder.cs
 Binary/Writing/SegmentedBuffer.cs
 Binary/Writing/WasmCodeWriter.cs
@@ -58,6 +63,7 @@ Binary/Writing/WasmValType.cs
 Debugging/Symbols/DwarfSymbolProvider.cs
 Debugging/Symbols/FunctionBreakpointResolution.cs
 Debugging/Symbols/ManagedSymbolProviders.cs
+Debugging/Symbols/ModuleSelection.cs
 Debugging/Symbols/SymbolModel.cs
 Debugging/Symbols/SymbolProviders.cs
 Debugging/Symbols/SymbolResolver.cs

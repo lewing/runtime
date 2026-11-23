@@ -189,6 +189,32 @@ public class DebugAndNameSectionTests
         }
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(32)]
+    public void Link_NameSection_NamesAnAliasedFunctionOnce(int aliasCount)
+    {
+        // Two symbols name one function. A name map holds one name per index (a repeated index is malformed), so the
+        // first name in symbol-table order is kept, as in wasm-ld.
+        var module = MakeModuleWithExportedFunction("zeta");
+        for (int i = 0; i < aliasCount; i++)
+        {
+            module.LinkingSection!.Symbols.Add(new WasmSymbol
+            {
+                Type = SymbolType.Function,
+                Flags = SymbolFlags.Exported,
+                Name = i == 0 ? "alpha" : $"alias{i}",
+                Index = 0,
+            });
+        }
+
+        var merged = _linker.Link([module]);
+
+        var names = WasmNameSectionReader.Read(merged);
+        Assert.Null(names.Malformation);
+        Assert.Equal([(0, "zeta")], names.FunctionNameList);
+    }
+
     // ── Debug + name section interaction ────────────────────────────────────────
 
     [Fact]

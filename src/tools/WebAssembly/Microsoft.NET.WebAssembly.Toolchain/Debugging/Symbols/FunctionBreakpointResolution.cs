@@ -38,7 +38,7 @@ internal sealed partial record FunctionBreakpointResolution(
 
     public bool IsBound => Status == FunctionBreakpointStatus.Bound;
 
-    /// <summary>The binding came from the substring tier, not an exact name (lewing's decision on #540).</summary>
+    /// <summary>The binding came from the substring tier, not an exact name (maintainer decision on #540).</summary>
     public bool IsSubstringMatch => IsBound && Match!.MatchedBy != MatchMode.Exact;
 
     /// <summary>The bound slot is a host import, not a wasm-defined function.</summary>

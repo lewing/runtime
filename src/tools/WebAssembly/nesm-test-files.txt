@@ -32,6 +32,7 @@ Linker/WasmLdCommandLineTests.cs
 Linker/WasmLinkerTests.cs
 Linker/WasmModuleStartFunctionTests.cs
 Linker/WatIntegrationTests.cs
+Validation/FusedBodyValidationOrderingTests.cs
 ValidationTests.cs
 WasmToolsTestHelper.cs
 Wat/StreamingTests.cs

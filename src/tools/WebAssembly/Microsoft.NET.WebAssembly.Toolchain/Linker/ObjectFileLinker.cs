@@ -2202,51 +2202,47 @@ internal sealed class ObjectFileLinker
 
     private static CustomSection BuildNameSection(string? moduleName, List<byte[]?> functionNames, List<byte[]?> globalNames, List<byte[]?> segmentNames)
     {
-        using var content = new MemoryStream();
-        if (moduleName is not null)
-        {
-            // wasm-ld always writes the module name subsection first (--soname, or else the output file's name).
-            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(moduleName);
-            using var body = new MemoryStream();
-            WasmLeb128.WriteULeb128(body, (uint)utf8.Length);
-            body.Write(utf8);
-            content.WriteByte((byte)NameSubsectionId.Module);
-            WasmLeb128.WriteULeb128(content, (uint)body.Length);
-            body.Position = 0;
-            body.CopyTo(content);
-        }
-
-        WriteNameMap(content, NameSubsectionId.Function, functionNames);
-        WriteNameMap(content, NameSubsectionId.Global, globalNames);
-        WriteNameMap(content, NameSubsectionId.DataSegment, segmentNames);
+        // wasm-ld always writes the module name subsection first (--soname, or else the output file's name).
+        byte[]? moduleNameUtf8 = moduleName is null ? null : System.Text.Encoding.UTF8.GetBytes(moduleName);
+        long size = (moduleNameUtf8 is null ? 0 : ModuleNameWriter.GetSubsectionSize(moduleNameUtf8.Length)) +
+            NameMapSize(functionNames, out int functionCount, out long functionEntries) +
+            NameMapSize(globalNames, out int globalCount, out long globalEntries) +
+            NameMapSize(segmentNames, out int segmentCount, out long segmentEntries);
+        var content = new ExactArrayBufferWriter(size);
+        if (moduleNameUtf8 is not null)
+            ModuleNameWriter.Write(content, moduleNameUtf8);
+        WriteNameMap(content, NameSubsectionId.Function, functionNames, functionCount, functionEntries);
+        WriteNameMap(content, NameSubsectionId.Global, globalNames, globalCount, globalEntries);
+        WriteNameMap(content, NameSubsectionId.DataSegment, segmentNames, segmentCount, segmentEntries);
         return new CustomSection("name", content.ToArray());
     }
 
-    private static void WriteNameMap(Stream output, NameSubsectionId subsection, List<byte[]?> names)
+    // The size of the subsection naming every non-null entry of names, or 0 when there are none (it is then omitted).
+    private static long NameMapSize(List<byte[]?> names, out int count, out long entriesSize)
     {
-        int count = 0;
-        foreach (byte[]? name in names)
-        {
-            if (name is not null)
-                count++;
-        }
-
-        if (count == 0)
-            return;
-        using var body = new MemoryStream();
-        WasmLeb128.WriteULeb128(body, (uint)count);
+        count = 0;
+        entriesSize = 0;
         for (int i = 0; i < names.Count; i++)
         {
             if (names[i] is not byte[] name)
                 continue;
-            WasmLeb128.WriteULeb128(body, (uint)i);
-            WasmLeb128.WriteULeb128(body, (uint)name.Length);
-            body.Write(name);
+            count++;
+            entriesSize += NameMapWriter.GetEntrySize((uint)i, name.Length);
         }
-        output.WriteByte((byte)subsection);
-        WasmLeb128.WriteULeb128(output, (uint)body.Length);
-        body.Position = 0;
-        body.CopyTo(output);
+        return count == 0 ? 0 : NameMapWriter.GetSubsectionSize(count, entriesSize);
+    }
+
+    private static void WriteNameMap(ExactArrayBufferWriter output, NameSubsectionId subsection, List<byte[]?> names, int count, long entriesSize)
+    {
+        if (count == 0)
+            return;
+        var map = new NameMapWriter(output, subsection, count, entriesSize);
+        for (int i = 0; i < names.Count; i++)
+        {
+            if (names[i] is byte[] name)
+                map.Write((uint)i, name);
+        }
+        map.Complete();
     }
 
     private void PrintRemoved()

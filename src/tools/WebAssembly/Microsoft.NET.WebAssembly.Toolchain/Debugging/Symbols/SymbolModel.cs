@@ -16,7 +16,7 @@ namespace Microsoft.NET.WebAssembly.Debugging.Symbols;
 /// without changing the policy: <see cref="NativeSymbolMap"/> and <see cref="R2R"/> (PR 3, in
 /// Nesm.Cdp), <see cref="Cdac"/> (PR 5). When the R2R provider lands, its managed C# name is the
 /// primary display name for R2R code and the mangled name-section name stays available as an alias
-/// (lewing's decision on #540); <see cref="SymbolPolicy.DisplayPrecedence"/> already orders it so.
+/// (maintainer decision on #540); <see cref="SymbolPolicy.DisplayPrecedence"/> already orders it so.
 /// </remarks>
 internal enum SymbolSource
 {
@@ -102,11 +102,16 @@ internal enum MatchMode
 /// </param>
 /// <param name="CoreModule">Restrict to the scope with this name (case-insensitive).</param>
 /// <param name="Sources">Restrict to these sources (null = all).</param>
+/// <param name="DefinedOnly">
+/// Only functions with a body are candidates. Applied BEFORE the tiers, so an exact name that only an
+/// import slot carries cannot hide defined substring matches (#625 review).
+/// </param>
 internal sealed record NameQuery(
     string Text,
     MatchMode Mode = MatchMode.Substring,
     string? CoreModule = null,
-    IReadOnlySet<SymbolSource>? Sources = null);
+    IReadOnlySet<SymbolSource>? Sources = null,
+    bool DefinedOnly = false);
 
 /// <summary>A name that matched, and the scope (core module) and function slot that supplied it.</summary>
 internal sealed record SymbolMatch(SymbolName Name, string? Scope, int FunctionIndex);

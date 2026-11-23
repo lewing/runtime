@@ -40,16 +40,31 @@ internal enum WasmLimitsFlags : byte
     All = HasMaximum | Shared | Is64,
 }
 
+/// <summary>Prefix and reserved byte of a table definition with an initializer expression.</summary>
+internal static class TableDefinitionEncoding
+{
+    public const byte Initialized = 0x40;
+    public const byte Reserved = 0x00;
+}
+
 /// <summary>An element segment's flags: its mode, whether the table index is explicit, and whether it holds
 /// function indices (with an <c>elemkind</c>) or expressions (with a reference type).</summary>
-internal enum ElementSegmentKind : byte
+public enum ElementSegmentKind : byte
 {
+    /// <summary>Active in table zero, containing function indices.</summary>
     ActiveFunctions = 0,
+    /// <summary>Passive, containing function indices.</summary>
     PassiveFunctions = 1,
+    /// <summary>Active in an explicitly indexed table, containing function indices.</summary>
     ActiveTableFunctions = 2,
+    /// <summary>Declarative, containing function indices.</summary>
     DeclarativeFunctions = 3,
+    /// <summary>Active in table zero, containing funcref expressions.</summary>
     ActiveExpressions = 4,
+    /// <summary>Passive, containing reference expressions.</summary>
     PassiveExpressions = 5,
+    /// <summary>Active in an explicitly indexed table, containing reference expressions.</summary>
     ActiveTableExpressions = 6,
+    /// <summary>Declarative, containing reference expressions.</summary>
     DeclarativeExpressions = 7,
 }

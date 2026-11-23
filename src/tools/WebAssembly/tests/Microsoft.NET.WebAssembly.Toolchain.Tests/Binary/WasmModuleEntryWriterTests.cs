@@ -151,6 +151,116 @@ public sealed class WasmModuleEntryWriterTests
     }
 
     [Fact]
+    public void TablesWithInitializersPreserveTheirReferenceTypeAndLimits()
+    {
+        var (w, output) = NewWriter();
+        w.Table(WasmValType.Ref(WasmHeapType.Concrete(2), nullable: false), 1, 3, false, [0xD2, 0x00, 0x0B]);
+        w.Table(ValType.FuncRef, 2, null, true, [0xD0, 0x70, 0x0B]);
+        Assert.Equal(Convert.FromHexString("40006402010103d2000b4000700402d0700b"), output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void TableInitializerErrorsDoNotWriteAnEntry()
+    {
+        var (w, output) = NewWriter();
+        Assert.Throws<ArgumentException>(() => w.Table(ValType.I32, 1, null, false, [0x0B]));
+        Assert.Throws<ArgumentException>(() => w.Table(ValType.FuncRef, 2, 1, false, [0x0B]));
+        Assert.Throws<ArgumentException>(() => w.Table(ValType.FuncRef, 1, null, false, [0xD0, 0x70]));
+        Assert.Equal(0, output.WrittenCount);
+    }
+
+    [Fact]
+    public void MemoryStreamBufferWriterAppendsAndSupportsStreamWrites()
+    {
+        using var stream = new BufferWriterStream(allowInvalidModuleEntries: false);
+        stream.GetSpan(0)[0] = 0x11;
+        stream.Advance(1);
+        stream.WriteByte(0x22);
+        stream.GetMemory(32).Span[0] = 0x33;
+        stream.Advance(1);
+        stream.Write((ReadOnlySpan<byte>)[0x44, 0x55]);
+        Assert.Equal(new byte[] { 0x11, 0x22, 0x33, 0x44, 0x55 }, stream.ToArray());
+        stream.Position = 1;
+        stream.Write((ReadOnlySpan<byte>)[0x66, 0x77]);
+        Assert.Equal(new byte[] { 0x11, 0x66, 0x77, 0x44, 0x55 }, stream.ToArray());
+        Assert.Throws<ArgumentOutOfRangeException>(() => { stream.GetSpan(-1); });
+    }
+
+    [Fact]
+    public void StreamBufferWriterAdvanceDistinguishesArgumentsFromWrongState()
+    {
+        using var stream = new BufferWriterStream(allowInvalidModuleEntries: false);
+        Assert.Throws<InvalidOperationException>(() => stream.Advance(0));
+        stream.GetSpan(1)[0] = 0x11;
+        Assert.Throws<ArgumentOutOfRangeException>(() => stream.Advance(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => stream.Advance(stream.Capacity + 1));
+        stream.Advance(1);
+        Assert.Throws<InvalidOperationException>(() => stream.Advance(0));
+        stream.GetSpan(1);
+        stream.Position = 0;
+        Assert.Throws<InvalidOperationException>(() => stream.Advance(1));
+    }
+
+    [Fact]
+    public void StreamBackedEntryWriterHandlesSingleAndMultiByteIndices()
+    {
+        using var stream = new BufferWriterStream(allowInvalidModuleEntries: false);
+        stream.Entries.Count(2);
+        Assert.Equal(1, stream.Entries.Function(127));
+        Assert.Equal(2, stream.Entries.Function(128));
+        stream.Entries.FuncType([ValType.I32, ValType.I64], [ValType.F32]);
+        Assert.Equal(Convert.FromHexString("027f800160027f7e017d"), stream.ToArray());
+        Assert.Equal(10, stream.Entries.Position);
+    }
+
+    [Fact]
+    public void ElementSegmentsWriteEveryModeAndPreserveExplicitTableZero()
+    {
+        var (w, output) = NewWriter();
+        ReadOnlyMemory<byte>[] expressions = [new byte[] { 0xD2, 0x01, 0x0B }];
+        w.ElementSegment(ElementSegmentKind.ActiveFunctions, 0, [0x41, 0, 0x0B], [1u]);
+        w.ElementSegment(ElementSegmentKind.PassiveFunctions, 0, [], [1u]);
+        w.ElementSegment(ElementSegmentKind.ActiveTableFunctions, 0, [0x41, 0, 0x0B], [1u]);
+        w.ElementSegment(ElementSegmentKind.DeclarativeFunctions, 0, [], [1u]);
+        w.ElementSegment(ElementSegmentKind.ActiveExpressions, 0, [0x41, 0, 0x0B], ValType.FuncRef, expressions);
+        w.ElementSegment(ElementSegmentKind.PassiveExpressions, 0, [], ValType.ExternRef, expressions);
+        w.ElementSegment(ElementSegmentKind.ActiveTableExpressions, 0, [0x41, 0, 0x0B], ValType.ExternRef, expressions);
+        w.ElementSegment(ElementSegmentKind.DeclarativeExpressions, 0, [], ValType.ExternRef, expressions);
+        Assert.Equal(Convert.FromHexString(
+            "0041000b0101" + "01000101" + "020041000b000101" + "03000101" +
+            "0441000b01d2010b" + "056f01d2010b" + "060041000b6f01d2010b" + "076f01d2010b"),
+            output.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void ImplicitFuncrefElementAcceptsEquivalentLongFormOnly()
+    {
+        var (w, output) = NewWriter();
+        ReadOnlyMemory<byte>[] expressions = [new byte[] { 0xD2, 0x00, 0x0B }];
+        w.ElementSegment(ElementSegmentKind.ActiveExpressions, 0, [0x41, 0x00, 0x0B],
+            WasmValType.Ref(WasmHeapType.Func, nullable: true), expressions);
+        Assert.Equal(Convert.FromHexString("0441000b01d2000b"), output.WrittenSpan.ToArray());
+        int before = output.WrittenCount;
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.ActiveExpressions, 0, [0x0B],
+            WasmValType.Ref(WasmHeapType.Func, nullable: false), expressions));
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.ActiveExpressions, 0, [0x0B],
+            WasmValType.Ref(WasmHeapType.Concrete(0), nullable: true), expressions));
+        Assert.Equal(before, output.WrittenCount);
+    }
+
+    [Fact]
+    public void InvalidElementSegmentDoesNotWrite()
+    {
+        var (w, output) = NewWriter();
+        ReadOnlyMemory<byte>[] invalid = [new byte[] { 0xD2, 0x01 }];
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.ActiveFunctions, 0, [], [1u]));
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.PassiveFunctions, 1, [], [1u]));
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.ActiveExpressions, 0, [0x41, 0, 0x0B], ValType.ExternRef, invalid));
+        Assert.Throws<ArgumentException>(() => w.ElementSegment(ElementSegmentKind.PassiveExpressions, 0, [], ValType.FuncRef, invalid));
+        Assert.Equal(0, output.WrittenCount);
+    }
+
+    [Fact]
     public void EntriesTakeAnyValueType()
     {
         WasmValType refNull0 = WasmValType.Ref(WasmHeapType.Concrete(0), nullable: true);

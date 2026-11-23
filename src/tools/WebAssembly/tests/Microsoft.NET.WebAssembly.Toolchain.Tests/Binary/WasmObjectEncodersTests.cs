@@ -240,6 +240,187 @@ public sealed class WasmObjectEncodersTests
         Assert.Equal(["0:first", "1:second"], WasmNameSectionReader.ParseFunctionNames(module).OrderBy(p => p.Key).Select(p => $"{p.Key}:{p.Value}"));
     }
 
+    [Fact]
+    public void NameMapWritesTheSameBytesToABufferWriter()
+    {
+        long entries = NameMapWriter.GetEntrySize(0, 1) + NameMapWriter.GetEntrySize(300, 4);
+        var buffer = new ArrayBufferWriter<byte>();
+        var map = new NameMapWriter(buffer, NameSubsectionId.Global, 2, entries);
+        map.Write(0, "g"u8);
+        map.Write(300, "heap"u8);
+        map.Complete();
+
+        Assert.Equal(Convert.FromHexString("07" + "0b" + "02" + "0001" + "67" + "ac0204" + "68656170"), buffer.WrittenSpan.ToArray());
+        Assert.Equal(NameMapWriter.GetSubsectionSize(2, entries), buffer.WrittenCount);
+    }
+
+    [Fact]
+    public void NameMapOverABufferWriterChecksBeforeWriting()
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        Assert.Throws<ArgumentException>("id", () => new NameMapWriter(buffer, NameSubsectionId.Local, 1, NameMapWriter.GetEntrySize(0, 1)));
+        Assert.Equal(0, buffer.WrittenCount);
+
+        // A buffer writer has no declared section size to catch an overrun, so the map's own checks are all there is.
+        var map = new NameMapWriter(buffer, NameSubsectionId.Function, 1, NameMapWriter.GetEntrySize(0, 1));
+        int header = buffer.WrittenCount;
+        Assert.Throws<InvalidOperationException>(() => map.Write(0, "long"u8));
+        Assert.Equal(header, buffer.WrittenCount);
+        map.Write(0, "x"u8);
+        Assert.Throws<InvalidOperationException>(() => map.Write(1, "y"u8));
+        Assert.Equal(header + NameMapWriter.GetEntrySize(0, 1), buffer.WrittenCount);
+        map.Complete();
+    }
+
+    [Theory]
+    [InlineData(0, (long)uint.MaxValue)]
+    [InlineData(128, (long)uint.MaxValue - 1)]
+    [InlineData(1, long.MaxValue)]
+    public void NameMapsRejectAnOversizedSubsectionBeforeWriting(int count, long entriesSize)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        Assert.Throws<ArgumentOutOfRangeException>("entriesSize",
+            () => new NameMapWriter(buffer, NameSubsectionId.Function, count, entriesSize));
+        Assert.Throws<ArgumentOutOfRangeException>("entriesSize",
+            () => new IndirectNameMapWriter(buffer, NameSubsectionId.Local, count, entriesSize));
+        Assert.Equal(0, buffer.WrittenCount);
+    }
+
+    [Fact]
+    public void NameMapsAcceptTheMaximumU32PayloadSize()
+    {
+        var flat = new ArrayBufferWriter<byte>();
+        _ = new NameMapWriter(flat, NameSubsectionId.Function, 1, (long)uint.MaxValue - 1);
+        Assert.Equal(Convert.FromHexString("01ffffffff0f01"), flat.WrittenSpan.ToArray());
+
+        var indirect = new ArrayBufferWriter<byte>();
+        _ = new IndirectNameMapWriter(indirect, NameSubsectionId.Local, 1, (long)uint.MaxValue - 1);
+        Assert.Equal(Convert.FromHexString("02ffffffff0f01"), indirect.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void ModuleNameWritesSubsectionZero()
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        ModuleNameWriter.Write(buffer, "mod"u8);
+        Assert.Equal(Convert.FromHexString("00" + "04" + "03" + "6d6f64"), buffer.WrittenSpan.ToArray());
+        Assert.Equal(ModuleNameWriter.GetSubsectionSize(3), buffer.WrittenCount);
+
+        using var output = new MemoryStream();
+        var writer = new WasmModuleWriter(output, writeHeader: false);
+        writer.BeginCustomSection("name"u8, ModuleNameWriter.GetSubsectionSize(3));
+        ModuleNameWriter.Write(writer, "mod"u8);
+        writer.EndSection();
+        Assert.Equal(Convert.FromHexString("00" + "0b" + "04" + "6e616d65" + "00" + "04" + "03" + "6d6f64"), output.ToArray());
+    }
+
+    [Fact]
+    public void IndirectNameMapWritesLocalNames()
+    {
+        // Function 0 names locals 0 and 2; function 5 names local 1.
+        long f0 = NameMapWriter.GetEntrySize(0, 1) + NameMapWriter.GetEntrySize(2, 2);
+        long f5 = NameMapWriter.GetEntrySize(1, 1);
+        long entries = IndirectNameMapWriter.GetEntrySize(0, 2, f0) + IndirectNameMapWriter.GetEntrySize(5, 1, f5);
+        var buffer = new ArrayBufferWriter<byte>();
+        var map = new IndirectNameMapWriter(buffer, NameSubsectionId.Local, 2, entries);
+        map.BeginMap(0, 2, f0);
+        map.Write(0, "a"u8);
+        map.Write(2, "bc"u8);
+        map.BeginMap(5, 1, f5);
+        map.Write(1, "d"u8);
+        map.Complete();
+
+        string payload = "02" + "00" + "02" + "0001" + "61" + "0202" + "6263" + "05" + "01" + "0101" + "64";
+        Assert.Equal(Convert.FromHexString("02" + (payload.Length / 2).ToString("x2") + payload), buffer.WrittenSpan.ToArray());
+        Assert.Equal(IndirectNameMapWriter.GetSubsectionSize(2, entries), buffer.WrittenCount);
+
+        var names = WasmNameSectionReader.Read(buffer.WrittenSpan);
+        Assert.Null(names.Malformation);
+        Assert.Equal("bc", names.LocalNames[0][2]);
+        Assert.Equal("d", names.LocalNames[5][1]);
+    }
+
+    [Theory]
+    [InlineData(NameSubsectionId.Module)]
+    [InlineData(NameSubsectionId.Function)]
+    [InlineData(NameSubsectionId.Type)]
+    [InlineData(NameSubsectionId.Tag)]
+    public void IndirectNameMapRejectsSubsectionsThatAreNotIndirect(NameSubsectionId id)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        Assert.Throws<ArgumentException>("id", () => new IndirectNameMapWriter(buffer, id, 0, 0));
+        Assert.Equal(0, buffer.WrittenCount);
+    }
+
+    [Theory]
+    [InlineData(NameSubsectionId.Local)]
+    [InlineData(NameSubsectionId.Label)]
+    [InlineData(NameSubsectionId.Field)]
+    public void IndirectNameMapAcceptsEveryIndirectMap(NameSubsectionId id)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        var map = new IndirectNameMapWriter(buffer, id, 0, 0);
+        map.Complete();
+        Assert.Equal([(byte)id, 1, 0], buffer.WrittenSpan.ToArray());
+    }
+
+    [Fact]
+    public void IndirectNameMapEnforcesOrderCountsAndSizes()
+    {
+        long inner = NameMapWriter.GetEntrySize(0, 1) + NameMapWriter.GetEntrySize(1, 1);
+        long entries = IndirectNameMapWriter.GetEntrySize(3, 2, inner) + IndirectNameMapWriter.GetEntrySize(4, 1, NameMapWriter.GetEntrySize(0, 1));
+        var buffer = new ArrayBufferWriter<byte>();
+        var map = new IndirectNameMapWriter(buffer, NameSubsectionId.Local, 2, entries);
+
+        // Every rejected call writes nothing.
+        int written = buffer.WrittenCount;
+        Assert.Contains("BeginMap first", Assert.Throws<InvalidOperationException>(() => map.Write(0, "a"u8)).Message);
+        Assert.Throws<InvalidOperationException>(() => map.BeginMap(3, 2, entries));
+        Assert.Equal(written, buffer.WrittenCount);
+
+        map.BeginMap(3, 2, inner);
+        map.Write(1, "a"u8);
+        written = buffer.WrittenCount;
+        Assert.Throws<ArgumentException>("index", () => map.Write(1, "b"u8));
+        Assert.Throws<ArgumentException>("index", () => map.Write(0, "b"u8));
+        // The inner map still owes an entry, so neither the next map nor the end may come yet.
+        Assert.Throws<InvalidOperationException>(() => map.BeginMap(4, 1, NameMapWriter.GetEntrySize(0, 1)));
+        Assert.Throws<InvalidOperationException>(map.Complete);
+        Assert.Equal(written, buffer.WrittenCount);
+        map.Write(2, "b"u8);
+
+        Assert.Throws<ArgumentException>("index", () => map.BeginMap(3, 1, NameMapWriter.GetEntrySize(0, 1)));
+        map.BeginMap(4, 1, NameMapWriter.GetEntrySize(0, 1));
+        Assert.Throws<InvalidOperationException>(() => map.Write(0, "ab"u8));
+        map.Write(0, "c"u8);
+        Assert.Throws<InvalidOperationException>(() => map.Write(1, "d"u8));
+        Assert.Throws<InvalidOperationException>(() => map.BeginMap(5, 0, 0));
+        map.Complete();
+    }
+
+    [Fact]
+    public void ExactBufferRejectsEmptyReservationsWhenFull()
+    {
+        var buffer = new ExactArrayBufferWriter(1);
+        buffer.GetSpan()[0] = 1;
+        Assert.Equal(1, buffer.GetSpan().Length);
+        buffer.Advance(1);
+        Assert.Throws<InvalidOperationException>(() => buffer.GetSpan());
+        Assert.Throws<InvalidOperationException>(() => buffer.GetMemory());
+        Assert.Throws<ArgumentOutOfRangeException>(() => buffer.GetSpan(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => buffer.GetMemory(-1));
+        Assert.Equal([1], buffer.ToArray());
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData((long)int.MaxValue)]
+    [InlineData(long.MaxValue)]
+    public void ExactBufferRejectsUnallocatableSizes(long size)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>("size", () => new ExactArrayBufferWriter(size));
+    }
+
     // ── LEB128 and IBufferWriter / Stream ───────────────────────────────────
 
     [Theory]

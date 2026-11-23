@@ -12,7 +12,7 @@ namespace Microsoft.NET.WebAssembly.Debugging.Symbols;
 /// Managed C# names of ReadyToRun-compiled function bodies, from the module image's static R2R index
 /// (MethodDefEntryPoints chain). Bound to function slots of the R2R module, so a managed name resolves to
 /// the R2R body like any wasm name; under <see cref="SymbolPolicy.DisplayPrecedence"/> it becomes the
-/// display name and the mangled name-section name stays an alias (lewing's decision on #540).
+/// display name and the mangled name-section name stays an alias (maintainer decision on #540).
 /// </summary>
 /// <param name="index">Function index → managed method name, or null when the module has no usable index.</param>
 /// <param name="indexStatus">Why the index is missing or empty (e.g. <c>not_r2r</c>, <c>parse_failed</c>).</param>

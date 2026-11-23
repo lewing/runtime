@@ -212,6 +212,7 @@ internal sealed class SymbolResolver(IReadOnlyList<SymbolScope> scopes)
                 {
                     var target = entry.Target ?? scope.Bind(entry.FunctionIndex);
                     if (target is null) continue;
+                    if (query.DefinedOnly && target is not WasmFunctionTarget { IsWasmDefined: true }) continue;
                     if (!matches.TryGetValue(target, out var list))
                     {
                         if (order.Count >= stopAfter) continue;

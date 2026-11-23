@@ -1117,7 +1117,17 @@ public sealed class SectionMerger
     /// Encodes everything about <paramref name="module"/> except its bulk content (function bodies, data and custom
     /// section payloads), which is written later straight from the model. Every encoding error is raised here.
     /// </summary>
-    internal static EncodedModule PrepareBinary(WasmModule module) => new(module);
+    internal static EncodedModule PrepareBinary(WasmModule module)
+    {
+        try
+        {
+            return new(module);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new LinkerException($"Cannot encode module entries: {ex.Message}", ex);
+        }
+    }
 
     /// <summary>
     /// A module ready to be written: its small sections encoded, every function's locals encoded and the size of
@@ -1129,8 +1139,8 @@ public sealed class SectionMerger
 
         // Small sections, function locals, data segment headers and custom section names, back to back; the
         // ranges below index into it. Its order is not the output order.
-        private readonly MemoryStream _encoded = new();
-        private readonly List<(WasmSectionId Id, int Start, int Length)> _sectionsBeforeCode = [];
+        private readonly BufferWriterStream _encoded = new(allowInvalidModuleEntries: true);
+        private readonly List<(WasmSectionId Id, int Start, int Length)> _sectionsBeforeCode;
 
         // Function i's body up to its instructions (size, then locals) is _encoded[_functionPrefixes[i].Start..End].
         private readonly FunctionPrefix[] _functionPrefixes = [];
@@ -1149,8 +1159,21 @@ public sealed class SectionMerger
         public EncodedModule(WasmModule module)
         {
             _module = module;
-            MemoryStream e = _encoded;
+            BufferWriterStream e = _encoded;
             List<TypeDefinition> typeDefinitions = module.TypeDefinitions;
+            bool hasPassiveData = HasPassiveSegment(module.DataSegments);
+            int sectionCount = (module.Types.Count > 0 ? 1 : 0) +
+                (module.Imports.Count > 0 ? 1 : 0) +
+                (module.Functions.Count > 0 ? 1 : 0) +
+                (module.Tables.Count > 0 ? 1 : 0) +
+                (module.Memories.Count > 0 ? 1 : 0) +
+                (module.Tags.Count > 0 ? 1 : 0) +
+                (module.Globals.Count > 0 ? 1 : 0) +
+                (module.Exports.Count > 0 ? 1 : 0) +
+                (module.StartFunction.HasValue ? 1 : 0) +
+                (module.Elements.Count > 0 ? 1 : 0) +
+                (hasPassiveData ? 1 : 0);
+            _sectionsBeforeCode = new(sectionCount);
 
             if (module.Types.Count > 0)
             {
@@ -1212,7 +1235,7 @@ public sealed class SectionMerger
                 WriteElementSection(e, module.Elements, typeDefinitions);
                 AddSection(WasmSectionId.Element, start);
             }
-            if (HasPassiveSegment(module.DataSegments))
+            if (hasPassiveData)
             {
                 int start = (int)e.Length;
                 WasmEncoder.WriteU32Leb(e, (uint)module.DataSegments.Count);
@@ -1617,34 +1640,43 @@ public sealed class SectionMerger
         if (resolvedSymbols is null)
             return null;
 
-        var namedFunctions = new List<(uint Index, string Name)>();
+        var namedFunctions = new List<(uint Index, string Name, int Order)>();
         foreach (var sym in resolvedSymbols.Values)
         {
             if (sym.Kind == Binary.Linking.SymbolType.Function &&
                 sym.MergedIndex.HasValue &&
                 !string.IsNullOrEmpty(sym.Name))
             {
-                namedFunctions.Add((sym.MergedIndex.Value, sym.Name));
+                namedFunctions.Add((sym.MergedIndex.Value, sym.Name, namedFunctions.Count));
             }
         }
 
         if (namedFunctions.Count == 0)
             return null;
 
-        namedFunctions.Sort(static (a, b) => a.Index.CompareTo(b.Index));
-
-        using var subsection = new MemoryStream();
-        WasmEncoder.WriteU32Leb(subsection, (uint)namedFunctions.Count);
-        foreach (var (index, name) in namedFunctions)
+        // Keep the first symbol-table name for aliases, as wasm-ld does. List.Sort is not stable.
+        namedFunctions.Sort(static (a, b) => a.Index != b.Index ? a.Index.CompareTo(b.Index) : a.Order.CompareTo(b.Order));
+        int count = 0;
+        long entriesSize = 0;
+        for (int i = 0; i < namedFunctions.Count; i++)
         {
-            WasmEncoder.WriteU32Leb(subsection, index);
-            WriteName(subsection, name);
+            if (i > 0 && namedFunctions[i].Index == namedFunctions[i - 1].Index)
+                continue;
+            count++;
+            entriesSize += NameMapWriter.GetEntrySize(namedFunctions[i].Index, Encoding.UTF8.GetByteCount(namedFunctions[i].Name));
         }
 
-        using var content = new MemoryStream();
-        content.WriteByte((byte)NameSubsectionId.Function);
-        WasmEncoder.WriteU32Leb(content, (uint)subsection.Length);
-        content.Write(subsection.GetBuffer(), 0, (int)subsection.Length);
+        var content = new ExactArrayBufferWriter(NameMapWriter.GetSubsectionSize(count, entriesSize));
+        var map = new NameMapWriter(content, NameSubsectionId.Function, count, entriesSize);
+        Span<byte> scratch = stackalloc byte[Utf8Scratch.StackSize];
+        for (int i = 0; i < namedFunctions.Count; i++)
+        {
+            if (i > 0 && namedFunctions[i].Index == namedFunctions[i - 1].Index)
+                continue;
+            using var name = new Utf8Scratch(namedFunctions[i].Name, scratch);
+            map.Write(namedFunctions[i].Index, name.Bytes);
+        }
+        map.Complete();
 
         return new CustomSection("name", content.ToArray());
     }
@@ -2039,16 +2071,38 @@ public sealed class SectionMerger
                     throw new LinkerException(Wasm64Guard.NotSupportedMessage("memory64", "linking"));
                 case ImportDescriptor.Table { Type.Is64: true }:
                     throw new LinkerException(Wasm64Guard.NotSupportedMessage("table64", "linking"));
+                case ImportDescriptor.Memory memory:
+                    Require32BitRange(memory.Type.Limits, "memory");
+                    break;
+                case ImportDescriptor.Table table:
+                    Require32BitRange(table.Type.Limits, "table");
+                    break;
             }
         }
 
         foreach (var memory in memories)
+        {
             if (memory.Is64)
                 throw new LinkerException(Wasm64Guard.NotSupportedMessage("memory64", "linking"));
+            Require32BitRange(memory.Limits, "memory");
+        }
 
         foreach (var table in tables)
+        {
             if (table.Is64)
                 throw new LinkerException(Wasm64Guard.NotSupportedMessage("table64", "linking"));
+            Require32BitRange(table.Limits, "table");
+        }
+    }
+
+    /// <summary>
+    /// Limits are read as u64 for every memory and table, and a 32-bit one that does not fit is invalid, not
+    /// malformed. Linker inputs are not validated, so refuse it here rather than truncate it.
+    /// </summary>
+    private static void Require32BitRange(Limits limits, string kind)
+    {
+        if (limits.Min > uint.MaxValue || limits.Max > uint.MaxValue)
+            throw new LinkerException($"A 32-bit {kind}'s limits must fit in 32 bits (min {limits.Min}, max {limits.Max?.ToString() ?? "none"})");
     }
 
     private static Limits MergeLimits(Limits a, Limits b)
@@ -2842,7 +2896,7 @@ public sealed class SectionMerger
     /// </para>
     /// </remarks>
     private static void WriteTypeSection(
-        Stream stream,
+        BufferWriterStream stream,
         List<FuncType> types,
         List<TypeDefinition>? typeDefinitions = null)
     {
@@ -2862,19 +2916,34 @@ public sealed class SectionMerger
                 RequireWritableTypeDefinition(typeDefinitions[i], i);
         }
 
-        WasmEncoder.WriteU32Leb(stream, (uint)types.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)types.Count);
+        Span<WasmValType> scratch = stackalloc WasmValType[128];
         for (int i = 0; i < types.Count; i++)
         {
-            stream.WriteByte((byte)CompositeTypeCode.Func);
             if (exact && typeDefinitions![i].CompositeType is CompositeType.Function function)
             {
-                WriteExactValTypes(stream, function.Parameters, typeDefinitions, $"type {i} parameter");
-                WriteExactValTypes(stream, function.Results, typeDefinitions, $"type {i} result");
+                int parameterCount = function.Parameters.Count;
+                int length = checked(parameterCount + function.Results.Count);
+                WasmValType[]? rented = length > scratch.Length ? System.Buffers.ArrayPool<WasmValType>.Shared.Rent(length) : null;
+                try
+                {
+                    Span<WasmValType> values = rented is null ? scratch[..length] : rented.AsSpan(0, length);
+                    for (int j = 0; j < parameterCount; j++)
+                        values[j] = GetExactValueType(function.Parameters[j], typeDefinitions, $"type {i} parameter {j}");
+                    for (int j = 0; j < function.Results.Count; j++)
+                        values[parameterCount + j] = GetExactValueType(function.Results[j], typeDefinitions, $"type {i} result {j}");
+                    entries.FuncType(values[..parameterCount], values[parameterCount..]);
+                }
+                finally
+                {
+                    if (rented is not null)
+                        System.Buffers.ArrayPool<WasmValType>.Shared.Return(rented);
+                }
             }
             else
             {
-                WriteValTypes(stream, types[i].Parameters);
-                WriteValTypes(stream, types[i].Results);
+                entries.FuncType(types[i].Parameters, types[i].Results);
             }
         }
     }
@@ -2905,34 +2974,21 @@ public sealed class SectionMerger
                 "emits each type standalone, which would break the group's mutual references.");
         }
 
-        foreach (var operand in function.Parameters.Concat(function.Results))
+        CheckOperands(function.Parameters, index);
+        CheckOperands(function.Results, index);
+
+        static void CheckOperands(IReadOnlyList<Microsoft.NET.WebAssembly.Types.ValueType> operands, int index)
         {
-            if (operand is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType } reference)
+            for (int i = 0; i < operands.Count; i++)
             {
-                throw new LinkerException(
-                    $"Type {index} has operand '{reference.Key}', a typed reference. The compact value type this " +
-                    "writer emits erases it to funcref, which widens the signature rather than failing.");
+                if (operands[i] is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType } reference)
+                {
+                    throw new LinkerException(
+                        $"Type {index} has operand '{reference.Key}', a typed reference. The compact value type this " +
+                        "writer emits erases it to funcref, which widens the signature rather than failing.");
+                }
             }
         }
-    }
-
-    private static void WriteValTypes(Stream stream, ReadOnlySpan<ValType> types)
-    {
-        WasmEncoder.WriteU32Leb(stream, (uint)types.Length);
-        foreach (var type in types)
-            stream.WriteByte((byte)type);
-    }
-
-    /// <inheritdoc cref="WriteExactValueType"/>
-    private static void WriteExactValTypes(
-        Stream stream,
-        IReadOnlyList<Microsoft.NET.WebAssembly.Types.ValueType> types,
-        IReadOnlyList<TypeDefinition>? typeDefinitions,
-        string site)
-    {
-        WasmEncoder.WriteU32Leb(stream, (uint)types.Count);
-        for (int i = 0; i < types.Count; i++)
-            WriteExactValueType(stream, types[i], typeDefinitions, $"{site} {i}");
     }
 
     /// <summary>
@@ -2961,96 +3017,60 @@ public sealed class SectionMerger
         IReadOnlyList<TypeDefinition>? typeDefinitions,
         string site)
     {
-        switch (exact)
-        {
-            case Microsoft.NET.WebAssembly.Types.ValueType.Number or Microsoft.NET.WebAssembly.Types.ValueType.Vector:
-                stream.WriteByte((byte)exact.ToStorageValType());
-                return;
-
-            case Microsoft.NET.WebAssembly.Types.ValueType.Reference reference:
-                WriteExactRefType(stream, reference, typeDefinitions, site);
-                return;
-
-            default:
-                throw new LinkerException(
-                    $"Cannot write {site}: '{exact.Key}' is a value type this writer has no encoding for. " +
-                    "Emitting a compact byte instead would silently change the type (GitHub #383).");
-        }
+        WasmValType type = GetExactValueType(exact, typeDefinitions, site);
+        Span<byte> encoded = stackalloc byte[1 + WasmLeb128.MaxLength];
+        stream.Write(encoded[..type.Encode(encoded)]);
     }
 
-    /// <inheritdoc cref="WriteExactValueType"/>
-    private static void WriteExactRefType(
-        Stream stream,
-        Microsoft.NET.WebAssembly.Types.ValueType.Reference reference,
+    private static WasmValType GetExactValueType(
+        Microsoft.NET.WebAssembly.Types.ValueType exact,
         IReadOnlyList<TypeDefinition>? typeDefinitions,
         string site)
     {
-        bool nullable = reference.Nullability == Nullability.Nullable;
-        switch (reference.HeapType)
-        {
-            case DefinedHeapType defined:
-                RequireWritableDefinedType(defined.TypeIndex, typeDefinitions, site);
-                stream.WriteByte(nullable ? (byte)0x63 : (byte)0x64);
-                WasmEncoder.WriteS33Leb(stream, defined.TypeIndex);
-                return;
-
-            case AbstractHeapType abstractHeap
-                when AbstractHeapTypeCodes.TryToCode(abstractHeap.Kind, out byte code):
-                if (nullable)
-                {
-                    // The nullable abbreviation is a single byte and is what every existing module
-                    // uses; emitting the long form here would change the bytes of output that is
-                    // correct today.
-                    stream.WriteByte(code);
-                }
-                else
-                {
-                    stream.WriteByte(0x64);
-                    stream.WriteByte(code);
-                }
-
-                return;
-
-            default:
-                throw new LinkerException(
-                    $"Cannot write {site} '{reference.Key}': this writer has no encoding for it. " +
-                    "Emitting the compact byte instead would silently widen the type (GitHub #383).");
-        }
+        if (exact is Microsoft.NET.WebAssembly.Types.ValueType.Reference { HeapType: DefinedHeapType defined })
+            RequireWritableDefinedType(defined.TypeIndex, typeDefinitions, site);
+        if (WasmValType.TryFromModel(exact, out WasmValType type))
+            return type;
+        throw new LinkerException(
+            $"Cannot write {site}: '{exact.Key}' is a value type this writer has no encoding for. " +
+            "Emitting a compact byte instead would silently change the type (GitHub #383).");
     }
 
     private static void WriteImportSection(
-        Stream stream,
+        BufferWriterStream stream,
         List<Import> imports,
         IReadOnlyList<TypeDefinition>? typeDefinitions = null)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)imports.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)imports.Count);
+        Span<byte> moduleScratch = stackalloc byte[Utf8Scratch.StackSize];
+        Span<byte> nameScratch = stackalloc byte[Utf8Scratch.StackSize];
         foreach (var import in imports)
         {
-            WriteName(stream, import.ModuleName);
-            WriteName(stream, import.Name);
-
+            using var module = new Utf8Scratch(import.ModuleName, moduleScratch);
+            using var name = new Utf8Scratch(import.Name, nameScratch);
             switch (import.Descriptor)
             {
                 case ImportDescriptor.Func function:
-                    stream.WriteByte(0x00);
-                    WasmEncoder.WriteU32Leb(stream, (uint)function.TypeIndex);
+                    entries.FunctionImport(module.Bytes, name.Bytes, (uint)function.TypeIndex);
                     break;
                 case ImportDescriptor.Table table:
-                    stream.WriteByte(0x01);
-                    WriteTableType(stream, table.Type, typeDefinitions);
+                    Require32BitLimits(table.Type.Limits, "table64");
+                    entries.TableImport(module.Bytes, name.Bytes, GetTableElementType(table.Type, typeDefinitions),
+                        table.Type.Limits.Min, table.Type.Limits.Max);
                     break;
                 case ImportDescriptor.Memory memory:
-                    stream.WriteByte(0x02);
-                    WriteMemoryLimits(stream, memory.Type.Limits, memory.Type.Shared);
+                    Require32BitLimits(memory.Type.Limits, "memory64");
+                    entries.MemoryImport(module.Bytes, name.Bytes, memory.Type.Limits.Min, memory.Type.Limits.Max,
+                        shared: memory.Type.Shared);
                     break;
                 case ImportDescriptor.Global global:
-                    stream.WriteByte(0x03);
-                    WriteGlobalType(stream, global.Type, typeDefinitions, "imported global content type");
+                    entries.GlobalImport(module.Bytes, name.Bytes,
+                        GetGlobalContentType(global.Type, typeDefinitions, "imported global content type"),
+                        global.Type.Mutability);
                     break;
                 case ImportDescriptor.Tag tag:
-                    stream.WriteByte(0x04);
-                    stream.WriteByte(0x00);
-                    WasmEncoder.WriteU32Leb(stream, (uint)tag.TypeIndex);
+                    entries.TagImport(module.Bytes, name.Bytes, (uint)tag.TypeIndex);
                     break;
                 default:
                     throw new LinkerException($"Unsupported import descriptor type '{import.Descriptor.GetType().Name}'.");
@@ -3058,94 +3078,95 @@ public sealed class SectionMerger
         }
     }
 
-    private static void WriteFunctionSection(Stream stream, List<WasmFunction> functions)
+    private static void WriteFunctionSection(BufferWriterStream stream, List<WasmFunction> functions)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)functions.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)functions.Count);
         foreach (var function in functions)
-            WasmEncoder.WriteU32Leb(stream, (uint)function.TypeIndex);
+            entries.Function((uint)function.TypeIndex);
     }
 
     private static void WriteTableSection(
-        Stream stream,
+        BufferWriterStream stream,
         List<TableType> tables,
         IReadOnlyList<TypeDefinition>? typeDefinitions = null)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)tables.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)tables.Count);
         foreach (var table in tables)
-            WriteTableDefinition(stream, table, typeDefinitions);
-    }
-
-    private static void WriteMemorySection(Stream stream, List<MemoryType> memories)
-    {
-        WasmEncoder.WriteU32Leb(stream, (uint)memories.Count);
-        foreach (var memory in memories)
-            WriteMemoryLimits(stream, memory.Limits, memory.Shared);
-    }
-
-    private static void WriteTagSection(Stream stream, List<Tag> tags)
-    {
-        WasmEncoder.WriteU32Leb(stream, (uint)tags.Count);
-        foreach (var tag in tags)
         {
-            stream.WriteByte(0x00);
-            WasmEncoder.WriteU32Leb(stream, (uint)tag.TypeIndex);
+            Require32BitLimits(table.Limits, "table64");
+            WasmValType type = GetTableElementType(table, typeDefinitions);
+            if (table.InitExpr.Length == 0)
+                entries.Table(type, table.Limits.Min, table.Limits.Max);
+            else
+                entries.Table(type, table.Limits.Min, table.Limits.Max, false,
+                    NormalizeConstExpr(table.InitExpr, "table initializer"));
         }
+    }
+
+    private static void WriteMemorySection(BufferWriterStream stream, List<MemoryType> memories)
+    {
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)memories.Count);
+        foreach (var memory in memories)
+        {
+            Require32BitLimits(memory.Limits, "memory64");
+            entries.Memory(memory.Limits.Min, memory.Limits.Max, shared: memory.Shared);
+        }
+    }
+
+    private static void WriteTagSection(BufferWriterStream stream, List<Tag> tags)
+    {
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)tags.Count);
+        foreach (var tag in tags)
+            entries.Tag((uint)tag.TypeIndex);
     }
 
     private static void WriteGlobalSection(
-        Stream stream,
+        BufferWriterStream stream,
         List<WasmGlobal> globals,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)globals.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)globals.Count);
         for (int i = 0; i < globals.Count; i++)
         {
             var global = globals[i];
-            WriteGlobalType(stream, global.Type, typeDefinitions, $"global {i} content type");
-            stream.Write(NormalizeConstExpr(global.InitExpr, $"global {i} initializer"));
+            entries.Global(GetGlobalContentType(global.Type, typeDefinitions, $"global {i} content type"),
+                global.Type.Mutability, NormalizeConstExpr(global.InitExpr, $"global {i} initializer"));
         }
     }
 
-    private static void WriteExportSection(Stream stream, OrderedDictionary<string, Export> exports)
+    private static void WriteExportSection(BufferWriterStream stream, OrderedDictionary<string, Export> exports)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)exports.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)exports.Count);
+        Span<byte> scratch = stackalloc byte[Utf8Scratch.StackSize];
         foreach (var (name, export) in exports)
         {
-            WriteName(stream, name);
-            switch (export.Descriptor)
+            using var utf8 = new Utf8Scratch(name, scratch);
+            (WasmExternalKind kind, uint index) = export.Descriptor switch
             {
-                case ExportDescriptor.Func function:
-                    stream.WriteByte(0x00);
-                    WasmEncoder.WriteU32Leb(stream, (uint)function.FunctionIndex);
-                    break;
-                case ExportDescriptor.Table table:
-                    stream.WriteByte(0x01);
-                    WasmEncoder.WriteU32Leb(stream, (uint)table.TableIndex);
-                    break;
-                case ExportDescriptor.Memory memory:
-                    stream.WriteByte(0x02);
-                    WasmEncoder.WriteU32Leb(stream, (uint)memory.MemoryIndex);
-                    break;
-                case ExportDescriptor.Global global:
-                    stream.WriteByte(0x03);
-                    WasmEncoder.WriteU32Leb(stream, (uint)global.GlobalIndex);
-                    break;
-                case ExportDescriptor.Tag tag:
-                    stream.WriteByte(0x04);
-                    WasmEncoder.WriteU32Leb(stream, (uint)tag.TagIndex);
-                    break;
-                default:
-                    throw new LinkerException($"Unsupported export descriptor type '{export.Descriptor.GetType().Name}'.");
-            }
+                ExportDescriptor.Func function => (WasmExternalKind.Function, (uint)function.FunctionIndex),
+                ExportDescriptor.Table table => (WasmExternalKind.Table, (uint)table.TableIndex),
+                ExportDescriptor.Memory memory => (WasmExternalKind.Memory, (uint)memory.MemoryIndex),
+                ExportDescriptor.Global global => (WasmExternalKind.Global, (uint)global.GlobalIndex),
+                ExportDescriptor.Tag tag => (WasmExternalKind.Tag, (uint)tag.TagIndex),
+                _ => throw new LinkerException($"Unsupported export descriptor type '{export.Descriptor.GetType().Name}'."),
+            };
+            entries.Export(utf8.Bytes, kind, index);
         }
     }
 
     private static void WriteElementSection(
-        Stream stream,
+        BufferWriterStream stream,
         List<Element> elements,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
-        WasmEncoder.WriteU32Leb(stream, (uint)elements.Count);
+        WasmModuleEntryWriter entries = stream.Entries;
+        entries.Count((uint)elements.Count);
         for (int i = 0; i < elements.Count; i++)
         {
             var element = elements[i];
@@ -3154,62 +3175,60 @@ public sealed class SectionMerger
             bool explicitTable = element.HasExplicitTableIndex || element.TableIndex != 0 ||
                 (expressionForm && !implicitExpressionType);
 
-            uint flags = element.Mode switch
+            ElementSegmentKind kind = element.Mode switch
             {
-                ElementMode.Active when expressionForm => explicitTable ? 6u : 4u,
-                ElementMode.Passive when expressionForm => 5u,
-                ElementMode.Declarative when expressionForm => 7u,
-                ElementMode.Active => explicitTable ? 2u : 0u,
-                ElementMode.Passive => 1u,
-                ElementMode.Declarative => 3u,
+                ElementMode.Active when expressionForm => explicitTable ? ElementSegmentKind.ActiveTableExpressions : ElementSegmentKind.ActiveExpressions,
+                ElementMode.Passive when expressionForm => ElementSegmentKind.PassiveExpressions,
+                ElementMode.Declarative when expressionForm => ElementSegmentKind.DeclarativeExpressions,
+                ElementMode.Active => explicitTable ? ElementSegmentKind.ActiveTableFunctions : ElementSegmentKind.ActiveFunctions,
+                ElementMode.Passive => ElementSegmentKind.PassiveFunctions,
+                ElementMode.Declarative => ElementSegmentKind.DeclarativeFunctions,
                 _ => throw new LinkerException($"Element segment {i} has unknown mode {element.Mode}."),
             };
 
-            WasmEncoder.WriteU32Leb(stream, flags);
+            uint tableIndex = 0;
+            ReadOnlySpan<byte> offset = default;
             if (element.Mode == ElementMode.Active)
             {
                 if (element.TableIndex < 0)
                     throw new LinkerException($"Active element segment {i} has no table index.");
                 if (explicitTable)
-                    WasmEncoder.WriteU32Leb(stream, (uint)element.TableIndex);
-                stream.Write(GetActiveOffsetExpr(element.OffsetExpr, $"element segment {i} offset"));
+                    tableIndex = (uint)element.TableIndex;
+                offset = GetActiveOffsetExpr(element.OffsetExpr, $"element segment {i} offset");
             }
 
             if (expressionForm)
             {
-                if (flags != 4)
+                if (element.ElementType is not Microsoft.NET.WebAssembly.Types.ValueType.Reference reference)
+                    throw new LinkerException($"Element segment {i} has non-reference type '{element.ElementType.Key}'.");
+                WasmValType type = GetExactValueType(reference, typeDefinitions, $"element segment {i} type");
+                int count = element.ElementExpressions.Count;
+                ReadOnlyMemory<byte>[] expressions = System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Rent(count);
+                try
                 {
-                    if (element.ElementType is not Microsoft.NET.WebAssembly.Types.ValueType.Reference reference)
-                        throw new LinkerException($"Element segment {i} has non-reference type '{element.ElementType.Key}'.");
-                    WriteExactRefType(stream, reference, typeDefinitions, $"element segment {i} type");
+                    for (int j = 0; j < count; j++)
+                        expressions[j] = NormalizeConstExpr(element.ElementExpressions[j], $"element segment {i} expression {j}");
+                    entries.ElementSegment(kind, tableIndex, offset, type, expressions.AsSpan(0, count));
                 }
-
-                WasmEncoder.WriteU32Leb(stream, (uint)element.ElementExpressions.Count);
-                for (int j = 0; j < element.ElementExpressions.Count; j++)
+                finally
                 {
-                    stream.Write(NormalizeConstExpr(
-                        element.ElementExpressions[j], $"element segment {i} expression {j}"));
+                    System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Return(expressions, clearArray: true);
                 }
                 continue;
             }
-
-            if (flags != 0)
-                stream.WriteByte(0x00);
 
             List<int> functionIndices =
                 element.Mode == ElementMode.Declarative && element.DeclaredFunctionIndices.Count > 0
                     ? element.DeclaredFunctionIndices
                     : element.FunctionIndices;
-            WasmEncoder.WriteU32Leb(stream, (uint)functionIndices.Count);
             for (int j = 0; j < functionIndices.Count; j++)
             {
-                int functionIndex = functionIndices[j];
-                if (functionIndex < 0)
+                if (functionIndices[j] < 0)
                     throw new LinkerException(
-                        $"Element segment {i} funcidx entry {j} is negative ({functionIndex}).");
-
-                WasmEncoder.WriteU32Leb(stream, (uint)functionIndex);
+                        $"Element segment {i} funcidx entry {j} is negative ({functionIndices[j]}).");
             }
+            ReadOnlySpan<int> indices = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(functionIndices);
+            entries.ElementSegment(kind, tableIndex, offset, System.Runtime.InteropServices.MemoryMarshal.Cast<int, uint>(indices));
         }
     }
 
@@ -3442,25 +3461,22 @@ public sealed class SectionMerger
     }
 
     /// <summary>Writes data segment <paramref name="index"/> up to its content: mode, memory, offset and length.</summary>
-    private static void WriteDataSegmentHeader(Stream stream, Data segment, int index)
+    private static void WriteDataSegmentHeader(BufferWriterStream stream, Data segment, int index)
     {
         if (segment.IsPassive)
         {
-            WasmEncoder.WriteU32Leb(stream, 1);
-        }
-        else if (segment.MemoryIndex == 0)
-        {
-            WasmEncoder.WriteU32Leb(stream, 0);
-            stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {index} offset"));
+            int size = DataSegmentEncoder.GetPassiveHeaderSize(segment.InitData.Length);
+            int written = DataSegmentEncoder.EncodePassiveHeader(stream.GetSpan(size), segment.InitData.Length);
+            stream.Advance(written);
         }
         else
         {
-            WasmEncoder.WriteU32Leb(stream, 2);
-            WasmEncoder.WriteU32Leb(stream, (uint)segment.MemoryIndex);
-            stream.Write(GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {index} offset"));
+            ReadOnlySpan<byte> offset = GetActiveOffsetExpr(segment.OffsetExpr, $"data segment {index} offset");
+            int size = DataSegmentEncoder.GetActiveHeaderSize(offset, segment.InitData.Length, memoryIndex: (uint)segment.MemoryIndex);
+            int written = DataSegmentEncoder.EncodeActiveHeader(stream.GetSpan(size), offset, segment.InitData.Length,
+                memoryIndex: (uint)segment.MemoryIndex);
+            stream.Advance(written);
         }
-
-        WasmEncoder.WriteU32Leb(stream, (uint)segment.InitData.Length);
     }
 
     /// <summary>
@@ -3493,18 +3509,14 @@ public sealed class SectionMerger
     /// makes the sound case sound.
     /// </para>
     /// </remarks>
-    private static void WriteTableElementType(
-        Stream stream,
+    private static WasmValType GetTableElementType(
         TableType tableType,
         IReadOnlyList<TypeDefinition>? typeDefinitions)
     {
         if (tableType.ExactElementType is not Microsoft.NET.WebAssembly.Types.ValueType.Reference reference)
-        {
-            stream.WriteByte((byte)tableType.ElementType);
-            return;
-        }
+            return (ValType)tableType.ElementType;
 
-        WriteExactRefType(stream, reference, typeDefinitions, "table element type");
+        return GetExactValueType(reference, typeDefinitions, "table element type");
     }
 
     /// <summary>
@@ -3544,102 +3556,20 @@ public sealed class SectionMerger
         }
     }
 
-    /// <summary>
-    /// Writes a bare <c>tabletype</c> (§5.3.9) — element type followed by limits. This is the shape
-    /// an <em>import</em> descriptor uses, and it cannot carry an initializer: the extended
-    /// <c>0x40 0x00</c> form belongs to the <c>table</c> production in the table section, not to
-    /// <c>tabletype</c>. wasm-tools 1.253.0 rejects
-    /// <c>(import "m" "t" (table 1 funcref (ref.null func)))</c> for that reason, and nesm's reader
-    /// now does too.
-    /// </summary>
-    private static void WriteTableType(
-        Stream stream,
-        TableType tableType,
-        IReadOnlyList<TypeDefinition>? typeDefinitions)
-    {
-        WriteTableElementType(stream, tableType, typeDefinitions);
-        WriteLimits(stream, tableType.Limits);
-    }
-
-    /// <summary>
-    /// Writes a table-section entry, using the extended encoding
-    /// <c>0x40 0x00 reftype limits expr</c> whenever the table carries an initializer expression.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Emitting the bare <c>tabletype</c> here when <see cref="TableType.InitExpr"/> is non-empty is
-    /// not a formatting choice — it silently changes the module's meaning. The re-read table comes up
-    /// holding nulls in every slot the element segments do not cover, so a <c>call_indirect</c>
-    /// through an initialised slot traps as "uninitialized element" (GitHub #383, the same failure
-    /// class as #266).
-    /// </para>
-    /// <para>
-    /// <see cref="TableType.InitExpr"/> already contains its terminating <c>0x0B</c> — the reader's
-    /// <c>ReadInitExpr</c> collects the END byte — so no separate terminator is written.
-    /// </para>
-    /// </remarks>
-    private static void WriteTableDefinition(
-        Stream stream,
-        TableType tableType,
-        IReadOnlyList<TypeDefinition>? typeDefinitions)
-    {
-        if (tableType.InitExpr.Length == 0)
-        {
-            WriteTableType(stream, tableType, typeDefinitions);
-            return;
-        }
-
-        stream.WriteByte(0x40);
-        stream.WriteByte(0x00);
-        WriteTableElementType(stream, tableType, typeDefinitions);
-        WriteLimits(stream, tableType.Limits);
-        stream.Write(NormalizeConstExpr(tableType.InitExpr, "table initializer"));
-    }
-
-    private static void WriteGlobalType(
-        Stream stream,
+    private static WasmValType GetGlobalContentType(
         GlobalType globalType,
         IReadOnlyList<TypeDefinition>? typeDefinitions = null,
         string site = "global content type")
     {
         if (globalType.ExactContentType is { } exact)
-            WriteExactValueType(stream, exact, typeDefinitions, site);
-        else
-            stream.WriteByte((byte)globalType.ContentType);
-
-        stream.WriteByte((byte)globalType.Mutability);
+            return GetExactValueType(exact, typeDefinitions, site);
+        return globalType.ContentType;
     }
 
-    private static void WriteLimits(Stream stream, Limits limits)
+    private static void Require32BitLimits(Limits limits, string feature)
     {
         if (limits.Is64)
-            throw new LinkerException(
-                Wasm64Guard.NotSupportedMessage("table64", "linking"));
-        if (limits.Max.HasValue)
-        {
-            stream.WriteByte(0x01);
-            WasmEncoder.WriteU32Leb(stream, (uint)limits.Min);
-            WasmEncoder.WriteU32Leb(stream, (uint)limits.Max.Value);
-        }
-        else
-        {
-            stream.WriteByte(0x00);
-            WasmEncoder.WriteU32Leb(stream, (uint)limits.Min);
-        }
-    }
-
-    private static void WriteMemoryLimits(Stream stream, Limits limits, bool shared)
-    {
-        if (limits.Is64)
-            throw new LinkerException(
-                Wasm64Guard.NotSupportedMessage("memory64", "linking"));
-        byte flag = 0x00;
-        if (limits.Max.HasValue) flag |= 0x01;
-        if (shared) flag |= 0x02;
-        stream.WriteByte(flag);
-        WasmEncoder.WriteU32Leb(stream, (uint)limits.Min);
-        if (limits.Max.HasValue)
-            WasmEncoder.WriteU32Leb(stream, (uint)limits.Max.Value);
+            throw new LinkerException(Wasm64Guard.NotSupportedMessage(feature, "linking"));
     }
 
     /// <summary>Writes a name that is already UTF-8, such as a <c>u8</c> literal.</summary>

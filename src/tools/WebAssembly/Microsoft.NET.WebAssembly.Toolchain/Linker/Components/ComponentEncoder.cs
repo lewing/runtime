@@ -932,9 +932,7 @@ public static class ComponentEncoder
                     s.Bytes(body.ToArray());
                 }
             });
-            WriteNameSection(w, indirect.Select(p => p.Kind == ImportKind.FromAdapter
-                ? $"adapt-{p.Import.Module}-{p.Import.Field}"
-                : $"indirect-{p.Import.Module}-{p.Import.Field}"));
+            WriteNameSection(w, indirect);
             return w.ToArray();
         }
 
@@ -990,21 +988,31 @@ public static class ComponentEncoder
             }
         });
 
-        private static void WriteNameSection(CtWriter w, IEnumerable<string> functionNames) => w.Section(WasmSectionId.Custom, s =>
+        /// <summary>The shim module's <c>name</c> section: function i is named after indirect import i, as wit-component does.</summary>
+        private static void WriteNameSection(CtWriter w, List<ImportPlan> indirect) => w.Section(WasmSectionId.Custom, s =>
         {
             s.Name("name"u8);
-            var names = functionNames.ToList();
-            var sub = new CtWriter();
-            sub.U32((uint)names.Count);
-            for (int i = 0; i < names.Count; i++)
+            var names = new string[indirect.Count];
+            long entriesSize = 0;
+            for (int i = 0; i < names.Length; i++)
             {
-                sub.U32((uint)i);
-                sub.Name(names[i]);
+                ImportPlan p = indirect[i];
+                names[i] = p.Kind == ImportKind.FromAdapter
+                    ? $"adapt-{p.Import.Module}-{p.Import.Field}"
+                    : $"indirect-{p.Import.Module}-{p.Import.Field}";
+                entriesSize += NameMapWriter.GetEntrySize((uint)i, Encoding.UTF8.GetByteCount(names[i]));
             }
 
-            s.Byte(0x01);
-            s.U32((uint)sub.Length);
-            s.Bytes(sub.ToArray());
+            var content = new ExactArrayBufferWriter(NameMapWriter.GetSubsectionSize(names.Length, entriesSize));
+            var map = new NameMapWriter(content, NameSubsectionId.Function, names.Length, entriesSize);
+            Span<byte> scratch = stackalloc byte[Utf8Scratch.StackSize];
+            for (int i = 0; i < names.Length; i++)
+            {
+                using var utf8 = new Utf8Scratch(names[i], scratch);
+                map.Write((uint)i, utf8.Bytes);
+            }
+            map.Complete();
+            s.Bytes(content.ToArray());
         });
 
         // ── Exports: lift each function, wrap the interface in a shim component, export its instance ──

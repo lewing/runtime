@@ -8,9 +8,98 @@ using Microsoft.NET.WebAssembly.Binary.Linking;
 using Microsoft.NET.WebAssembly.Linker;
 using Microsoft.NET.WebAssembly.Module;
 using Microsoft.NET.WebAssembly.Types;
+using Microsoft.NET.WebAssembly.Wat;
 
 public class SectionMergerTests
 {
+    [Fact]
+    public void Memory64_IsRefusedByTheWriterRatherThanNarrowed()
+    {
+        var module = new WasmModule { Memories = [new MemoryType(new Limits(2, null, Is64: true))] };
+
+        var error = Assert.Throws<LinkerException>(() => new SectionMerger().EmitBinary(module));
+
+        Assert.Contains("memory64", error.Message);
+    }
+
+    [Fact]
+    public void Memory64Import_IsRefusedByTheWriterRatherThanNarrowed()
+    {
+        var module = new WasmModule
+        {
+            Imports = [new Import("env", "memory", new ImportDescriptor.Memory(new MemoryType(new Limits(2, null, Is64: true))))],
+        };
+
+        var error = Assert.Throws<LinkerException>(() => new SectionMerger().EmitBinary(module));
+
+        Assert.Contains("memory64", error.Message);
+    }
+
+    [Fact]
+    public void Table64Import_IsRefusedByTheWriterRatherThanNarrowed()
+    {
+        var module = new WasmModule
+        {
+            Imports = [new Import("env", "table", new ImportDescriptor.Table(new TableType(RefType.FuncRef, new Limits(2, null, Is64: true))))],
+        };
+
+        var error = Assert.Throws<LinkerException>(() => new SectionMerger().EmitBinary(module));
+
+        Assert.Contains("table64", error.Message);
+    }
+
+    [Fact]
+    public void OutOfRangeDefinedType_IsRefusedByTheWriter()
+    {
+        WasmModule module = ModuleReader.ReadModule(new MemoryStream(WatCompiler.Compile(
+            "(module (type (func)) (table 1 funcref))")));
+        module.Tables[0] = module.Tables[0] with
+        {
+            ExactElementType = new Microsoft.NET.WebAssembly.Types.ValueType.Reference(Nullability.Nullable, new DefinedHeapType(1)),
+        };
+
+        var error = Assert.Throws<LinkerException>(() => new SectionMerger().EmitBinary(module));
+
+        Assert.Contains("type index 1", error.Message);
+        Assert.Contains("outside the merged type space", error.Message);
+    }
+
+    [Fact]
+    public void DataInNonzeroMemory_PreservesItsIndexOnReencode()
+    {
+        // wasm-tools parse: (module (memory 1) (memory 1) (data (memory 1) (i32.const 0) "abc"))
+        byte[] original = Convert.FromHexString("0061736d01000000050502000100010b0a01020141000b03616263");
+        WasmModule module = ModuleReader.ReadModuleAndValidate(new MemoryStream(original));
+
+        byte[] rewritten = new SectionMerger().EmitBinary(module);
+
+        Assert.Equal(original, rewritten);
+        WasmModule parsed = ModuleReader.ReadModuleAndValidate(new MemoryStream(rewritten));
+        Assert.Equal(1, Assert.Single(parsed.DataSegments).MemoryIndex);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidEntryArgumentsAreReportedAsLinkerErrorsBeforeWriting(bool streaming)
+    {
+        var module = new WasmModule { Memories = [new MemoryType(new Limits((ulong)uint.MaxValue + 1))] };
+        var merger = new SectionMerger();
+        using var output = new MemoryStream();
+
+        var error = Assert.Throws<LinkerException>(() =>
+        {
+            if (streaming)
+                merger.WriteBinary(output, module);
+            else
+                merger.EmitBinary(module);
+        });
+
+        Assert.IsAssignableFrom<ArgumentException>(error.InnerException);
+        Assert.Contains("32-bit limits", error.Message);
+        Assert.Equal(0, output.Length);
+    }
+
     [Fact]
     public void MergeTypesAndImports_DeduplicatesAndBuildsIndexMaps()
     {

@@ -265,6 +265,22 @@ public class Memory64Tests
         Assert.Contains("not yet supported", ex.Message);
     }
 
+    /// <summary>
+    /// Limits decode as u64 for every address type, so an unvalidated linker input can carry a 32-bit memory whose
+    /// limits do not fit in 32 bits. <c>ImportMemory</c> narrows them to u32 before the writer sees them, which
+    /// silently linked a different, valid size; the linker must refuse the input instead.
+    /// </summary>
+    [Fact]
+    public void Memory32_LimitsBeyondU32_ImportMemoryOption_ThrowsRatherThanTruncates()
+    {
+        var memSec = Section(5, EncodeU32(1), [0x00], EncodeU64(0x1_0000_0001));
+        var module = ModuleReader.ParseModuleForAnalysis(new MemoryStream(Module(memSec)));
+
+        var ex = Assert.Throws<LinkerException>(
+            () => new WasmLinker().LinkToBinary([module], new LinkerOptions { ImportMemory = true }));
+        Assert.Contains("A 32-bit memory's limits must fit in 32 bits", ex.Message);
+    }
+
     // ── Linker OPTION paths (ImportMemory / InitialMemory / ImportTable / GrowableTable) previously
     //    cast the limits to uint and rebuilt Limits WITHOUT Is64 — erasing the flag before the
     //    writer-level guards ran, so a wasm64 module silently linked as wasm32. Each must now reject.
