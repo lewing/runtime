@@ -88,6 +88,36 @@ public readonly struct WasmValType : IEquatable<WasmValType>
     /// <exception cref="ArgumentException"><paramref name="type"/> is not a single-byte value type.</exception>
     public static implicit operator WasmValType(ValType type) => FromValType(type);
 
+    internal static bool TryFromModel(Microsoft.NET.WebAssembly.Types.ValueType type, out WasmValType value)
+    {
+        if (type is Microsoft.NET.WebAssembly.Types.ValueType.Number or Microsoft.NET.WebAssembly.Types.ValueType.Vector)
+        {
+            value = FromValType(type.ToStorageValType());
+            return true;
+        }
+
+        if (type is Microsoft.NET.WebAssembly.Types.ValueType.Reference reference)
+        {
+            bool nullable = reference.Nullability == Nullability.Nullable;
+            if (reference.HeapType is DefinedHeapType { TypeIndex: >= 0 } defined)
+            {
+                value = Ref(WasmHeapType.Concrete((uint)defined.TypeIndex), nullable);
+                return true;
+            }
+            if (reference.HeapType is AbstractHeapType abstractType &&
+                AbstractHeapTypeCodes.TryToCode(abstractType.Kind, out byte code))
+            {
+                value = nullable
+                    ? FromValType((ValType)code)
+                    : Ref(WasmHeapType.Abstract(abstractType.Kind), nullable: false);
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
+    }
+
     /// <summary>Whether this is a reference type: a shorthand, <c>(ref null ht)</c> or <c>(ref ht)</c>.</summary>
     public bool IsReference => _code != 0 && _code is not (>= (byte)ValType.V128 and <= (byte)ValType.I32);
 

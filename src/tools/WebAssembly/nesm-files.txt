@@ -9,6 +9,7 @@ Binary/WasmOpcode.cs
 Binary/Writing/DataSegmentEncoder.cs
 Binary/Writing/LinkingSectionEncoder.cs
 Binary/Writing/NameMapWriter.cs
+Binary/Writing/NameSink.cs
 Binary/Writing/RelocationSectionEncoder.cs
 Binary/Writing/SegmentedBuffer.cs
 Binary/Writing/WasmCodeWriter.cs

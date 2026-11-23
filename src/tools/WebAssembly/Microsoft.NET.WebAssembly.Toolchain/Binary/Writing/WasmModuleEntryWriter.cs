@@ -3,6 +3,7 @@
 
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Microsoft.NET.WebAssembly.Types;
 
 namespace Microsoft.NET.WebAssembly.Binary.Writing;
@@ -23,12 +24,19 @@ public sealed class WasmModuleEntryWriter
     private const byte ExceptionTagAttribute = 0x00;
 
     private readonly IBufferWriter<byte> _output;
+    private readonly bool _allowInvalidModuleEntries;
 
     /// <summary>Creates a writer that appends to <paramref name="output"/>.</summary>
-    public WasmModuleEntryWriter(IBufferWriter<byte> output)
+    public WasmModuleEntryWriter(IBufferWriter<byte> output) : this(output, allowInvalidModuleEntries: false)
+    {
+    }
+
+    // Validation fixtures need non-nullable tables without initializers, max < min and shared limits without max.
+    internal WasmModuleEntryWriter(IBufferWriter<byte> output, bool allowInvalidModuleEntries)
     {
         ArgumentNullException.ThrowIfNull(output);
         _output = output;
+        _allowInvalidModuleEntries = allowInvalidModuleEntries;
     }
 
     /// <summary>The number of bytes this writer has written: the writer-relative position of the next entry.</summary>
@@ -132,11 +140,24 @@ public sealed class WasmModuleEntryWriter
     public void Table(WasmValType elementType, ulong min, ulong? max = null, bool is64 = false)
     {
         CheckRefType(elementType);
-        if (!elementType.IsNullable)
+        if (!elementType.IsNullable && !_allowInvalidModuleEntries)
             throw new ArgumentException($"A table of {elementType} needs an initializer expression, which this entry does not have.", nameof(elementType));
         CheckLimits(min, max, is64, shared: false);
         WriteValueType(elementType);
         WriteLimits(min, max, is64, shared: false);
+    }
+
+    /// <summary>Writes a table entry with an explicit initializer expression, including its terminating <c>end</c>.</summary>
+    public void Table(WasmValType elementType, ulong min, ulong? max, bool is64, ReadOnlySpan<byte> initExpression)
+    {
+        CheckRefType(elementType);
+        CheckLimits(min, max, is64, shared: false);
+        DataSegmentEncoder.CheckExpression(initExpression, "An initializer expression", nameof(initExpression));
+        WriteByte(TableDefinitionEncoding.Initialized);
+        WriteByte(TableDefinitionEncoding.Reserved);
+        WriteValueType(elementType);
+        WriteLimits(min, max, is64, shared: false);
+        WriteBytes(initExpression);
     }
 
     /// <summary>Writes a memory section entry: its limits.</summary>
@@ -193,12 +214,70 @@ public sealed class WasmModuleEntryWriter
     /// <param name="functionIndices">The functions, in table order.</param>
     public void ActiveElementSegment(ReadOnlySpan<byte> offsetExpression, ReadOnlySpan<uint> functionIndices)
     {
-        DataSegmentEncoder.CheckExpression(offsetExpression, "An offset expression", nameof(offsetExpression));
-        WriteByte((byte)ElementSegmentKind.ActiveFunctions);
-        WriteBytes(offsetExpression);
+        ElementSegment(ElementSegmentKind.ActiveFunctions, 0, offsetExpression, functionIndices);
+    }
+
+    /// <summary>Writes an element segment containing function indices, including its mode and offset.</summary>
+    public void ElementSegment(ElementSegmentKind kind, uint tableIndex, ReadOnlySpan<byte> offsetExpression,
+        ReadOnlySpan<uint> functionIndices)
+    {
+        CheckElementHeader(kind, tableIndex, offsetExpression, expressions: false);
+        WriteElementHeader(kind, tableIndex, offsetExpression);
+        if (kind != ElementSegmentKind.ActiveFunctions)
+            WriteByte(0); // elemkind func
         WriteU((ulong)functionIndices.Length, 0);
         foreach (uint functionIndex in functionIndices)
             WriteU(functionIndex, 0);
+    }
+
+    /// <summary>Writes an element segment containing complete, end-terminated reference expressions.</summary>
+    public void ElementSegment(ElementSegmentKind kind, uint tableIndex, ReadOnlySpan<byte> offsetExpression,
+        WasmValType elementType, ReadOnlySpan<ReadOnlyMemory<byte>> expressions)
+    {
+        CheckElementHeader(kind, tableIndex, offsetExpression, expressions: true);
+        CheckRefType(elementType);
+        if (kind == ElementSegmentKind.ActiveExpressions &&
+            elementType != WasmValType.FuncRef &&
+            elementType != WasmValType.Ref(WasmHeapType.Func, nullable: true))
+            throw new ArgumentException("The implicit element type is funcref.", nameof(elementType));
+        foreach (ReadOnlyMemory<byte> expression in expressions)
+            DataSegmentEncoder.CheckExpression(expression.Span, "An element expression", nameof(expressions));
+        WriteElementHeader(kind, tableIndex, offsetExpression);
+        if (kind != ElementSegmentKind.ActiveExpressions)
+            WriteValueType(elementType);
+        WriteU((ulong)expressions.Length, 0);
+        foreach (ReadOnlyMemory<byte> expression in expressions)
+            WriteBytes(expression.Span);
+    }
+
+    private static void CheckElementHeader(ElementSegmentKind kind, uint tableIndex,
+        ReadOnlySpan<byte> offsetExpression, bool expressions)
+    {
+        bool validKind = expressions
+            ? kind is ElementSegmentKind.ActiveExpressions or ElementSegmentKind.PassiveExpressions or
+                ElementSegmentKind.ActiveTableExpressions or ElementSegmentKind.DeclarativeExpressions
+            : kind is ElementSegmentKind.ActiveFunctions or ElementSegmentKind.PassiveFunctions or
+                ElementSegmentKind.ActiveTableFunctions or ElementSegmentKind.DeclarativeFunctions;
+        if (!validKind)
+            throw new ArgumentOutOfRangeException(nameof(kind), kind, "The segment kind does not match its entries.");
+        bool explicitTable = kind is ElementSegmentKind.ActiveTableFunctions or ElementSegmentKind.ActiveTableExpressions;
+        bool active = explicitTable || kind is ElementSegmentKind.ActiveFunctions or ElementSegmentKind.ActiveExpressions;
+        if (!explicitTable && tableIndex != 0)
+            throw new ArgumentException("Only a segment with an explicit table may name a nonzero index.", nameof(tableIndex));
+        if (active)
+            DataSegmentEncoder.CheckExpression(offsetExpression, "An offset expression", nameof(offsetExpression));
+        else if (!offsetExpression.IsEmpty)
+            throw new ArgumentException("A passive or declarative segment has no offset.", nameof(offsetExpression));
+    }
+
+    private void WriteElementHeader(ElementSegmentKind kind, uint tableIndex, ReadOnlySpan<byte> offsetExpression)
+    {
+        WriteByte((byte)kind);
+        if (kind is ElementSegmentKind.ActiveTableFunctions or ElementSegmentKind.ActiveTableExpressions)
+            WriteU(tableIndex, 0);
+        if (kind is ElementSegmentKind.ActiveFunctions or ElementSegmentKind.ActiveTableFunctions or
+            ElementSegmentKind.ActiveExpressions or ElementSegmentKind.ActiveTableExpressions)
+            WriteBytes(offsetExpression);
     }
 
     // ── Encoding ─────────────────────────────────────────────────────────────
@@ -221,15 +300,15 @@ public sealed class WasmModuleEntryWriter
             WriteU(max.Value, 0);
     }
 
-    private static void CheckLimits(ulong min, ulong? max, bool is64, bool shared)
+    private void CheckLimits(ulong min, ulong? max, bool is64, bool shared)
     {
         if (!is64 && min > uint.MaxValue)
             throw new ArgumentException("32-bit limits must fit in 32 bits; pass is64 for memory64/table64.", nameof(min));
         if (!is64 && max > uint.MaxValue)
             throw new ArgumentException("32-bit limits must fit in 32 bits; pass is64 for memory64/table64.", nameof(max));
-        if (max < min)
+        if (!_allowInvalidModuleEntries && max < min)
             throw new ArgumentException($"The maximum {max} is less than the minimum {min}.", nameof(max));
-        if (shared && max is null)
+        if (!_allowInvalidModuleEntries && shared && max is null)
             throw new ArgumentException("A shared memory must have a maximum.", nameof(max));
     }
 
@@ -269,8 +348,8 @@ public sealed class WasmModuleEntryWriter
     private void WriteTypes(ReadOnlySpan<ValType> types)
     {
         WriteU((ulong)types.Length, 0);
-        foreach (ValType type in types)
-            WriteByte((byte)type);
+        if (!types.IsEmpty)
+            WriteBytes(MemoryMarshal.AsBytes(types));
     }
 
     private void WriteValueType(WasmValType type) => Advance(type.Encode(_output.GetSpan(1 + WasmLeb128.MaxLength)));
